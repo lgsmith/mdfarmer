@@ -1,24 +1,37 @@
 import inspect
 import utilities as u
 from pathlib import Path
+import subprocess as sp
+import re
+import json
+
+from __future__ import annotations
+
 
 class Clone:
     __slots__ = (
-        'config', 'job_number', 'job_number_re', 'job_name_fstring',
+        'config', 'job_number', 'job_number_re', 'job_name_fstring', 'current_seed',
         'current_gen_dir', 'config_p', 'scheduler_script_p', 'compare_keys',
         'scheduler_fstring', 'scheduler', 'traj_list', 'sep', 'dirname_pad',
         'scheduler_kws', 'restarts_per_gen', 'restart_attempts')
+
+    # This should mostly be used by the init function, and by adaptive sampling scripts.
+
+
 
     def __init__(self,
                  # keys should match argument parameter names from runner
                  # function, 4x:omm_basic_sim_block
                  config: dict,
+
                  # Scheduler to call. Will also be used to name files later.
                  scheduler: str,
                  # BSUB/SBATCH/Scheduler script with anchors for str.format().
                  scheduler_fstring: str,
                  # Keys should match fstring anchors. Values should be desired substitution.
                  scheduler_kws: dict,
+                 # should be path to the serialized xml this clone will grow from.
+                 seed: str,
                  # If true, call inspect.cleandoc on sched. fstring prior to binding it to self.
                  cleandoc_sched_fstring=True,
                  restarts_per_gen=3,
@@ -44,6 +57,12 @@ class Clone:
                  ):
         # REQUIRED ARGS below here
         self.config = config  # dict keys and values must be json serializable.
+        seed_p = Path(seed)
+        if seed_p.is_file():
+            self.current_seed = seed_p
+            self.config['seed'] = seed
+        else:
+            raise FileNotFoundError(seed_p)
         self.scheduler = scheduler
         if cleandoc_sched_fstring:
             self.scheduler_fstring = inspect.cleandoc(scheduler_fstring)
@@ -88,17 +107,23 @@ class Clone:
     def __eq__(self, other: Clone) -> bool:
         return hash(self) == hash(other)
 
+    def set_seed(self, seed):
+        if seed.is_file():
+            self.current_seed = seed
+            self.config['seed'] = str(seed)
+        else:
+            raise FileNotFoundError(seed)
     # note this gets the gen index from config then builds the dir for that gen
     # So, if you want to start a new generation, you have to increment/change
     # self.config['gen_index'] before calling this.
-    def build_gen(self, overwrite=False):
+    def plow_harrow_plant(self, overwrite=False):
         # If we're running subsequent generations, we want to restart from prev.
         # positions and velocities.
         if self.config['gen_index'] != 0:
             self.config['initial'] = None
             self.config['new_velocities'] = False
 
-        self.current_gen_dir = dir_runs_clones_gens(
+        self.current_gen_dir = u.dir_runs_clones_gens(
             Path(self.config['traj_dir_top_level']),
             self.config['run_index'],
             self.config['clone_index'],
@@ -107,6 +132,7 @@ class Clone:
             sep=self.config['sep'],
             mkdir=True
         )
+
         config_p = self.current_gen_dir / 'config.json'
         if overwrite or not config_p.is_file():
             with config_p.open('w') as f:
@@ -122,8 +148,20 @@ class Clone:
             self.current_gen_dir / self.scheduler).with_suffix('.sh')
         self.scheduler_script_p.write_text(scheduler_script)
 
+    def check_seed(self):
+        # Check if there's a state save matching current state here
+        if self.current_seed.is_file():
+            seed_dir = self.current_seed.parent
+            if seed_dir != self.current_gen_dir:
+                cg_seed_p = self.current_gen_dir/self.config['restart_name']
+                if cg_seed_p.is_file():
+                    self.current_seed = cg_seed_p
+            self.config['seed'] = str(self.current_seed)
+        else:
+            raise FileNotFoundError(self.current_seed)
+
     def start_current(self, overwrite=False):
-        self.build_gen(overwrite=overwrite)
+        self.plow_harrow_plant(overwrite=overwrite)
         # SIMULATION RUNS HERE. OUTPUT SCANNED FOR JOB NUMBER.
         try:
             with self.scheduler_script_p.open() as f:
@@ -141,9 +179,11 @@ class Clone:
               'clone', self.config['clone_index'], 'gen',
               self.config['gen_index'])
 
-    def start_next(self, overwrite=False):
+    def start_next(self, overwrite=False, seed=None):
         # because we want to start next, increment the gen before building
         self.config['gen_index'] += 1
+        if seed:
+            self.current_seed = seed
         self.start_current(overwrite=overwrite)
 
     def check_start_gen(self, scheduler_report: set, overwrite=False):
@@ -177,6 +217,7 @@ class Clone:
                         if self.restarts_per_gen > self.restart_attempts:
                             self.restart_attempts += 1
                             self.config['steps'] = remaining_steps
+                            self.check_seed()
                             self.start_current(overwrite=overwrite)
                             # need to reset total for next round
                             self.config['steps'] = total_steps
