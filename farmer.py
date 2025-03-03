@@ -6,12 +6,13 @@ import seeder
 import simulate as sims
 import time
 
+
 class Farmer:
     __slots__ = ('runs_clones_list', 'n_runs', 'n_clones', 'n_gens', 'runner',
                  'config_template', 'jn_regex', 'current_jids', 'overwrite',
                  'active_clone_threshold', 'active_clone_set', 'runs_first',
                  'job_name_fstring', 'job_number_re', 'finished_clones',
-                 'quiet', 'sep', 'dirname_pad', 'seed_structure_fns', 'scheduler',
+                 'quiet', 'sep', 'dirname_pad', 'seed_state_fns', 'scheduler',
                  'scheduler_report_cmd', 'scheduler_fstring', 'scheduler_kws',
                  'scheduler_assoc_rep_cmd')
 
@@ -30,14 +31,14 @@ class Farmer:
         if p.is_file():
             return p
         else:
-            raise FileNotFoundError
+            raise FileNotFoundError(p)
 
     def make_clone_check_running(self, tdir, run_index, clone_index, rep_dict):
         # First, determine which (if any) generations for each run and clone have finished.
         clone_dir = u.dir_runs_clones(tdir, run_index,
-                                    clone_index,
-                                    self.dirname_pad,
-                                    mkdir=False)
+                                      clone_index,
+                                      self.dirname_pad,
+                                      mkdir=False)
         config = u.merge_args_defaults_dict(
             self.runner, **self.config_template)
         if clone_dir.is_dir():
@@ -65,24 +66,25 @@ class Farmer:
                 traj_p = (highest_gen / traj_name).with_suffix(
                     traj_suff)
                 if traj_p.is_file():
-                    try:
-                        if self.config_template['append']:
-                            remaining_steps = u.calx_remaining_steps(
-                                str(traj_p),
-                                config['prmtop_fn'],
-                                prev_config['steps'],
-                                prev_config['write_interval']
-                            )
-                            if remaining_steps > 0:
-                                config['steps'] = remaining_steps
-                            else:  # this generation is done: increment gen counter.
-                                gen_index += 1
-                    except KeyError:
+                    if self.config_template['append']:
+                        config['seed'] = traj_p.parent/self.config_template['chk_fn']
+                        remaining_steps = u.calx_remaining_steps(
+                            str(traj_p),
+                            config['prmtop_fn'],
+                            prev_config['steps'],
+                            prev_config['write_interval']
+                        )
+                        if remaining_steps > 0:
+                            config['steps'] = remaining_steps
+                            # change the config's seed to look at the checkpoint/state file in the traj_dir
+                        else:  # this generation is done: increment gen counter.
+                            gen_index += 1
+                    else:
                         old_traj_p = traj_p.parent / 'old_' + traj_p.name
                         print(
                             'Traj found, but not operating in append mode.')
                         print('Moving', str(traj_p), 'to',
-                              str(old_traj_p))
+                                str(old_traj_p))
                         traj_p.rename(old_traj_p)
                 else:
                     print('No traj found from looking in {}.'.format(
@@ -109,7 +111,7 @@ class Farmer:
         config['clone_index'] = clone_index
         config['gen_index'] = gen_index
         if gen_index == 0:
-            config['initial'] = self.seed_structure_fns[run_index]
+            config['initial'] = self.seed_state_fns[run_index]
             config['new_velocities'] = True
         else:
             config['initial'] = None
@@ -173,10 +175,10 @@ class Farmer:
         )
         seed_structure_fps = [Path(s).resolve()
                               for s in seed_structure_fns]
-        self.seed_structure_fns = []
+        self.seed_state_fns = []
         for p in seed_structure_fps:
             if p.is_file():
-                self.seed_structure_fns.append(str(p))
+                self.seed_state_fns.append(str(p))
             else:
                 print(p)
                 raise FileNotFoundError
@@ -277,7 +279,7 @@ class Farmer:
     # whether you're starting or restarting, this is probably what you want
     # if you'd just like a 'minder' process to start all your sims and keep them
     # running until they've gotten through all the generations.
-    def start_clone_minder(self, update_interval=120):
+    def start_seed_minder(self, update_interval=120):
         completed_list = self.launch(sleep=None)
         brake_file_p = Path('stop')
         # this needs to be while all(list of T/F for completed runs/clones)
@@ -298,12 +300,17 @@ class Farmer:
 class Adaptive(Farmer):
     __slots__ = ('current_gen', 'ranker', 'seeds', 'rank_jobscript')
 
-    def __init__(self, n_runs: int, n_clones: int, n_gens: int, config_template: dict, seed_structure_fns: list, scheduler: str, scheduler_fstring: str,
-                 scheduler_kws: dict, scheduler_report_cmd: str, scheduler_assoc_rep_cmd: str, traj_list=None, quiet=False,
+    def __init__(self, n_runs, n_clones, n_gens, config_template, seed_structure_fns, scheduler, scheduler_fstring,
+                 scheduler_kws, scheduler_report_cmd, scheduler_assoc_rep_cmd, traj_list=None, quiet=False,
                  active_clone_threshold=50, dirname_pad=3, job_number_re='[1-9][0-9]*', sep='-', runs_first=True,
-                 job_name_elements=('{title}', '{run_index}', '{clone_index}', '{gen_index}'), overwrite=False, runner=sims.omm_generation, current_gen=None):
-        super().__init__(n_runs, n_clones, n_gens, config_template, seed_structure_fns, scheduler, scheduler_fstring, scheduler_kws, scheduler_report_cmd,
-                         scheduler_assoc_rep_cmd, traj_list, quiet, active_clone_threshold, dirname_pad, job_number_re, sep, runs_first, job_name_elements, overwrite, runner):
+                 job_name_elements=('{title}', '{run_index}', '{clone_index}', '{gen_index}'), overwrite=False, 
+                 runner=sims.omm_generation, current_gen=None):
+
+        super().__init__(n_runs, n_clones, n_gens, config_template, seed_structure_fns, scheduler, scheduler_fstring, 
+                         scheduler_kws, scheduler_report_cmd, scheduler_assoc_rep_cmd, traj_list, quiet, 
+                         active_clone_threshold, dirname_pad, job_number_re, sep, runs_first, 
+                         job_name_elements, overwrite, runner):  # type: ignore
+
         if current_gen:
             self.current_gen = current_gen
         else:

@@ -1,20 +1,25 @@
 import json
 import openmm.app as app
 import openmm as mm
+import utilities as u
+from pathlib import Path
+
+from os import environ
 
 # This function is written so that you could use jug's 'Task' class to uplift
 # instances of calls. It returns the path to the trajectory written.
+
+
 def omm_generation(traj_dir_top_level: str,
-                   prmtop_fn: str,
+                   system_xml: str,
+                   top_file: str,
                    run_index: int,
                    clone_index: int,
                    gen_index: int,
                    title: str,
-                   # Normally the project name. Note this is obligatory.
-                   # options to write output, simulation options.
-                   # If provided, begin from these coordinates/velocities. Checks for pdb or rst7.
-                   # If None, use naming conventions below to look for restart from previous gen.
-                   initial=None,
+                   integrator_xml: str,
+                   # Begin from these coordinates/velocities. Expects a path to an OpenMM State.
+                   seed: str,
                    # if restarting, Do we start fresh or do we append?
                    append=False,
                    # dir-name indexes zero padded by this value. If 'None', then no padding.
@@ -23,61 +28,33 @@ def omm_generation(traj_dir_top_level: str,
                    sep='-',
                    # mimics fah directory structure for processed trjs.
                    traj_name='traj',
-                   # options are only .dcd at present
-                   traj_suffix='.dcd',
-                   restart_name='restart.rst7',
+                   traj_suffix='.xtc',
+                   restart_name='state.xml',
                    # If None, mm picks whichever platform it thinks is fastest at runtime.
                    platform_name=None,
                    # passed to PlatformProperties
                    platform_properties=None,
                    # State data reporter's kwargs, true or false options, see omm docs.
                    state_data_kwargs=None,
-                   # 2e7 is 100 ns, given 0.005 ps dt. Needs to be an int.
-                   steps=2 * 10 ** 7,
+                   # 2e7 is 100 ns, given 0.004 ps dt. Needs to be an int.
+                   steps=25 * 10 ** 6,
                    # If provided, take this many steps without writing any output before starting to report.
                    eq_steps=None,
-                   # Given 0.005 ps dt, 10 ps write freq.
-                   write_interval=2000,
+                   # Given 0.004 ps dt, 10 ps write freq.
+                   write_interval=2500,
                    # If true, run minimizeEnergy on simulation before taking steps.
                    # simulation parameters below here; standard values for normal solvated protein inserted.
                    # Note units in comments
                    minimize_first=False,
                    # Integrator parameters
-                   temperature=300,  # kelvin
-                   new_velocities=False,
-                   # If true, get new velocities at temperature when initializing simulation.
-                   pressure=1.0,  # atmospheres
-                   # for LangevinMiddleIntegrator; 1/picosecond
-                   friction=1.0,
-                   barostat_interval=100,  # for MC barostat
-                   # Default for Langevin; for mixed precision should be ok
-                   constraint_tolerance=1e-8,
-                   integrator_name='LangevinMiddleIntegrator',
-                   dt=0.004,
-                   # Picoseconds; chosen to work with selected hydrogen mass.
-                   # System configuration
-                   hydrogen_mass=2,
-                   # AMU; chosen to work with selected dt. Passed to createSystem.
-                   constraints='HBonds',
-                   # One of constraints.keys() in this file, or None for none.
-                   nonbond_method='PME',
-                   # One of nonbonded_methods.keys() in this file.
-                   nonbond_cutoff=1.0,
-                   # Nanometers, 1 is a decent number for a normal water + protein system.
-                   rigid_water=True,  # Passed to createSystem
+                   temperature=None,  # kelvin
+                   new_velocities=False
                    ):
-    if not platform_properties:
-        platform_properties = {'Precision': 'mixed'}
 
-    nonbonded_methods = {
-        'NoCutoff': app.NoCutoff,
-        'CutoffNonPeriodic': app.CutoffNonPeriodic,
-        'CutoffPeriodic': app.CutoffPeriodic,
-        'Ewald': app.Ewald,
-        # note, you probably want PME unless you're doing something special
-        'PME': app.PME,
-        # Include attractive LJ forces in PME calculation. Useful for membranes.
-        'LJPME': app.LJPME
+    # make reporter by extension
+    reporters = {
+        '.dcd': app.DCDReporter,
+        '.xtc': app.XTCReporter,
     }
 
     if not state_data_kwargs:
@@ -91,28 +68,12 @@ def omm_generation(traj_dir_top_level: str,
             separator='\t'
         )
 
-    constraint_types = {
-        'HBonds': app.HBonds,
-        'AllBonds': app.AllBonds,
-        'HAngles': app.HAngles
-    }
     print('starting', title, run_index, clone_index, gen_index)
-    traj_dir = dir_runs_clones_gens(Path(traj_dir_top_level), run_index,
-                                    clone_index,
-                                    gen_index, dirname_pad, sep=sep)
+    traj_dir = u.dir_runs_clones_gens(Path(traj_dir_top_level), run_index,
+                                      clone_index,
+                                      gen_index, dirname_pad, sep=sep)
     traj_path = (traj_dir / traj_name).with_suffix(traj_suffix)
 
-    # make reporter by extension
-    # TODO: add more reporters and integrators
-    reporters = {
-        '.dcd': app.DCDReporter,
-        '.rst7': parmed.openmm.reporters.RestartReporter,
-        '.out': app.StateDataReporter
-    }
-
-    integrators = {
-        "LangevinMiddleIntegrator": mm.LangevinMiddleIntegrator
-    }
     try:
         if traj_path.is_file():
             traj_reporter = reporters[traj_suffix](str(traj_path),
@@ -122,75 +83,44 @@ def omm_generation(traj_dir_top_level: str,
             traj_reporter = reporters[traj_suffix](str(traj_path),
                                                    write_interval)
     except KeyError:
-        print(
-            f'You seem to have used a trajectory extension, {traj_suffix}, '
-            f'for which no reporter is implemented yet.')
-        print('Your current choices are:', *reporters.keys())
+        print('You seem to have used a trajectory extension,',
+              traj_suffix, 'for which no reporter is implemented yet.\n',
+              'Your current choices are:', *reporters.keys())
         raise
 
     data_reporter_p = traj_path.with_suffix('.out')
-    if data_reporter_p.is_file():
-        data_reporter = reporters['.out'](str(data_reporter_p),
-                                          write_interval,
-                                          append=append,
-                                          **state_data_kwargs)
-    else:
-        data_reporter = reporters['.out'](str(data_reporter_p),
-                                          write_interval,
-                                          **state_data_kwargs)
+    data_reporter = app.StateDataReporter(
+        str(data_reporter_p),
+        write_interval,
+        append=append,
+        **state_data_kwargs)
 
-    restart_reporter = reporters['.rst7'](restart_name,
-                                          write_interval,
-                                          write_velocities=True)
+    # This will write xmls with system velocities in them
+    restart_reporter = app.CheckpointReporter(
+        restart_name,
+        write_interval,
+        writeState=True)
 
-    if initial:
-        prmtop_crds = parmed.load_file(prmtop_fn, initial)
-    elif append and Path(restart_name).is_file():
-        prmtop_crds = parmed.load_file(prmtop_fn, restart_name)
-    else:
-        prev_gen_dir = dir_runs_clones_gens(Path(traj_dir_top_level), run_index,
-                                            clone_index, gen_index - 1,
-                                            dirname_pad, sep=sep)
-        prev_rst_p = prev_gen_dir / restart_name
-        if not prev_rst_p.is_file():
-            print(prev_rst_p,
-                  'Does not exist, and no restart was provided,',
-                  'so no crds to run with. Exiting...')
-            raise
-        prmtop_crds = parmed.load_file(prmtop_fn, str(prev_rst_p))
-    system = prmtop_crds.createSystem(
-        nonbondedMethod=nonbonded_methods[nonbond_method],
-        nonbondedCutoff=nonbond_cutoff,
-        constraints=constraint_types[constraints],
-        rigidWater=rigid_water,
-        hydrogenMass=hydrogen_mass * u.amu
-    )
-    topology = prmtop_crds.topology
-    positions = prmtop_crds.positions
-    if barostat_interval > 0:
-        system.addForce(
-            mm.MonteCarloBarostat(pressure * u.atmospheres,
-                                  temperature * u.kelvin, barostat_interval))
+    system = mm.XmlSerializer.deserialize(system_xml.read_text())
+    topology = app.PDBFile(top_file).topology
 
-    integrator = integrators[integrator_name](temperature * u.kelvin,
-                                              friction / u.picoseconds,
-                                              dt * u.picoseconds)
-    integrator.setConstraintTolerance(constraint_tolerance)
+    integrator = mm.XmlSerializer.deserialize(integrator_xml.read_text())
     if platform_name:
         platform = mm.Platform_getPlatformByName(platform_name)
     else:
         platform = None
-    simulation = app.Simulation(topology, system, integrator,
-                                platform=platform,
-                                platformProperties=platform_properties)
-    simulation.context.setPositions(positions)
-    if prmtop_crds.box_vectors:
-        simulation.context.setPeriodicBoxVectors(*prmtop_crds.box_vectors)
-    if new_velocities or prmtop_crds.velocities is None:
-        simulation.context.setVelocitiesToTemperature(temperature * u.kelvin)
+    if platform_properties:
+        simulation = app.Simulation(topology, system, integrator,
+                                    platform=platform,
+                                    platformProperties=platform_properties)
     else:
-        simulation.context.setVelocities(
-            prmtop_crds.velocities * u.angstrom / u.picosecond)
+        simulation = app.Simulation(topology, system, integrator,
+                                    platform=platform)
+    simulation.loadState(seed)
+
+
+    if new_velocities:
+        simulation.context.setVelocitiesToTemperature(temperature * u.kelvin)
 
     if minimize_first:
         print('Performing energy minimization...')
@@ -238,5 +168,3 @@ def omm_basic_sim_block_json(config):
     new_traj_path = omm_generation(**conf_dict)
     with traj_list_path.open('a') as tl:
         tl.write(str(new_traj_path) + '\n')
-
-
