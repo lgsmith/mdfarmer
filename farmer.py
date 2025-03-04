@@ -1,10 +1,12 @@
 import subprocess as sp
-import utilities as u
+import utilities as util
 from pathlib import Path
 import json
 import seeder
 import simulate as sims
 import time
+
+
 
 
 class Farmer:
@@ -35,11 +37,11 @@ class Farmer:
 
     def make_clone_check_running(self, tdir, run_index, clone_index, rep_dict):
         # First, determine which (if any) generations for each run and clone have finished.
-        clone_dir = u.dir_runs_clones(tdir, run_index,
+        clone_dir = util.dir_runs_clones(tdir, run_index,
                                       clone_index,
                                       self.dirname_pad,
                                       mkdir=False)
-        config = u.merge_args_defaults_dict(
+        config = util.merge_args_defaults_dict(
             self.runner, **self.config_template)
         if clone_dir.is_dir():
             # relies on padding to cause lex sort to yield highest
@@ -67,8 +69,8 @@ class Farmer:
                     traj_suff)
                 if traj_p.is_file():
                     if self.config_template['append']:
-                        config['seed'] = traj_p.parent/self.config_template['chk_fn']
-                        remaining_steps = u.calx_remaining_steps(
+                        config['seed'] = traj_p.parent/self.config_template['state_fn']
+                        remaining_steps = util.calx_remaining_steps(
                             str(traj_p),
                             config['prmtop_fn'],
                             prev_config['steps'],

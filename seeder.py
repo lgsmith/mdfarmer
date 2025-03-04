@@ -1,5 +1,5 @@
 import inspect
-import utilities as u
+import utilities as util
 from pathlib import Path
 import subprocess as sp
 import re
@@ -7,17 +7,20 @@ import json
 
 from __future__ import annotations
 
+default_run_script = """
+from mdfarmer.simulate import omm_basic_sim_block_json as runner
+runner('config.json')
+"""
+
 
 class Clone:
     __slots__ = (
         'config', 'job_number', 'job_number_re', 'job_name_fstring', 'current_seed',
         'current_gen_dir', 'config_p', 'scheduler_script_p', 'compare_keys',
         'scheduler_fstring', 'scheduler', 'traj_list', 'sep', 'dirname_pad',
-        'scheduler_kws', 'restarts_per_gen', 'restart_attempts')
+        'scheduler_kws', 'restarts_per_gen', 'restart_attempts', 'run_script')
 
     # This should mostly be used by the init function, and by adaptive sampling scripts.
-
-
 
     def __init__(self,
                  # keys should match argument parameter names from runner
@@ -39,7 +42,7 @@ class Clone:
                  job_number=None,
                  dirname_pad=2,
                  sep='-',
-
+                 run_script=default_run_script,
                  # regex to extract job_number from submission call output.
                  job_number_re='[1-9][0-9]*',
                  # A string with anchors for keys from the config to fill in  job_name at
@@ -69,12 +72,13 @@ class Clone:
         else:
             self.scheduler_fstring = scheduler_fstring
         self.scheduler_kws = scheduler_kws
+        self.run_script = run_script
 
         # Args with defaults below here
         self.restarts_per_gen = restarts_per_gen
         # this should always start at zero, since it's incremented below.
         self.restart_attempts = 0
-        self.current_gen_dir = u.dir_runs_clones_gens(
+        self.current_gen_dir = util.dir_runs_clones_gens(
             Path(self.config['traj_dir_top_level']),
             self.config['run_index'],
             self.config['clone_index'],
@@ -116,6 +120,7 @@ class Clone:
     # note this gets the gen index from config then builds the dir for that gen
     # So, if you want to start a new generation, you have to increment/change
     # self.config['gen_index'] before calling this.
+
     def plow_harrow_plant(self, overwrite=False):
         # If we're running subsequent generations, we want to restart from prev.
         # positions and velocities.
@@ -123,7 +128,7 @@ class Clone:
             self.config['initial'] = None
             self.config['new_velocities'] = False
 
-        self.current_gen_dir = u.dir_runs_clones_gens(
+        self.current_gen_dir = util.dir_runs_clones_gens(
             Path(self.config['traj_dir_top_level']),
             self.config['run_index'],
             self.config['clone_index'],
@@ -146,7 +151,11 @@ class Clone:
                                                          **self.scheduler_kws)
         self.scheduler_script_p = (
             self.current_gen_dir / self.scheduler).with_suffix('.sh')
-        self.scheduler_script_p.write_text(scheduler_script)
+        if overwrite or not self.scheduler_script_p.is_file():
+            self.scheduler_script_p.write_text(scheduler_script)
+        run_script_p = self.current_gen_dir / 'run.py'
+        if overwrite or not run_script_p.is_file():
+            run_script_p.write_text(self.run_script)
 
     def check_seed(self):
         # Check if there's a state save matching current state here
@@ -196,7 +205,7 @@ class Clone:
                           ).with_suffix(self.config['traj_suffix'])
                 if traj_p.is_file():
                     total_steps = self.config['steps']
-                    remaining_steps = u.calx_remaining_steps(
+                    remaining_steps = util.calx_remaining_steps(
                         str(traj_p),
                         self.config['prmtop_fn'],
                         total_steps,

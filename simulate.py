@@ -1,7 +1,7 @@
 import json
 import openmm.app as app
 import openmm as mm
-import utilities as u
+import utilities as util
 from pathlib import Path
 
 from os import environ
@@ -69,7 +69,7 @@ def omm_generation(traj_dir_top_level: str,
         )
 
     print('starting', title, run_index, clone_index, gen_index)
-    traj_dir = u.dir_runs_clones_gens(Path(traj_dir_top_level), run_index,
+    traj_dir = util.dir_runs_clones_gens(Path(traj_dir_top_level), run_index,
                                       clone_index,
                                       gen_index, dirname_pad, sep=sep)
     traj_path = (traj_dir / traj_name).with_suffix(traj_suffix)
@@ -120,7 +120,7 @@ def omm_generation(traj_dir_top_level: str,
 
 
     if new_velocities:
-        simulation.context.setVelocitiesToTemperature(temperature * u.kelvin)
+        simulation.context.setVelocitiesToTemperature(temperature * util.kelvin)
 
     if minimize_first:
         print('Performing energy minimization...')
