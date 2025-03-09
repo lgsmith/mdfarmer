@@ -28,7 +28,7 @@ class Farmer:
         self.current_jids = set(map(int, jids_string.split()))
         print(self.current_jids)
 
-    def check_path(self, p):
+    def check_path(self, p: Path):
         if p.is_file():
             return p
         else:
@@ -117,10 +117,10 @@ class Farmer:
         config['gen_index'] = gen_index
         # Pick top and sys based on run index:
         sys_fn = self.system_fns[seed_index]
-        config['system_fn'] = self.check_path(sys_fn).resolve()
+        config['system_fn'] = self.check_path(Path(sys_fn)).resolve()
 
         top_fn = self.top_fns[seed_index] 
-        config['top_fn'] = self.check_path(top_fn).resolve()
+        config['top_fn'] = self.check_path(Path(top_fn)).resolve()
 
         if gen_index == 0:
             config['initial'] = self.seed_state_fns[seed_index]
