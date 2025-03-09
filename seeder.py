@@ -244,7 +244,7 @@ class Clone:
                         self.restart_attempts = 0
                         # do any automated traj postprocessing encoded by harvester
                         if self.harvester:
-                            self.harvester.reap()
+                            self.harvester.reap(self.current_gen_dir)
                         self.start_next(overwrite=overwrite)
                 else:  # no trajectory file, start from here just as if we'd found an empty file.
                     print(

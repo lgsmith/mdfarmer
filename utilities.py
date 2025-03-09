@@ -44,20 +44,30 @@ def strip_and_downsample(config_fn):
     traj_fn = f'{traj_name}{traj_suffix}'
     traj = pl.Trajectory(traj_fn, model)
     downsample_frq = config['downsample_frq']
+    dry_outfn = f'dry{sep}{traj_fn}'
+    dry_outp = Path(dry_outfn)
+    down_outfn = f'downsample{sep}{traj_fn}'
+    down_outp = Path(down_outfn)
     if traj_suffix == ".xtc":
-        dry_outtraj = loos.XTCWriter(f'dry{sep}{traj_fn}')
-        downsampe_outtraj = loos.XTCWriter(f'downsample{sep}{traj_fn}')
+        dry_outtraj = loos.XTCWriter(dry_outfn)
+        downsampe_outtraj = loos.XTCWriter(down_outfn)
     elif traj_suffix == '.dcd':
-        dry_outtraj = loos.DCDWriter(f'dry{sep}{traj_fn}')
-        downsampe_outtraj = loos.DCDWriter(f'downsample{sep}{traj_fn}')
+        dry_outtraj = loos.DCDWriter(dry_outfn)
+        downsampe_outtraj = loos.DCDWriter(down_outfn)
     else:
         raise NotImplemented(f'{traj_suffix}: not implemented for basic strip and downsample')
     while next(traj, False):
         dry_outtraj.writeFrame(subset)
         if traj.frameNumber() % downsample_frq == 0:
             downsampe_outtraj.writeFrame(model)
+    
     # if we've subset and also dried the trajectories, remove the original.
-    Path(traj_fn).unlink()
+    # Should raise a file not found error if the call to stat() 
+    # is applied to a file that was never created
+    if dry_outp.stat().st_size > 0 and down_outp.stat().st_size > 0:
+        Path(traj_fn).unlink()
+    else:
+        print('either', dry_outp, 'or', down_outp,'are size zero, refusing to unlink')
 
 
 # These basic strings are useful in many cases on clusters using the scheduler named as the key.
