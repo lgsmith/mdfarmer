@@ -115,12 +115,12 @@ class Farmer:
         config['seed_index'] = seed_index
         config['clone_index'] = clone_index
         config['gen_index'] = gen_index
-        # Pick top and sys based on run index:
+        # Pick top and sys based on seed index:
         sys_fn = self.system_fns[seed_index]
-        config['system_fn'] = self.check_path(Path(sys_fn)).resolve()
+        config['system_fn'] = str(self.check_path(Path(sys_fn)).resolve())
 
         top_fn = self.top_fns[seed_index] 
-        config['top_fn'] = self.check_path(Path(top_fn)).resolve()
+        config['top_fn'] = str(self.check_path(Path(top_fn)).resolve())
 
         if gen_index == 0:
             config['initial'] = self.seed_state_fns[seed_index]
@@ -138,7 +138,7 @@ class Farmer:
             job_number_re=self.job_number_re,
             job_name_fstring=self.job_name_fstring,
             dirname_pad=self.dirname_pad,
-            sep=self.sep,
+            sep=self.sep
         )
         if jid:
             self.active_clone_set.add()

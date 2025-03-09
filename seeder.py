@@ -148,6 +148,7 @@ class Clone:
 
         config_p = self.current_gen_dir / 'config.json'
         if overwrite or not config_p.is_file():
+            print(self.config)
             with config_p.open('w') as f:
                 json.dump(self.config, f, indent=4)
         else:
