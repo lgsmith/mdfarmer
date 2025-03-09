@@ -95,10 +95,10 @@ class Farmer:
                 if traj_p.is_file():
                     if self.config_template['append']:
                         # Because jobs will be launched from traj_p.parent file should be there
-                        config['seed_fn'] = self.config_template['restart_fn']
+                        config['seed_fn'] = self.config_template['restart_name']
                         remaining_steps = util.calx_remaining_steps(
                             str(traj_p),
-                            config['top_fn'],
+                            prev_config['top_fn'],
                             prev_config['steps'],
                             prev_config['write_interval']
                         )
