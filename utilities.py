@@ -201,8 +201,7 @@ default_straight_sampling_config_template = dict(
     write_interval=2500,
     minimize_first=False,
     temperature=300,
-    new_velocities=False,
-    harvester_subset='resid<100'  # Definitely change!
+    new_velocities=False
 )
 
 # You'll need to replace all of these, but I wanted it to be more clear what the slots were.
