@@ -98,7 +98,7 @@ class Farmer:
                             self.config_template['state_fn']
                         remaining_steps = util.calx_remaining_steps(
                             str(traj_p),
-                            config['prmtop_fn'],
+                            config['top_fn'],
                             prev_config['steps'],
                             prev_config['write_interval']
                         )
@@ -151,10 +151,8 @@ class Farmer:
         config['top_fn'] = str(self.check_path(Path(top_fn)).resolve())
 
         if gen_index == 0:
-            config['initial'] = self.seed_state_fns[seed_index]
             config['new_velocities'] = True
         else:
-            config['initial'] = None
             config['new_velocities'] = False
         clone = seeder.Clone(
             config,
@@ -169,7 +167,7 @@ class Farmer:
             sep=self.sep
         )
         if jid:
-            self.active_clone_set.add()
+            self.active_clone_set.add(clone)
 
         return clone
 
