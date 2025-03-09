@@ -31,19 +31,27 @@ except ImportError:
         return length
 
 
-def strip_and_downsample(config_fn):
+"""
+To run this one, hconfig needs to contain the following keys:
+ - `'harvester_subset'`: a LOOS selection string that produces the desired system subsetting.
+ - `'downsample_frq'`: An int---the number of frames to skip over before writing another solvated frame.
+"""
+def strip_and_downsample(config_fn, harvester_config_fn):
     import loos
     from loos import pyloos as pl
     config_fp = Path(config_fn)
     config = json.loads(config_fp.read_text())
+    hconfig_fp = Path(harvester_config_fn)
+    hconfig = json.loads(hconfig_fp.read_text())
     sep = config['sep']
     model = loos.createSystem(config['top_file'])
-    subset = loos.selectAtoms(model, config['harvester_subset'])
+    subset_selection = hconfig['harvester_subset']
+    subset = loos.selectAtoms(model, subset_selection)
     traj_name = config['traj_name']
     traj_suffix = config['traj_suffix']
     traj_fn = f'{traj_name}{traj_suffix}'
     traj = pl.Trajectory(traj_fn, model)
-    downsample_frq = config['downsample_frq']
+    downsample_frq = hconfig['downsample_frq']
     dry_outfn = f'dry{sep}{traj_fn}'
     dry_outp = Path(dry_outfn)
     down_outfn = f'downsample{sep}{traj_fn}'
@@ -219,5 +227,5 @@ default_harvest_shellscript = inspect.cleandoc("""#!/bin/bash
                 #BSUB -o harvest.out
                 #BSUB -q {queue_name}
 
-                python -c 'from mdfarmer.utilities import strip_and_downsample; strip_and_downsample("config.json")'
+                python -c 'from mdfarmer.utilities import strip_and_downsample; strip_and_downsample("config.json", "hconfig.json")'
                 """)
