@@ -18,7 +18,8 @@ class Clone:
         'config', 'job_number', 'job_number_re', 'job_name_fstring', 'current_seed',
         'current_gen_dir', 'config_p', 'scheduler_script_p', 'compare_keys',
         'scheduler_fstring', 'scheduler', 'traj_list', 'sep', 'dirname_pad',
-        'scheduler_kws', 'restarts_per_gen', 'restart_attempts', 'run_script')
+        'scheduler_kws', 'restarts_per_gen', 'restart_attempts', 'run_script',
+        'harvester')
 
     # This should mostly be used by the init function, and by adaptive sampling scripts.
 
@@ -56,7 +57,8 @@ class Clone:
                      '{title}', '{run_index}', '{clone_index}',
                      '{gen_index}'),
                  # Compare keys are used by eq and hash to determine whether two clones are equal.
-                 compare_keys=('title', 'run_index', 'clone_index')
+                 compare_keys=('title', 'run_index', 'clone_index'),
+                 harvester=None
                  ):
         # REQUIRED ARGS below here
         self.config = config  # dict keys and values must be json serializable.
@@ -96,6 +98,7 @@ class Clone:
         self.dirname_pad = dirname_pad
         self.job_number_re = re.compile(job_number_re)
         self.compare_keys = compare_keys
+        self.harvester = harvester
 
     # Compare a value across self config and other config in other Clone.
     def conf_value_eq(self, other: Clone, conf_key: str) -> bool:
@@ -239,6 +242,9 @@ class Clone:
 
                     else:  # trajectory was created, and finished running.
                         self.restart_attempts = 0
+                        # do any automated traj postprocessing encoded by harvester
+                        if self.harvester:
+                            self.harvester.reap()
                         self.start_next(overwrite=overwrite)
                 else:  # no trajectory file, start from here just as if we'd found an empty file.
                     print(
