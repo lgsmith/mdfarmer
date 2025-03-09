@@ -1,6 +1,7 @@
 import json
 import openmm.app as app
 import openmm as mm
+from openmm import unit
 from . import utilities as util
 from pathlib import Path
 
@@ -106,7 +107,7 @@ def omm_generation(traj_dir_top_level: str,
 
     integrator = mm.XmlSerializer.deserialize(Path(integrator_xml).read_text())
     if platform_name:
-        platform = mm.Platform_getPlatformByName(platform_name)
+        platform = mm.Platform.getPlatformByName(platform_name)
     else:
         platform = None
     if platform_properties:
@@ -120,7 +121,7 @@ def omm_generation(traj_dir_top_level: str,
 
 
     if new_velocities:
-        simulation.context.setVelocitiesToTemperature(temperature * util.kelvin)
+        simulation.context.setVelocitiesToTemperature(temperature * unit.kelvin)
 
     if minimize_first:
         print('Performing energy minimization...')
