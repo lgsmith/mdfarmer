@@ -13,7 +13,7 @@ from os import environ
 def omm_generation(traj_dir_top_level: str,
                    system_xml: str,
                    top_file: str,
-                   run_index: int,
+                   seed_index: int,
                    clone_index: int,
                    gen_index: int,
                    title: str,
@@ -68,8 +68,8 @@ def omm_generation(traj_dir_top_level: str,
             separator='\t'
         )
 
-    print('starting', title, run_index, clone_index, gen_index)
-    traj_dir = util.dir_runs_clones_gens(Path(traj_dir_top_level), run_index,
+    print('starting', title, seed_index, clone_index, gen_index)
+    traj_dir = util.dir_seeds_clones_gens(Path(traj_dir_top_level), seed_index,
                                       clone_index,
                                       gen_index, dirname_pad, sep=sep)
     traj_path = (traj_dir / traj_name).with_suffix(traj_suffix)

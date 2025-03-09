@@ -19,7 +19,7 @@ class Clone:
         'current_gen_dir', 'config_p', 'scheduler_script_p', 'compare_keys',
         'scheduler_fstring', 'scheduler', 'traj_list', 'sep', 'dirname_pad',
         'scheduler_kws', 'restarts_per_gen', 'restart_attempts', 'run_script',
-        'harvester')
+        'harvester', 'run_script_name')
 
     # This should mostly be used by the init function, and by adaptive sampling scripts.
 
@@ -51,14 +51,14 @@ class Clone:
                  job_name_fstring=None,
                  # if job_name_fstring is none, join iterable of job_name_elements
                  # and save as sef.job_name_fstring. Default vals are recommended min.
-                 # If each of these are not in job name, with run, clone, gen in that order
+                 # If each of these are not in job name, with seed, clone, gen in that order
                  # reassociation from a killed orchestrator will fail.
                  job_name_elements=(
-                     '{title}', '{run_index}', '{clone_index}',
+                     '{title}', '{seed_index}', '{clone_index}',
                      '{gen_index}'),
                  # Compare keys are used by eq and hash to determine whether two clones are equal.
-                 compare_keys=('title', 'run_index', 'clone_index'),
-                 harvester=None
+                 compare_keys=('title', 'seed_index', 'clone_index'),
+                 harvester=None,
                  ):
         # REQUIRED ARGS below here
         self.config = config  # dict keys and values must be json serializable.
@@ -74,15 +74,19 @@ class Clone:
         else:
             self.scheduler_fstring = scheduler_fstring
         self.scheduler_kws = scheduler_kws
-        self.run_script = run_script
+        try:
+            self.run_script_name = self.scheduler_kws['run_script_name']
+        except KeyError:
+            self.run_script_name = 'run.py'
+            scheduler_kws['run_script_name'] = self.run_script_name
 
         # Args with defaults below here
         self.restarts_per_gen = restarts_per_gen
         # this should always start at zero, since it's incremented below.
         self.restart_attempts = 0
-        self.current_gen_dir = util.dir_runs_clones_gens(
+        self.current_gen_dir = util.dir_seeds_clones_gens(
             Path(self.config['traj_dir_top_level']),
-            self.config['run_index'],
+            self.config['seed_index'],
             self.config['clone_index'],
             self.config['gen_index'],
             self.config['dirname_pad'],
@@ -99,12 +103,13 @@ class Clone:
         self.job_number_re = re.compile(job_number_re)
         self.compare_keys = compare_keys
         self.harvester = harvester
+        self.run_script = run_script
 
     # Compare a value across self config and other config in other Clone.
     def conf_value_eq(self, other: Clone, conf_key: str) -> bool:
         return self.config[conf_key] == other.config[conf_key]
 
-    # Two clones should be the same if their config has the same run, clone, and title in it.
+    # Two clones should be the same if their config has the same seed, clone, and title in it.
     # Customize by providing a set of keys to compare.
     def __hash__(self):
         return hash(tuple(self.config[k] for k in self.compare_keys))
@@ -131,9 +136,9 @@ class Clone:
             self.config['initial'] = None
             self.config['new_velocities'] = False
 
-        self.current_gen_dir = util.dir_runs_clones_gens(
+        self.current_gen_dir = util.dir_seeds_clones_gens(
             Path(self.config['traj_dir_top_level']),
-            self.config['run_index'],
+            self.config['seed_index'],
             self.config['clone_index'],
             self.config['gen_index'],
             self.config['dirname_pad'],
@@ -150,13 +155,13 @@ class Clone:
                   'Proceeding with old config; did not ask for overwrite.')
 
         job_name = self.job_name_fstring.format(**self.config)
-        scheduler_script = self.scheduler_fstring.format(job_name=job_name,
+        scheduler_script = self.scheduler_fstring.format(job_name=job_name, 
                                                          **self.scheduler_kws)
         self.scheduler_script_p = (
             self.current_gen_dir / self.scheduler).with_suffix('.sh')
         if overwrite or not self.scheduler_script_p.is_file():
             self.scheduler_script_p.write_text(scheduler_script)
-        run_script_p = self.current_gen_dir / 'run.py'
+        run_script_p = self.current_gen_dir / self.run_script_name
         if overwrite or not run_script_p.is_file():
             run_script_p.write_text(self.run_script)
 
@@ -187,7 +192,7 @@ class Clone:
         # is the Job number.
         self.job_number = int(
             self.job_number_re.search(scheduler_output).group(0))
-        print('started job', self.job_number, 'run', self.config['run_index'],
+        print('started job', self.job_number, 'seed', self.config['seed_index'],
               'clone', self.config['clone_index'], 'gen',
               self.config['gen_index'])
 
@@ -224,7 +229,8 @@ class Clone:
                         traj_p.unlink()
                         self.restart_attempts += 1
                         self.start_current(overwrite=overwrite)
-                    # if this, the trajectory has steps remaining before it is a full gen. Run those.
+                    # if this, the trajectory has steps remaining before it is a full gen. 
+                    # Run those.
                     elif remaining_steps > 0:
                         if self.restarts_per_gen > self.restart_attempts:
                             self.restart_attempts += 1
