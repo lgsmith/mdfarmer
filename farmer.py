@@ -94,8 +94,8 @@ class Farmer:
                     traj_suff)
                 if traj_p.is_file():
                     if self.config_template['append']:
-                        config['seed'] = traj_p.parent / \
-                            self.config_template['state_fn']
+                        # Because jobs will be launched from traj_p.parent file should be there
+                        config['seed_fn'] = self.config_template['restart_fn']
                         remaining_steps = util.calx_remaining_steps(
                             str(traj_p),
                             config['top_fn'],
