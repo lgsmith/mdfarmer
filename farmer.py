@@ -57,9 +57,9 @@ class Farmer:
             highest_gen = None
         if highest_gen:
             config_p = highest_gen / 'config.json'
-            if config_p.is_file():
-                with config_p.open() as f:
-                    prev_config = json.load(f)
+            try:
+                prev_config_raw = config_p.read_text()
+                prev_config = json.loads(prev_config_raw)
                 gen_index = prev_config['gen_index']
                 try:
                     traj_name = prev_config['traj_name']
@@ -96,9 +96,14 @@ class Farmer:
                     print('Starting from fresh dir for seed {seed_index},'
                           ' clone {clone_index},'
                           ' gen {gen_index}.'.format(**prev_config))
-            else:
+            except FileNotFoundError:
                 print(
                     'Could not find config, parsing gen_index from path.')
+                gen_index = int(highest_gen.name.split(self.sep)[-1])
+            except json.decoder.JSONDecodeError:
+                print('Config at', config_p, 
+                      'appears to contain malformed json; here is the raw string:')
+                print(prev_config_raw,'\nProceeding to obtain gen index from path.')
                 gen_index = int(highest_gen.name.split(self.sep)[-1])
         else:
             # if we get here in control flow,  then we start fresh
