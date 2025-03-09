@@ -101,10 +101,10 @@ def omm_generation(traj_dir_top_level: str,
         write_interval,
         writeState=True)
 
-    system = mm.XmlSerializer.deserialize(system_fn.read_text())
+    system = mm.XmlSerializer.deserialize(Path(system_fn).read_text())
     topology = app.PDBFile(top_fn).topology
 
-    integrator = mm.XmlSerializer.deserialize(integrator_xml.read_text())
+    integrator = mm.XmlSerializer.deserialize(Path(integrator_xml).read_text())
     if platform_name:
         platform = mm.Platform_getPlatformByName(platform_name)
     else:
