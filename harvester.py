@@ -8,7 +8,7 @@ class Harvester:
                  'harvester_template', 'scheduler', 'scriptname')
 
     def __init__(self,  main_path: Path, harvester_template: str, 
-                 scheduler: str, run_config=None, scriptname='postprocess.sh'):
+                 scheduler: str, run_config=None, scriptname='harvest.sh'):
         # Expects a dict to be fed to harvester_template.format(**run_config)
         self.run_config = run_config
         # the path the data is in. This will be the gen_dir to submit from
