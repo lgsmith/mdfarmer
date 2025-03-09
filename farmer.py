@@ -8,11 +8,10 @@ import time
 import copy
 
 
-
 class Farmer:
-    __slots__ = ('seeds_clones_list', 'n_seeds', 'n_clones', 'n_gens', 'runner',
+    __slots__ = ('priority_ordered_clones', 'n_seeds', 'n_clones', 'n_gens', 'runner',
                  'config_template', 'jn_regex', 'current_jids', 'overwrite',
-                 'active_clone_threshold', 'active_clone_set', 'seeds_first',
+                 'active_clone_threshold', 'active_clone_set', 'failed_clone_set', 'seeds_first',
                  'job_name_fstring', 'job_number_re', 'finished_clones', 'harvester',
                  'quiet', 'sep', 'dirname_pad', 'seed_state_fns', 'scheduler',
                  'scheduler_report_cmd', 'scheduler_fstring', 'scheduler_kws',
@@ -38,12 +37,36 @@ class Farmer:
         p = Path(self.config_template[key])
         self.check_path(p)
 
+    # move clone off the active list
+    def mark_clone_failed(self, clone):
+        self.failed_clone_set.add(clone)
+        try:
+            self.active_clone_set.remove(clone)
+        except KeyError:  # if clone isn't in active set that's OK.
+            pass
+        print('FAILED CLONE:', clone.get_tag())
+
+    # Check if clone has finished all its generations. 
+    # Remove from clone_list, and active set, and add to finished set. 
+    # return True if finished, False if not.
+    def check_mark_clone_finished(self, clone):
+        next_up_gen = clone.current_gen
+        enough_gens = next_up_gen > self.n_gens
+        if enough_gens:
+            print('Finished:', clone.get_tag())
+            self.finished_clones.add(clone)
+            try:
+                self.active_clone_set.remove(clone)
+            except KeyError:
+                print('done_before_launch', clone.get_tag())
+        return enough_gens
+
     def make_clone_check_running(self, tdir, seed_index, clone_index, rep_dict):
         # First, determine which (if any) generations for each run and clone have finished.
         clone_dir = util.dir_seeds_clones(tdir, seed_index,
-                                      clone_index,
-                                      self.dirname_pad,
-                                      mkdir=False)
+                                          clone_index,
+                                          self.dirname_pad,
+                                          mkdir=False)
         config = copy.deepcopy(self.config_template)
         if clone_dir.is_dir():
             # relies on padding to cause lex sort to yield highest
@@ -71,7 +94,8 @@ class Farmer:
                     traj_suff)
                 if traj_p.is_file():
                     if self.config_template['append']:
-                        config['seed'] = traj_p.parent/self.config_template['state_fn']
+                        config['seed'] = traj_p.parent / \
+                            self.config_template['state_fn']
                         remaining_steps = util.calx_remaining_steps(
                             str(traj_p),
                             config['prmtop_fn'],
@@ -88,7 +112,7 @@ class Farmer:
                         print(
                             'Traj found, but not operating in append mode.')
                         print('Moving', str(traj_p), 'to',
-                                str(old_traj_p))
+                              str(old_traj_p))
                         traj_p.rename(old_traj_p)
                 else:
                     print('No traj found from looking in {}.'.format(
@@ -101,9 +125,9 @@ class Farmer:
                     'Could not find config, parsing gen_index from path.')
                 gen_index = int(highest_gen.name.split(self.sep)[-1])
             except json.decoder.JSONDecodeError:
-                print('Config at', config_p, 
+                print('Config at', config_p,
                       'appears to contain malformed json; here is the raw string:')
-                print(prev_config_raw,'\nProceeding to obtain gen index from path.')
+                print(prev_config_raw, '\nProceeding to obtain gen index from path.')
                 gen_index = int(highest_gen.name.split(self.sep)[-1])
         else:
             # if we get here in control flow,  then we start fresh
@@ -123,7 +147,7 @@ class Farmer:
         sys_fn = self.system_fns[seed_index]
         config['system_fn'] = str(self.check_path(Path(sys_fn)).resolve())
 
-        top_fn = self.top_fns[seed_index] 
+        top_fn = self.top_fns[seed_index]
         config['top_fn'] = str(self.check_path(Path(top_fn)).resolve())
 
         if gen_index == 0:
@@ -151,7 +175,8 @@ class Farmer:
 
     def __init__(self, n_seeds: int, n_clones: int, n_gens: int,
                  config_template: dict,
-                 seed_structure_fns: list,  # len(seed_structure_fns) == n_seeds
+                 # len(seed_structure_fns) == n_seeds
+                 seed_structure_fns: list,
                  system_fns: list,
                  top_fns: list,
                  scheduler: str,
@@ -188,12 +213,12 @@ class Farmer:
         self.scheduler_report_cmd = scheduler_report_cmd
         self.scheduler_assoc_rep_cmd = scheduler_assoc_rep_cmd
         self.job_number_re = job_number_re
-        self.harvester=harvester
+        self.harvester = harvester
         # Ensure that all file-names are in the config as full paths
         self.config_template['traj_dir_top_level'] = str(
             Path(self.config_template['traj_dir_top_level']).resolve()
         )
-        
+
         seed_structure_fps = [Path(s).resolve()
                               for s in seed_structure_fns]
         self.seed_state_fns = []
@@ -212,9 +237,10 @@ class Farmer:
         # important to pass this down through the clones
         self.job_name_fstring = self.sep.join(job_name_elements)
         self.current_jids = set()
-        self.finished_clones = dict()
+        self.finished_clones = set()
         self.active_clone_threshold = active_clone_threshold
         self.active_clone_set = set()
+        self.failed_clone_set = set()
         try:
             traj_list = self.config_template['traj_list']
             self.config_template['traj_list'] = str(Path(traj_list).resolve())
@@ -239,65 +265,80 @@ class Farmer:
             for line in report:
                 ls = line.split()
                 jid = int(ls[0])
-                rix, cix, gix = map(int, ls[1].split(self.sep)[1:])
-                rep_dict[(rix, cix, gix)] = jid
+                six, cix, gix = map(int, ls[1].split(self.sep)[1:])
+                rep_dict[(six, cix, gix)] = jid
 
         tdir = Path(self.config_template['traj_dir_top_level'])
-        self.seeds_clones_list = []
+        self.priority_ordered_clones = []
         # try to figure out how 'complete' all extant clones are
         if self.seeds_first:
-            # order list so that we try to start an unfinished clone in each 
+            # order list so that we try to start an unfinished clone in each
             # seed before moving to the next clone.
             for clone_index in range(self.n_clones):
                 clone_queue = []
                 for seed_index in range(self.n_seeds):
                     clone_queue.append(self.make_clone_check_running(
                         tdir, seed_index, clone_index, rep_dict))
-                self.seeds_clones_list.append(clone_queue)
+                self.priority_ordered_clones.append(clone_queue)
         else:
-            # else order list so to start each unfinished clone in 
+            # else order list so to start each unfinished clone in
             # a given seed before moving to the next seed.
             for seed_index in range(self.n_seeds):
                 clone_queue = []
                 for clone_index in range(self.n_clones):
                     clone_queue.append(self.make_clone_check_running(
                         tdir, seed_index, clone_index, rep_dict))
-                self.seeds_clones_list.append(clone_queue)
+                self.priority_ordered_clones.append(clone_queue)
 
     def launch(self, sleep=None, update_jids=True):
-        retlist = []  # note, this will be flat
+        still_running = []  # note, this will be flat
         if update_jids:
             self.update_jids()
-        for seed_index, clone_list in enumerate(self.seeds_clones_list):
-            for clone_index, clone in enumerate(clone_list):
-                if sleep:
-                    time.sleep(sleep)
+        for clone_list in self.priority_ordered_clones:
+            # Record one False for a fully emptied clone-list
+            if not clone_list:
+                still_running.append(False)
+            else:
+                clone_indexes_to_remove = []
+                for i, clone in enumerate(clone_list):
+                    if sleep:
+                        time.sleep(sleep)
+                    # This probably shouldn't happen, but it's worth checking for
+                    if clone in self.finished_clones or \
+                          clone in self.failed_clone_set:
+                        still_running.append(False)
+                        clone_indexes_to_remove.append(i)
+                    elif self.check_mark_clone_finished(clone):
+                        still_running.append(False)
+                        clone_indexes_to_remove.append(i)
+                    # If clone is in active set, it may have just finished a generation. 
+                    elif clone in self.active_clone_set:
+                        # Try to start another.
+                        if clone.check_start_gen( self.current_jids, overwrite=self.overwrite):
+                            still_running.append(True)
+                        else:
+                            self.mark_clone_failed(clone)
+                            still_running.append(False)
+                            clone_indexes_to_remove.append(i)
 
-                next_up_gen = clone.config['gen_index']
-                # this is only a check to see if the clone has run enough gens.
-                enough_gens = next_up_gen > self.n_gens
-                retlist.append(enough_gens)
-                if enough_gens:
-                    self.finished_clones[
-                        (seed_index, clone_index, next_up_gen)
-                    ] = clone
-                    clone_list.remove(clone)
-                    try:
-                        self.active_clone_set.remove(clone)
-                    except KeyError:
-                        print(
-                            f'done_before_launch: {seed_index},{clone_index},{next_up_gen}')
-                elif clone in self.active_clone_set:
-                    clone.check_start_gen(
-                        self.current_jids, overwrite=self.overwrite
-                    )
-                elif len(self.active_clone_set) < self.active_clone_threshold:
-                    self.active_clone_set.add(clone)
-                    clone.check_start_gen(
-                        self.current_jids, overwrite=self.overwrite
-                    )
-
-        return retlist
+                    # This condition arises when there are few enough active clones 
+                    # that we could launch more.
+                    elif len(self.active_clone_set) < self.active_clone_threshold:
+                        #  So we try to launch another.
+                        if clone.check_start_gen(self.current_jids, overwrite=self.overwrite):
+                            self.active_clone_set.add(clone)
+                            still_running.append(True)
+                        else:
+                            self.mark_clone_failed(clone, clone_list)
+                            still_running.append(False)
+                            clone_indexes_to_remove.append(i)
+                    else:
+                        print('WARNING:', clone.get_tag(), 'is not accounted for by launch logic.')
+                # Because we are changing the length of the list, this must be done in reverse order
+                clone_indexes_to_remove.reverse()
+                for i in clone_indexes_to_remove:
+                    del clone_list[i]
+        return still_running
 
     # whether you're starting or restarting, this is probably what you want
     # if you'd just like a 'minder' process to start all your sims and keep them
@@ -327,19 +368,19 @@ class Adaptive(Farmer):
     def __init__(self, n_seeds, n_clones, n_gens, config_template, seed_structure_fns, scheduler, scheduler_fstring,
                  scheduler_kws, scheduler_report_cmd, scheduler_assoc_rep_cmd, traj_list=None, quiet=False,
                  active_clone_threshold=50, dirname_pad=3, job_number_re='[1-9][0-9]*', sep='-', seeds_first=True,
-                 job_name_elements=('{title}', '{seed_index}', '{clone_index}', '{gen_index}'), overwrite=False, 
+                 job_name_elements=('{title}', '{seed_index}', '{clone_index}', '{gen_index}'), overwrite=False,
                  runner=sims.omm_generation, current_gen=None):
 
-        super().__init__(n_seeds, n_clones, n_gens, config_template, seed_structure_fns, scheduler, scheduler_fstring, 
-                         scheduler_kws, scheduler_report_cmd, scheduler_assoc_rep_cmd, traj_list, quiet, 
-                         active_clone_threshold, dirname_pad, job_number_re, sep, seeds_first, 
-                         job_name_elements, overwrite, runner) 
+        super().__init__(n_seeds, n_clones, n_gens, config_template, seed_structure_fns, scheduler, scheduler_fstring,
+                         scheduler_kws, scheduler_report_cmd, scheduler_assoc_rep_cmd, traj_list, quiet,
+                         active_clone_threshold, dirname_pad, job_number_re, sep, seeds_first,
+                         job_name_elements, overwrite, runner)
 
         if current_gen:
             self.current_gen = current_gen
         else:
             current_youngest_gen = self.n_gens
-            for clone_list in self.seeds_clones_list:
+            for clone_list in self.priority_ordered_clones:
                 for clone in clone_list:
                     clone_gen = clone.config['gen_index']
                     if current_youngest_gen > clone_gen:
@@ -350,7 +391,7 @@ class Adaptive(Farmer):
         retlist = []  # note, this will be flat
         if update_jids:
             self.update_jids()
-        for seed_index, clone_list in enumerate(self.seeds_clones_list):
+        for seed_index, clone_list in enumerate(self.priority_ordered_clones):
             for clone_index, clone in enumerate(clone_list):
                 if sleep:
                     time.sleep(sleep)
