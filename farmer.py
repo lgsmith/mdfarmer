@@ -133,6 +133,7 @@ class Farmer:
             self.scheduler,
             self.scheduler_fstring,
             self.scheduler_kws,
+            self.seed_state_fns[seed_index],
             job_number=jid,
             job_number_re=self.job_number_re,
             job_name_fstring=self.job_name_fstring,
