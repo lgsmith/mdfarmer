@@ -80,7 +80,7 @@ basic_scheduler_fstrings = {
                 {gpu_line}
                 #BSUB -q {queue_name}
 
-                python -c 'from mdfarmer import omm_basic_sim_block_json as runner; runner("config.json")'
+                python {run_script_name}
                 """),
     "slurm": inspect.cleandoc("""
                 #SBATCH -j {job_name}
@@ -89,7 +89,7 @@ basic_scheduler_fstrings = {
                 {gpu_line}
                 #SBATCH -p {queue_name}
                 
-                python -c 'from mdfarmer import omm_basic_sim_block_json as runner; runner("config.json")'
+                python {run_script_name}
                 """)
 }
 
@@ -110,7 +110,7 @@ basic_scheduler_reports = {
 
 # Basic report to print the name, and then the jobid, for each job with job title
 # created by orchestrator. Allows scripts to associate currently running jobs to
-# their run, clone, and gen indexes. Output should be a string where each new line
+# their seed, clone, and gen indexes. Output should be a string where each new line
 # is a job, with the Job ID in the first field and the Job Name in the second.
 # __init__ from Orchestrator calls:
 #   self.scheduler_assoc_fstring.format(title=self.config_template['title'])
@@ -139,18 +139,18 @@ def fdir(dirpre, num, pad, sep='-', padchar='0'):
     return f'{dirpre}{sep}{num:{padchar}>{pad}}'
 
 
-def dir_runs_clones(top_lvl: Path, run_index, clone_index, pad, sep='-',
+def dir_seeds_clones(top_lvl: Path, seed_index, clone_index, pad, sep='-',
                     padchar='0', mkdir=True):
-    p = top_lvl / fdir('run', run_index, pad, sep=sep, padchar=padchar) / \
+    p = top_lvl / fdir('seed', seed_index, pad, sep=sep, padchar=padchar) / \
         fdir('clone', clone_index, pad, sep=sep, padchar=padchar)
     if mkdir:
         p.mkdir(exist_ok=True, parents=True)
     return p
 
 
-def dir_runs_clones_gens(top_lvl: Path, run_index, clone_index, gen_index, pad,
+def dir_seeds_clones_gens(top_lvl: Path, seed_index, clone_index, gen_index, pad,
                          sep='-', padchar='0', mkdir=True):
-    p = top_lvl / fdir('run', run_index, pad, sep=sep, padchar=padchar) / \
+    p = top_lvl / fdir('seed', seed_index, pad, sep=sep, padchar=padchar) / \
         fdir('clone', clone_index, pad, sep=sep, padchar=padchar) / \
         fdir('gen', gen_index, pad, sep=sep, padchar=padchar)
     if mkdir:
