@@ -297,8 +297,9 @@ class Farmer:
     # whether you're starting or restarting, this is probably what you want
     # if you'd just like a 'minder' process to start all your sims and keep them
     # running until they've gotten through all the generations.
-    def start_tending_seeds(self, update_interval=120):
+    def start_tending_fields(self, update_interval=120):
         completed_list = self.launch(sleep=None)
+        print('completed_list', *completed_list)
         brake_file_p = Path('stop')
         # this needs to be while all(list of T/F for completed seeds/clones)
         while not all(completed_list):
