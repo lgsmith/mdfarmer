@@ -13,10 +13,10 @@ class Farmer:
     __slots__ = ('runs_clones_list', 'n_runs', 'n_clones', 'n_gens', 'runner',
                  'config_template', 'jn_regex', 'current_jids', 'overwrite',
                  'active_clone_threshold', 'active_clone_set', 'runs_first',
-                 'job_name_fstring', 'job_number_re', 'finished_clones',
+                 'job_name_fstring', 'job_number_re', 'finished_clones', 'harvester',
                  'quiet', 'sep', 'dirname_pad', 'seed_state_fns', 'scheduler',
                  'scheduler_report_cmd', 'scheduler_fstring', 'scheduler_kws',
-                 'scheduler_assoc_rep_cmd')
+                 'scheduler_assoc_rep_cmd', 'system_fns', 'top_fns')
 
     def update_jids(self):
         jids_string = sp.check_output(
@@ -28,12 +28,15 @@ class Farmer:
         self.current_jids = set(map(int, jids_string.split()))
         print(self.current_jids)
 
-    def check_path_config(self, key):
-        p = Path(self.config_template[key])
+    def check_path(self, p):
         if p.is_file():
             return p
         else:
             raise FileNotFoundError(p)
+
+    def check_path_config(self, key):
+        p = Path(self.config_template[key])
+        self.check_path(p)
 
     def make_clone_check_running(self, tdir, run_index, clone_index, rep_dict):
         # First, determine which (if any) generations for each run and clone have finished.
@@ -112,6 +115,13 @@ class Farmer:
         config['run_index'] = run_index
         config['clone_index'] = clone_index
         config['gen_index'] = gen_index
+        # Pick top and sys based on run index:
+        sys_fn = self.system_fns[run_index]
+        config['system_fn'] = self.check_path(sys_fn).resolve()
+
+        top_fn = self.top_fns[run_index] 
+        config['top_fn'] = self.check_path(top_fn).resolve()
+
         if gen_index == 0:
             config['initial'] = self.seed_state_fns[run_index]
             config['new_velocities'] = True
@@ -137,6 +147,8 @@ class Farmer:
     def __init__(self, n_runs: int, n_clones: int, n_gens: int,
                  config_template: dict,
                  seed_structure_fns: list,  # len(seed_structure_fns) == n_runs
+                 system_fns: list,
+                 top_fns: list,
                  scheduler: str,
                  scheduler_fstring: str,
                  scheduler_kws: dict,
@@ -153,6 +165,7 @@ class Farmer:
                      '{title}', '{run_index}', '{clone_index}',
                      '{gen_index}'),
                  overwrite=False,
+                 harvester=None,
                  runner=sims.omm_generation
                  ):
         self.n_runs = n_runs
@@ -160,6 +173,8 @@ class Farmer:
         self.n_gens = n_gens
         self.overwrite = overwrite
         self.config_template = config_template
+        self.system_fns = system_fns
+        self.top_fns = top_fns
         self.runner = runner
         self.runs_first = runs_first
         self.scheduler = scheduler
@@ -168,16 +183,12 @@ class Farmer:
         self.scheduler_report_cmd = scheduler_report_cmd
         self.scheduler_assoc_rep_cmd = scheduler_assoc_rep_cmd
         self.job_number_re = job_number_re
+        self.harvester=harvester
         # Ensure that all file-names are in the config as full paths
         self.config_template['traj_dir_top_level'] = str(
             Path(self.config_template['traj_dir_top_level']).resolve()
         )
-        self.config_template['system_fn'] = str(
-            self.check_path_config('system_fn').resolve()
-        )
-        self.config_template['system_fn'] = str(
-            self.check_path_config('system_fn').resolve()
-        )
+        
         seed_structure_fps = [Path(s).resolve()
                               for s in seed_structure_fns]
         self.seed_state_fns = []
@@ -284,14 +295,14 @@ class Farmer:
     # whether you're starting or restarting, this is probably what you want
     # if you'd just like a 'minder' process to start all your sims and keep them
     # running until they've gotten through all the generations.
-    def start_seed_minder(self, update_interval=120):
+    def start_tending_seeds(self, update_interval=120):
         completed_list = self.launch(sleep=None)
         brake_file_p = Path('stop')
         # this needs to be while all(list of T/F for completed runs/clones)
         while not all(completed_list):
             if brake_file_p.is_file():
                 print(
-                    f'Brake file detected: {brake_file_p} Stopping submission loop.')
+                    f'Brake file detected: {brake_file_p.resolve()} Stopping submission loop.')
                 return False
             completed_list = self.launch(sleep=None)
             if not self.quiet:
