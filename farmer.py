@@ -5,7 +5,7 @@ import json
 from . import seeder
 from . import simulate as sims
 import time
-
+import copy
 
 
 
@@ -44,8 +44,7 @@ class Farmer:
                                       clone_index,
                                       self.dirname_pad,
                                       mkdir=False)
-        config = util.merge_args_defaults_dict(
-            self.runner, **self.config_template)
+        config = copy.deepcopy(self.config_template)
         if clone_dir.is_dir():
             # relies on padding to cause lex sort to yield highest
             # gen dir as last element
