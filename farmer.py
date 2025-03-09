@@ -172,8 +172,11 @@ class Farmer:
         self.config_template['traj_dir_top_level'] = str(
             Path(self.config_template['traj_dir_top_level']).resolve()
         )
-        self.config_template['prmtop_fn'] = str(
-            self.check_path_config('prmtop_fn').resolve()
+        self.config_template['system_fn'] = str(
+            self.check_path_config('system_fn').resolve()
+        )
+        self.config_template['system_fn'] = str(
+            self.check_path_config('system_fn').resolve()
         )
         seed_structure_fps = [Path(s).resolve()
                               for s in seed_structure_fns]
