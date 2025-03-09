@@ -1,9 +1,9 @@
 import subprocess as sp
-import utilities as util
+from . import utilities as util
 from pathlib import Path
 import json
-import seeder
-import simulate as sims
+from . import seeder
+from . import simulate as sims
 import time
 
 
@@ -314,7 +314,7 @@ class Adaptive(Farmer):
         super().__init__(n_runs, n_clones, n_gens, config_template, seed_structure_fns, scheduler, scheduler_fstring, 
                          scheduler_kws, scheduler_report_cmd, scheduler_assoc_rep_cmd, traj_list, quiet, 
                          active_clone_threshold, dirname_pad, job_number_re, sep, runs_first, 
-                         job_name_elements, overwrite, runner):  # type: ignore
+                         job_name_elements, overwrite, runner) 
 
         if current_gen:
             self.current_gen = current_gen
