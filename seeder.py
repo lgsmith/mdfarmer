@@ -1,11 +1,11 @@
+from __future__ import annotations
 import inspect
-import utilities as util
+from . import utilities as util
 from pathlib import Path
 import subprocess as sp
 import re
 import json
 
-from __future__ import annotations
 
 default_run_script = """
 from mdfarmer.simulate import omm_basic_sim_block_json as runner

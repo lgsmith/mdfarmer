@@ -1,7 +1,7 @@
 import json
 import openmm.app as app
 import openmm as mm
-import utilities as util
+from . import utilities as util
 from pathlib import Path
 
 from os import environ
