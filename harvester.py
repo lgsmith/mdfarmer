@@ -4,7 +4,7 @@ import json
 
 
 class Harvester:
-    __slots__ = ('run_config', 'main_path', 'run_config_name'
+    __slots__ = ('run_config', 'main_path', 'run_config_name',
                  'harvester_template', 'scheduler', 'scriptname')
 
     def __init__(self,  harvester_template: str, 
