@@ -35,7 +35,7 @@ class Clone:
                  # Keys should match fstring anchors. Values should be desired substitution.
                  scheduler_kws: dict,
                  # should be path to the serialized xml this clone will grow from.
-                 seed: str,
+                 seed_fn: str,
                  # If true, call inspect.cleandoc on sched. fstring prior to binding it to self.
                  cleandoc_sched_fstring=True,
                  restarts_per_gen=3,
@@ -64,10 +64,10 @@ class Clone:
         self.config = config  # dict keys and values must be json serializable.
         self.total_steps = config['steps']
         self.remaining_steps = self.total_steps
-        seed_p = Path(seed)
+        seed_p = Path(seed_fn)
         if seed_p.is_file():
             self.current_seed = seed_p
-            self.config['seed'] = seed
+            self.config['seed_fn'] = seed_fn
         else:
             raise FileNotFoundError(seed_p)
         self.scheduler = scheduler
@@ -127,12 +127,13 @@ class Clone:
         return ' '.join((f'{k}: {self.config[k]}'
                          for k in self.compare_keys))
 
-    def set_seed(self, seed):
-        if seed.is_file():
-            self.current_seed = seed
-            self.config['seed'] = str(seed)
+    def set_seed(self, seed_fp):
+        if seed_fp.is_file():
+            self.current_seed = seed_fp
+            self.config['seed_fn'] = str(seed_fp)
         else:
-            raise FileNotFoundError(seed)
+            print('ERROR: CLONE', self.get_tag(), 'could not find seed.')
+            raise FileNotFoundError(seed_fp)
     # note this gets the gen index from config then builds the dir for that gen
     # So, if you want to start a new generation, you have to increment/change
     # self.config['gen_index'] before calling this.
@@ -143,7 +144,6 @@ class Clone:
         # If we're running subsequent generations, we want to restart from prev.
         # positions and velocities.
         if self.config['gen_index'] != 0:
-            self.config['initial'] = None
             self.config['new_velocities'] = False
 
         self.current_gen_dir = util.dir_seeds_clones_gens(
@@ -182,17 +182,16 @@ class Clone:
                   self.restart_attempts, 'times. Aborting this clone.')
             return False
 
-    def check_seed(self):
+    def check_set_restart_seed(self):
         # Check if there's a state save matching current state here
-        if self.current_seed.is_file():
             seed_dir = self.current_seed.parent
             if seed_dir != self.current_gen_dir:
                 cg_seed_p = self.current_gen_dir/self.config['restart_name']
                 if cg_seed_p.is_file():
                     self.current_seed = cg_seed_p
-            self.config['seed'] = str(self.current_seed)
-        else:
-            raise FileNotFoundError(self.current_seed)
+                else:
+                    raise FileNotFoundError(cg_seed_p)
+                self.config['seed_fn'] = str(self.current_seed)
 
     def start_current(self, overwrite=False):
         should_launch = self.plow_harrow_plant(overwrite=overwrite)
@@ -211,16 +210,14 @@ class Clone:
             # is the Job number.
             self.job_number = int(
                 self.job_number_re.search(scheduler_output).group(0))
-            print('started job', self.job_number, 'seed', self.config['seed_index'],
-                  'clone', self.config['clone_index'], 'gen',
-                  self.config['gen_index'])
+            print('Started:', self.get_tag())
         return should_launch
 
-    def start_next(self, overwrite=False, seed=None):
+    def start_next(self, overwrite=False):
+        # Set seed to be current restart file, but full path so it will be found in next gen dir.
+        self.set_seed((self.current_gen_dir/self.config['restart_fn']).resolve())
         # because we want to start next, increment the gen before building
         self.config['gen_index'] += 1
-        if seed:
-            self.current_seed = seed
         attempted_launch = self.start_current(overwrite=overwrite)
         return attempted_launch
 
@@ -254,7 +251,7 @@ class Clone:
                     # Run those.
                     elif self.remaining_steps > 0:
                         self.config['steps'] = self.remaining_steps
-                        self.check_seed()
+                        self.check_set_restart_seed()
                         no_failure = self.start_current(overwrite=overwrite)
                     else:  # trajectory was created, and finished running.
                         self.restart_attempts = 0

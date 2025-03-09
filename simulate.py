@@ -11,15 +11,15 @@ from os import environ
 
 
 def omm_generation(traj_dir_top_level: str,
-                   system_xml: str,
-                   top_file: str,
+                   system_fn: str,
+                   top_fn: str,
                    seed_index: int,
                    clone_index: int,
                    gen_index: int,
                    title: str,
                    integrator_xml: str,
                    # Begin from these coordinates/velocities. Expects a path to an OpenMM State.
-                   seed: str,
+                   seed_fn: str,
                    # if restarting, Do we start fresh or do we append?
                    append=False,
                    # dir-name indexes zero padded by this value. If 'None', then no padding.
@@ -101,8 +101,8 @@ def omm_generation(traj_dir_top_level: str,
         write_interval,
         writeState=True)
 
-    system = mm.XmlSerializer.deserialize(system_xml.read_text())
-    topology = app.PDBFile(top_file).topology
+    system = mm.XmlSerializer.deserialize(system_fn.read_text())
+    topology = app.PDBFile(top_fn).topology
 
     integrator = mm.XmlSerializer.deserialize(integrator_xml.read_text())
     if platform_name:
@@ -116,7 +116,7 @@ def omm_generation(traj_dir_top_level: str,
     else:
         simulation = app.Simulation(topology, system, integrator,
                                     platform=platform)
-    simulation.loadState(seed)
+    simulation.loadState(seed_fn)
 
 
     if new_velocities:
