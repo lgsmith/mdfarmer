@@ -71,8 +71,8 @@ def omm_generation(traj_dir_top_level: str,
 
     print('starting', title, seed_index, clone_index, gen_index)
     traj_dir = util.dir_seeds_clones_gens(Path(traj_dir_top_level), seed_index,
-                                      clone_index,
-                                      gen_index, dirname_pad, sep=sep)
+                                          clone_index,
+                                          gen_index, dirname_pad, sep=sep)
     traj_path = (traj_dir / traj_name).with_suffix(traj_suffix)
 
     try:
@@ -119,10 +119,16 @@ def omm_generation(traj_dir_top_level: str,
                                     platform=platform)
     simulation.loadState(seed_fn)
 
-
     if new_velocities:
-        simulation.context.setVelocitiesToTemperature(temperature * unit.kelvin)
-
+        simulation.context.setVelocitiesToTemperature(
+            temperature * unit.kelvin)
+    # Because of openmm issue with xtcwriter, check if seed is current gen's restart
+    if traj_path.suffix == '.xtc':
+        seed_p = Path(seed_fn)
+        if traj_path.parent != seed_p.parent or not append:
+            simulation.currentStep = 0
+            print('Not appending or restarting, so setting steps to 0.',
+                  flush=True)
     if minimize_first:
         print('Performing energy minimization...')
         simulation.minimizeEnergy()
