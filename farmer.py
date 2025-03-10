@@ -358,11 +358,11 @@ class Farmer:
                 print(
                     f'Brake file detected: {brake_file_p.resolve()} Stopping submission loop.')
                 return False
+            time.sleep(update_interval)
             still_running = self.launch(sleep=None)
             if not self.quiet:
                 print('The following (seed clone gen) are complete:', ', '.join((
                     map(lambda c: c.get_tag(), self.finished_clones))))
-            time.sleep(update_interval)
             print('STILL RUNNING:', *still_running)
         # If we get here, that means the minder thinks all clones have finished.
         return True
