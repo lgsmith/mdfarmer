@@ -36,6 +36,7 @@ class Harvester:
                 scheduler_output = sp.check_output(
                     self.scheduler, stdin=f, cwd=current_dir, text=True
                 )
+                print('harvester output:', scheduler_output)
         except sp.CalledProcessError as err:
             print(f'{self.scheduler} call threw error', err.stdout, err.stderr)
             raise
