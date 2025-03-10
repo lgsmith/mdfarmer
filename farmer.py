@@ -164,7 +164,8 @@ class Farmer:
             job_number_re=self.job_number_re,
             job_name_fstring=self.job_name_fstring,
             dirname_pad=self.dirname_pad,
-            sep=self.sep
+            sep=self.sep,
+            harvester=self.harvester
         )
         if jid:
             self.active_clone_set.add(clone)
