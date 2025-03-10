@@ -81,7 +81,7 @@ def strip_and_downsample(config_fn, harvester_config_fn):
         traj_p = Path(traj_fn)
         traj_p.unlink()
         # leave a symlink to dry traj so that frame counting efforts don't go awry
-        dry_outp.symlink_to(traj_p)
+        traj_p.symlink_to(dry_outp)
     else:
         print('either', dry_outp, 'or', down_outp,'are size zero, refusing to unlink')
 
