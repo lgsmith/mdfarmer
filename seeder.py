@@ -57,7 +57,7 @@ class Clone:
                      '{title}', '{seed_index}', '{clone_index}',
                      '{gen_index}'),
                  # Compare keys are used by eq and hash to determine whether two clones are equal.
-                 compare_keys=('title', 'seed_index', 'clone_index'),
+                 compare_keys=('seed_index', 'clone_index'),
                  harvester=None,
                  ):
         # REQUIRED ARGS below here
@@ -215,7 +215,7 @@ class Clone:
 
     def start_next(self, overwrite=False):
         # Set seed to be current restart file, but full path so it will be found in next gen dir.
-        self.set_seed((self.current_gen_dir/self.config['restart_fn']).resolve())
+        self.set_seed((self.current_gen_dir/self.config['restart_name']).resolve())
         # because we want to start next, increment the gen before building
         self.config['gen_index'] += 1
         attempted_launch = self.start_current(overwrite=overwrite)
