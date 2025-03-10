@@ -144,7 +144,7 @@ def omm_generation(traj_dir_top_level: str,
     state = simulation.context.getState(getPositions=True, getVelocities=True,
                                         enforcePeriodicBox=True)
     restart_reporter.report(simulation, state)
-
+    print('Done!')
     return traj_path.resolve()
 
 

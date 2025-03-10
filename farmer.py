@@ -295,22 +295,27 @@ class Farmer:
         for clone_list in self.priority_ordered_clones:
             # Record one False for a fully emptied clone-list
             if not clone_list:
+                print('not clonelist-triggered')
                 still_running.append(False)
             else:
                 clone_indexes_to_remove = []
                 for i, clone in enumerate(clone_list):
+                    print('starting into clone loop for clone index', i, clone.get_tag())
                     if sleep:
                         time.sleep(sleep)
                     # This probably shouldn't happen, but it's worth checking for
                     if clone in self.finished_clones or \
                           clone in self.failed_clone_set:
+                        print('clone is finished clones or failed clones')
                         still_running.append(False)
                         clone_indexes_to_remove.append(i)
                     elif self.check_mark_clone_finished(clone):
+                        print('clone was just marked finished')
                         still_running.append(False)
                         clone_indexes_to_remove.append(i)
                     # If clone is in active set, it may have just finished a generation. 
                     elif clone in self.active_clone_set:
+                        print('clone is in active clone list')
                         # Try to start another.
                         if clone.check_start_gen( self.current_jids, overwrite=self.overwrite):
                             still_running.append(True)
@@ -322,8 +327,10 @@ class Farmer:
                     # This condition arises when there are few enough active clones 
                     # that we could launch more.
                     elif len(self.active_clone_set) < self.active_clone_threshold:
+                        print('there are some more active clones, let us launch', clone.get_tag())
                         #  So we try to launch another.
                         if clone.check_start_gen(self.current_jids, overwrite=self.overwrite):
+                            print('started clone, adding to active_clone_set')
                             self.active_clone_set.add(clone)
                             still_running.append(True)
                         else:
@@ -342,20 +349,21 @@ class Farmer:
     # if you'd just like a 'minder' process to start all your sims and keep them
     # running until they've gotten through all the generations.
     def start_tending_fields(self, update_interval=120):
-        completed_list = self.launch(sleep=None)
-        print('completed_list', *completed_list)
+        still_running = self.launch(sleep=None, update_jids=False)
         brake_file_p = Path('stop')
         # this needs to be while all(list of T/F for completed seeds/clones)
-        while not all(completed_list):
+        print('still_running:', *still_running)
+        while any(still_running):
             if brake_file_p.is_file():
                 print(
                     f'Brake file detected: {brake_file_p.resolve()} Stopping submission loop.')
                 return False
-            completed_list = self.launch(sleep=None)
+            still_running = self.launch(sleep=None)
             if not self.quiet:
-                print('The following (seed clone gen) are complete:', *(
-                    ','.join(map(str, self.finished_clones))))
+                print('The following (seed clone gen) are complete:', ', '.join((
+                    map(lambda c: c.get_tag(), self.finished_clones))))
             time.sleep(update_interval)
+            print('STILL RUNNING:', *still_running)
         # If we get here, that means the minder thinks all clones have finished.
         return True
 
@@ -408,7 +416,7 @@ class Adaptive(Farmer):
                     except KeyError:
                         print(
                             f'done_before_launch: {seed_index},{clone_index},{next_up_gen}')
-                elif clone in self.active_clone_set:
+                elif clone in melf.active_clone_set:
                     clone.check_start_gen(
                         self.current_jids, overwrite=self.overwrite
                     )
