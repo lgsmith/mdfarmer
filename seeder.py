@@ -155,7 +155,6 @@ class Clone:
             sep=self.config['sep'],
             mkdir=True
         )
-
         config_p = self.current_gen_dir / 'config.json'
         if overwrite or not config_p.is_file():
             with config_p.open('w') as f:
@@ -218,6 +217,7 @@ class Clone:
         self.set_seed((self.current_gen_dir/self.config['restart_name']).resolve())
         # because we want to start next, increment the gen before building
         self.config['gen_index'] += 1
+        self.current_gen += 1
         attempted_launch = self.start_current(overwrite=overwrite)
         return attempted_launch
 
