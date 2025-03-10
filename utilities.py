@@ -47,6 +47,9 @@ def strip_and_downsample(config_fn, harvester_config_fn):
     model = loos.createSystem(config['top_fn'])
     subset_selection = hconfig['harvester_subset']
     subset = loos.selectAtoms(model, subset_selection)
+    # dump to PDB for topology
+    pdb = loos.PDB.fromAtomicGroup(subset)
+    Path('dry-top.pdb').write_text(str(pdb))
     traj_name = config['traj_name']
     traj_suffix = config['traj_suffix']
     traj_fn = f'{traj_name}{traj_suffix}'
@@ -54,6 +57,7 @@ def strip_and_downsample(config_fn, harvester_config_fn):
     downsample_frq = hconfig['downsample_frq']
     dry_outfn = f'dry{sep}{traj_fn}'
     dry_outp = Path(dry_outfn)
+
     down_outfn = f'downsample{sep}{traj_fn}'
     down_outp = Path(down_outfn)
     if traj_suffix == ".xtc":
@@ -67,14 +71,17 @@ def strip_and_downsample(config_fn, harvester_config_fn):
     print(f'Preparing to loop over trj in strip and downsample.')
     while next(traj, False):
         dry_outtraj.writeFrame(subset)
-        if traj.frameNumber() % downsample_frq == 0:
+        if traj.index() % downsample_frq == 0:
             downsampe_outtraj.writeFrame(model)
     
     # if we've subset and also dried the trajectories, remove the original.
     # Should raise a file not found error if the call to stat() 
     # is applied to a file that was never created
     if dry_outp.stat().st_size > 0 and down_outp.stat().st_size > 0:
-        Path(traj_fn).unlink()
+        traj_p = Path(traj_fn)
+        traj_p.unlink()
+        # leave a symlink to dry traj so that frame counting efforts don't go awry
+        dry_outp.symlink_to(traj_p)
     else:
         print('either', dry_outp, 'or', down_outp,'are size zero, refusing to unlink')
 
