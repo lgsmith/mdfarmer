@@ -47,9 +47,7 @@ def strip_and_downsample(config_fn, harvester_config_fn):
     model = loos.createSystem(config['top_fn'])
     subset_selection = hconfig['harvester_subset']
     subset = loos.selectAtoms(model, subset_selection)
-    # dump to PDB for topology
-    pdb = loos.PDB.fromAtomicGroup(subset)
-    Path('dry-top.pdb').write_text(str(pdb))
+    
     traj_name = config['traj_name']
     traj_suffix = config['traj_suffix']
     traj_fn = f'{traj_name}{traj_suffix}'
@@ -73,6 +71,10 @@ def strip_and_downsample(config_fn, harvester_config_fn):
         dry_outtraj.writeFrame(subset)
         if traj.index() % downsample_frq == 0:
             downsampe_outtraj.writeFrame(model)
+    # dump to PDB for topology
+    subset.pruneBonds()  # Need to do this to ensure connects are correct.
+    pdb = loos.PDB.fromAtomicGroup(subset)
+    Path('dry-top.pdb').write_text(str(pdb))
     
     # if we've subset and also dried the trajectories, remove the original.
     # Should raise a file not found error if the call to stat() 
