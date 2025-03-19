@@ -92,31 +92,34 @@ class Farmer:
                     traj_suff = config['traj_suffix']
                 traj_p = (highest_gen / traj_name).with_suffix(
                     traj_suff)
-                if traj_p.is_file():
-                    if self.config_template['append']:
-                        # Because jobs will be launched from traj_p.parent file should be there
-                        config['seed_fn'] = self.config_template['restart_name']
-                        remaining_steps = util.calx_remaining_steps(
-                            str(traj_p),
-                            prev_config['top_fn'],
-                            prev_config['steps'],
-                            prev_config['write_interval']
-                        )
-                        if remaining_steps > 0:
-                            config['steps'] = remaining_steps
-                            # change the config's seed to look at the checkpoint/state file in the traj_dir
-                        else:  # this generation is done: increment gen counter.
-                            gen_index += 1
+                try: 
+                    if traj_p.stat().st_size > 0:
+                        if config['append']:
+                            # Because jobs will be launched from traj_p.parent file should be there
+                            config['seed_fn'] = prev_config['seed_fn']
+                            remaining_steps = util.calx_remaining_steps(
+                                str(traj_p),
+                                prev_config['top_fn'],
+                                prev_config['steps'],
+                                prev_config['write_interval']
+                            )
+                            if remaining_steps > 0:
+                                config['steps'] = remaining_steps
+                                # change the config's seed to look at the checkpoint/state file in the traj_dir
+                            else:  # this generation is done: increment gen counter.
+                                gen_index += 1
+                        else:
+                            old_traj_p = traj_p.parent / 'old_' + traj_p.name
+                            print(
+                                'Traj found, but not operating in append mode.')
+                            print('Moving', str(traj_p), 'to',
+                                str(old_traj_p))
+                            traj_p.rename(old_traj_p)
                     else:
-                        old_traj_p = traj_p.parent / 'old_' + traj_p.name
-                        print(
-                            'Traj found, but not operating in append mode.')
-                        print('Moving', str(traj_p), 'to',
-                              str(old_traj_p))
-                        traj_p.rename(old_traj_p)
-                else:
-                    print('No traj found from looking in {}.'.format(
-                        config_p))
+                        print('Empty trajectory found from looking in:', config_p,)
+                        traj_p.unlink()
+                except FileNotFoundError:
+                    print(f'No traj found from looking in {config_p}.')
                     print('Starting from fresh dir for seed {seed_index},'
                           ' clone {clone_index},'
                           ' gen {gen_index}.'.format(**prev_config))
