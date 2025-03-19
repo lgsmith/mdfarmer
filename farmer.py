@@ -72,7 +72,8 @@ class Farmer:
             # relies on padding to cause lex sort to yield highest
             # gen dir as last element
             try:
-                highest_gen = sorted(clone_dir.iterdir())[-1]
+                gen_paths =  sorted(clone_dir.iterdir())
+                highest_gen = gen_paths[-1]
             except IndexError:
                 highest_gen = None
         else:
@@ -96,18 +97,36 @@ class Farmer:
                     if traj_p.stat().st_size > 0:
                         if config['append']:
                             # Because jobs will be launched from traj_p.parent file should be there
-                            config['seed_fn'] = prev_config['seed_fn']
-                            remaining_steps = util.calx_remaining_steps(
-                                str(traj_p),
-                                prev_config['top_fn'],
-                                prev_config['steps'],
-                                prev_config['write_interval']
-                            )
-                            if remaining_steps > 0:
-                                config['steps'] = remaining_steps
-                                # change the config's seed to look at the checkpoint/state file in the traj_dir
-                            else:  # this generation is done: increment gen counter.
-                                gen_index += 1
+                            restart_p = Path(prev_config['restart_fn'])
+                            if restart_p.is_file():
+                                config['seed_fn'] = str(restart_p.resolve())
+                                remaining_steps = util.calx_remaining_steps(
+                                    str(traj_p),
+                                    prev_config['top_fn'],
+                                    prev_config['steps'],
+                                    prev_config['write_interval']
+                                )
+                                if remaining_steps > 0:
+                                    config['steps'] = remaining_steps
+                                    # change the config's seed to look at the checkpoint/state file in the traj_dir
+                                else:  # this generation is done: increment gen counter.
+                                    gen_index += 1
+                            else:
+                                print(traj_p, 'found, but no restart at', restart_p, 
+                                      'so unlinking and building fresh.')
+                                traj_p.unlink() 
+                                try:
+                                    prev_prev_dirp = gen_paths[-2]
+                                    prev_prev_config_raw = (prev_prev_dirp/'config.json').read_text()
+                                    prev_prev_config = json.loads(prev_prev_config_raw)
+                                    restart_p = prev_prev_dirp/ prev_prev_config['restart_fn']
+                                    config['seed_fn'] = str(restart_p.resove())
+                                except IndexError:
+                                    print('Starting over since first generation is borked')
+                                    highest_gen = None
+                                except json.JSONDecodeError:
+                                    print('Prev gen Config illegible, so starting over')
+                                    highest_gen = None
                         else:
                             old_traj_p = traj_p.parent / 'old_' + traj_p.name
                             print(
