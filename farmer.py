@@ -97,7 +97,7 @@ class Farmer:
                     if traj_p.stat().st_size > 0:
                         if config['append']:
                             # Because jobs will be launched from traj_p.parent file should be there
-                            restart_p = Path(prev_config['restart_name'])
+                            restart_p = highest_gen / prev_config['restart_name'])
                             if restart_p.is_file():
                                 config['seed_fn'] = str(restart_p.resolve())
                                 remaining_steps = util.calx_remaining_steps(
@@ -187,7 +187,8 @@ class Farmer:
             job_name_fstring=self.job_name_fstring,
             dirname_pad=self.dirname_pad,
             sep=self.sep,
-            harvester=self.harvester
+            harvester=self.harvester,
+            dry_run=self.dry_run
         )
         if jid:
             self.active_clone_set.add(clone)
