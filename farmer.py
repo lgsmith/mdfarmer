@@ -97,7 +97,7 @@ class Farmer:
                     if traj_p.stat().st_size > 0:
                         if config['append']:
                             # Because jobs will be launched from traj_p.parent file should be there
-                            restart_p = Path(prev_config['restart_fn'])
+                            restart_p = Path(prev_config['restart_name'])
                             if restart_p.is_file():
                                 config['seed_fn'] = str(restart_p.resolve())
                                 remaining_steps = util.calx_remaining_steps(
@@ -119,7 +119,7 @@ class Farmer:
                                     prev_prev_dirp = gen_paths[-2]
                                     prev_prev_config_raw = (prev_prev_dirp/'config.json').read_text()
                                     prev_prev_config = json.loads(prev_prev_config_raw)
-                                    restart_p = prev_prev_dirp/ prev_prev_config['restart_fn']
+                                    restart_p = prev_prev_dirp/ prev_prev_config['restart_name']
                                     config['seed_fn'] = str(restart_p.resove())
                                 except IndexError:
                                     print('Starting over since first generation is borked')
