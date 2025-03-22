@@ -15,7 +15,7 @@ runner('config.json')
 
 class Clone:
     __slots__ = (
-        'config', 'job_number', 'job_number_re', 'job_name_fstring', 'current_seed',
+        'config', 'dry_run', 'job_number', 'job_number_re', 'job_name_fstring', 'current_seed',
         'current_gen_dir', 'current_gen', 'config_p', 'scheduler_script_p', 'compare_keys',
         'scheduler_fstring', 'scheduler', 'traj_list', 'sep', 'dirname_pad',
         'scheduler_kws', 'restarts_per_gen', 'restart_attempts', 'run_script',
@@ -59,6 +59,7 @@ class Clone:
                  # Compare keys are used by eq and hash to determine whether two clones are equal.
                  compare_keys=('seed_index', 'clone_index'),
                  harvester=None,
+                 dry_run=False
                  ):
         # REQUIRED ARGS below here
         self.config = config  # dict keys and values must be json serializable.
@@ -83,6 +84,7 @@ class Clone:
             scheduler_kws['run_script_name'] = self.run_script_name
 
         # Args with defaults below here
+        self.dry_run = dry_run
         self.restarts_per_gen = restarts_per_gen
         # this should always start at zero, since it's incremented below.
         self.restart_attempts = 0
@@ -194,7 +196,7 @@ class Clone:
 
     def start_current(self, overwrite=False):
         should_launch = self.plow_harrow_plant(overwrite=overwrite)
-        if should_launch:
+        if should_launch and not self.dry_run:
             # SIMULATION RUNS HERE. OUTPUT SCANNED FOR JOB NUMBER.
             try:
                 with self.scheduler_script_p.open() as f:
@@ -260,7 +262,7 @@ class Clone:
                         # do any automated traj postprocessing encoded by harvester
                         if self.harvester:
                             print('running harvester!')
-                            self.harvester.reap(self.current_gen_dir)
+                            self.harvester.reap(self.current_gen_dir, dry_run=self.dry_run)
                         no_failure = self.start_next(overwrite=overwrite)
                 else:  # no trajectory file, start from here just as if we'd found an empty file.
                     print(
