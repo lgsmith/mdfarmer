@@ -120,7 +120,7 @@ class Farmer:
                                     prev_prev_config_raw = (prev_prev_dirp/'config.json').read_text()
                                     prev_prev_config = json.loads(prev_prev_config_raw)
                                     restart_p = prev_prev_dirp/ prev_prev_config['restart_name']
-                                    config['seed_fn'] = str(restart_p.resove())
+                                    config['seed_fn'] = str(restart_p.resolve())
                                 except IndexError:
                                     print('Starting over since first generation is borked')
                                     highest_gen = None
