@@ -29,15 +29,18 @@ class Harvester:
         harvest_script_p.write_text(harvest_script)
         return harvest_script_p
 
-    def reap(self, current_dir):
+    def reap(self, current_dir, dry_run=False):
         harvest_script_p = self.prep_and_write_inputs(current_dir)
-        try:
-            with harvest_script_p.open() as f:
-                scheduler_output = sp.check_output(
-                    self.scheduler, stdin=f, cwd=current_dir, text=True
-                )
-                print('harvester scheduler return:', scheduler_output)
-        except sp.CalledProcessError as err:
-            print(f'{self.scheduler} call threw error', err.stdout, err.stderr)
-            raise
+        if not dry_run:
+            try:
+                with harvest_script_p.open() as f:
+                    scheduler_output = sp.check_output(
+                        self.scheduler, stdin=f, cwd=current_dir, text=True
+                    )
+                    print('harvester scheduler return:', scheduler_output)
+            except sp.CalledProcessError as err:
+                print(f'{self.scheduler} call threw error', err.stdout, err.stderr)
+                raise
+        else:
+            scheduler_output = None
         return scheduler_output

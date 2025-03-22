@@ -10,7 +10,7 @@ import copy
 
 class Farmer:
     __slots__ = ('priority_ordered_clones', 'n_seeds', 'n_clones', 'n_gens', 'runner',
-                 'config_template', 'jn_regex', 'current_jids', 'overwrite',
+                 'config_template', 'jn_regex', 'current_jids', 'dry_run', 'overwrite',
                  'active_clone_threshold', 'active_clone_set', 'failed_clone_set', 'seeds_first',
                  'job_name_fstring', 'job_number_re', 'finished_clones', 'harvester',
                  'quiet', 'sep', 'dirname_pad', 'seed_state_fns', 'scheduler',
@@ -217,7 +217,8 @@ class Farmer:
                      '{gen_index}'),
                  overwrite=False,
                  harvester=None,
-                 runner=sims.omm_generation
+                 runner=sims.omm_generation,
+                 dry_run=False
                  ):
         self.n_seeds = n_seeds
         self.n_clones = n_clones
@@ -235,6 +236,7 @@ class Farmer:
         self.scheduler_assoc_rep_cmd = scheduler_assoc_rep_cmd
         self.job_number_re = job_number_re
         self.harvester = harvester
+        self.dry_run = dry_run
         # Ensure that all file-names are in the config as full paths
         self.config_template['traj_dir_top_level'] = str(
             Path(self.config_template['traj_dir_top_level']).resolve()
@@ -376,6 +378,11 @@ class Farmer:
         brake_file_p = Path('stop')
         # this needs to be while all(list of T/F for completed seeds/clones)
         print('still_running:', *still_running)
+        # If dry run, short circuit the tending loop.
+        if self.dry_run:
+            still_running = [False]
+        # check on how the jobs are doing, see if you can launch more!
+        # AKA the tending loop.
         while any(still_running):
             if brake_file_p.is_file():
                 print(
