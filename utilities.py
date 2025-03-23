@@ -65,8 +65,8 @@ def strip_and_downsample(config_fn, harvester_config_fn):
         dry_outtraj = loos.DCDWriter(dry_outfn)
         downsampe_outtraj = loos.DCDWriter(down_outfn)
     else:
-        raise NotImplemented(f'{traj_suffix}: not implemented for basic strip and downsample')
-    print(f'Preparing to loop over trj in strip and downsample.')
+        raise NotImplementedError(f'{traj_suffix}: not implemented for basic strip and downsample')
+    print('Preparing to loop over trj in strip and downsample.')
     while next(traj, False):
         dry_outtraj.writeFrame(subset)
         if traj.index() % downsample_frq == 0:
