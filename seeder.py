@@ -196,7 +196,9 @@ class Clone:
 
     def start_current(self, overwrite=False):
         should_launch = self.plow_harrow_plant(overwrite=overwrite)
+        print(self.get_tag(), 'should_launch', should_launch, 'dry_run', self.dry_run)
         if should_launch and not self.dry_run:
+            print('launching', self.get_tag())
             # SIMULATION RUNS HERE. OUTPUT SCANNED FOR JOB NUMBER.
             try:
                 with self.scheduler_script_p.open() as f:
