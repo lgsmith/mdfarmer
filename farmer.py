@@ -97,7 +97,7 @@ class Farmer:
                     if traj_p.stat().st_size > 0:
                         if config['append']:
                             # Because jobs will be launched from traj_p.parent file should be there
-                            restart_p = highest_gen / prev_config['restart_name'])
+                            restart_p = highest_gen / prev_config['restart_name']
                             if restart_p.is_file():
                                 config['seed_fn'] = str(restart_p.resolve())
                                 remaining_steps = util.calx_remaining_steps(
@@ -360,7 +360,7 @@ class Farmer:
                             self.active_clone_set.add(clone)
                             still_running.append(True)
                         else:
-                            self.mark_clone_failed(clone, clone_list)
+                            self.mark_clone_failed(clone)
                             still_running.append(False)
                             clone_indexes_to_remove.append(i)
                     else:
@@ -399,69 +399,69 @@ class Farmer:
         return True
 
 
-class Adaptive(Farmer):
-    __slots__ = ('current_gen', 'ranker', 'seeds', 'rank_jobscript')
+# class Adaptive(Farmer):
+#     __slots__ = ('current_gen', 'ranker', 'seeds', 'rank_jobscript')
 
-    def __init__(self, n_seeds, n_clones, n_gens, config_template, seed_structure_fns, scheduler, scheduler_fstring,
-                 scheduler_kws, scheduler_report_cmd, scheduler_assoc_rep_cmd, traj_list=None, quiet=False,
-                 active_clone_threshold=50, dirname_pad=3, job_number_re='[1-9][0-9]*', sep='-', seeds_first=True,
-                 job_name_elements=('{title}', '{seed_index}', '{clone_index}', '{gen_index}'), overwrite=False,
-                 runner=sims.omm_generation, current_gen=None):
+#     def __init__(self, n_seeds, n_clones, n_gens, config_template, seed_structure_fns, scheduler, scheduler_fstring,
+#                  scheduler_kws, scheduler_report_cmd, scheduler_assoc_rep_cmd, traj_list=None, quiet=False,
+#                  active_clone_threshold=50, dirname_pad=3, job_number_re='[1-9][0-9]*', sep='-', seeds_first=True,
+#                  job_name_elements=('{title}', '{seed_index}', '{clone_index}', '{gen_index}'), overwrite=False,
+#                  runner=sims.omm_generation, current_gen=None):
 
-        super().__init__(n_seeds, n_clones, n_gens, config_template, seed_structure_fns, scheduler, scheduler_fstring,
-                         scheduler_kws, scheduler_report_cmd, scheduler_assoc_rep_cmd, traj_list, quiet,
-                         active_clone_threshold, dirname_pad, job_number_re, sep, seeds_first,
-                         job_name_elements, overwrite, runner)
+#         super().__init__(n_seeds, n_clones, n_gens, config_template, seed_structure_fns, scheduler, scheduler_fstring,
+#                          scheduler_kws, scheduler_report_cmd, scheduler_assoc_rep_cmd, traj_list, quiet,
+#                          active_clone_threshold, dirname_pad, job_number_re, sep, seeds_first,
+#                          job_name_elements, overwrite, runner)
 
-        if current_gen:
-            self.current_gen = current_gen
-        else:
-            current_youngest_gen = self.n_gens
-            for clone_list in self.priority_ordered_clones:
-                for clone in clone_list:
-                    clone_gen = clone.config['gen_index']
-                    if current_youngest_gen > clone_gen:
-                        current_youngest_gen = clone_gen
-            self.current_gen = current_youngest_gen
+#         if current_gen:
+#             self.current_gen = current_gen
+#         else:
+#             current_youngest_gen = self.n_gens
+#             for clone_list in self.priority_ordered_clones:
+#                 for clone in clone_list:
+#                     clone_gen = clone.config['gen_index']
+#                     if current_youngest_gen > clone_gen:
+#                         current_youngest_gen = clone_gen
+#             self.current_gen = current_youngest_gen
 
-    def launch(self, sleep=None, update_jids=True):
-        retlist = []  # note, this will be flat
-        if update_jids:
-            self.update_jids()
-        for seed_index, clone_list in enumerate(self.priority_ordered_clones):
-            for clone_index, clone in enumerate(clone_list):
-                if sleep:
-                    time.sleep(sleep)
+#     def launch(self, sleep=None, update_jids=True):
+#         retlist = []  # note, this will be flat
+#         if update_jids:
+#             self.update_jids()
+#         for seed_index, clone_list in enumerate(self.priority_ordered_clones):
+#             for clone_index, clone in enumerate(clone_list):
+#                 if sleep:
+#                     time.sleep(sleep)
 
-                next_up_gen = clone.config['gen_index']
-                # Check if the clone is up to date with the current gen of adaptive sampling.
-                enough_gens = next_up_gen > self.current_gen
-                retlist.append(enough_gens)
-                if enough_gens:
-                    self.finished_clones[
-                        (seed_index, clone_index, next_up_gen)
-                    ] = clone
-                    clone_list.remove(clone)
-                    try:
-                        self.active_clone_set.remove(clone)
-                    except KeyError:
-                        print(
-                            f'done_before_launch: {seed_index},{clone_index},{next_up_gen}')
-                elif clone in melf.active_clone_set:
-                    clone.check_start_gen(
-                        self.current_jids, overwrite=self.overwrite
-                    )
-                elif len(self.active_clone_set) < self.active_clone_threshold:
-                    self.active_clone_set.add(clone)
-                    clone.check_start_gen(
-                        self.current_jids, overwrite=self.overwrite
-                    )
-        # if there are no clones in active clone list, after adding some and removing others, the gen is complete
-        if len(self.active_clone_set) == 0:
-            self.current_gen += 1
-            self.rank_and_seed()
+#                 next_up_gen = clone.config['gen_index']
+#                 # Check if the clone is up to date with the current gen of adaptive sampling.
+#                 enough_gens = next_up_gen > self.current_gen
+#                 retlist.append(enough_gens)
+#                 if enough_gens:
+#                     self.finished_clones[
+#                         (seed_index, clone_index, next_up_gen)
+#                     ] = clone
+#                     clone_list.remove(clone)
+#                     try:
+#                         self.active_clone_set.remove(clone)
+#                     except KeyError:
+#                         print(
+#                             f'done_before_launch: {seed_index},{clone_index},{next_up_gen}')
+#                 elif clone in self.active_clone_set:
+#                     clone.check_start_gen(
+#                         self.current_jids, overwrite=self.overwrite
+#                     )
+#                 elif len(self.active_clone_set) < self.active_clone_threshold:
+#                     self.active_clone_set.add(clone)
+#                     clone.check_start_gen(
+#                         self.current_jids, overwrite=self.overwrite
+#                     )
+#         # if there are no clones in active clone list, after adding some and removing others, the gen is complete
+#         if len(self.active_clone_set) == 0:
+#             self.current_gen += 1
+#             self.rank_and_seed()
 
-        # Add the number of gens to be run as an additional condition that must be true for clone-minder to return.
-        retlist.append(self.current_gen > self.n_gens + 1)
+#         # Add the number of gens to be run as an additional condition that must be true for clone-minder to return.
+#         retlist.append(self.current_gen > self.n_gens + 1)
 
-        return retlist
+#         return retlist
