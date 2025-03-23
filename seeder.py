@@ -185,14 +185,14 @@ class Clone:
 
     def check_set_restart_seed(self):
         # Check if there's a state save matching current state here
-            seed_dir = self.current_seed.parent
-            if seed_dir != self.current_gen_dir:
-                cg_seed_p = self.current_gen_dir/self.config['restart_name']
-                if cg_seed_p.is_file():
-                    self.current_seed = cg_seed_p
-                else:
-                    raise FileNotFoundError(cg_seed_p)
-                self.config['seed_fn'] = str(self.current_seed)
+        seed_dir = self.current_seed.parent
+        if seed_dir != self.current_gen_dir:
+            cg_seed_p = self.current_gen_dir/self.config['restart_name']
+            if cg_seed_p.is_file():
+                self.current_seed = cg_seed_p
+            else:
+                raise FileNotFoundError(cg_seed_p)
+            self.config['seed_fn'] = str(self.current_seed)
 
     def start_current(self, overwrite=False):
         should_launch = self.plow_harrow_plant(overwrite=overwrite)
@@ -227,52 +227,50 @@ class Clone:
 
     # Returns false if launch not attempted because of too many restart attempts
     def check_start_gen(self, scheduler_report: set, overwrite=False):
-        if self.job_number:
-            if self.job_number in scheduler_report:
-                print('Job', self.job_number, 'still running',
-                      self.job_name_fstring.format(**self.config))
-                no_failure = True
-            else:
-                traj_p = (self.current_gen_dir / self.config['traj_name']
-                          ).with_suffix(self.config['traj_suffix'])
-                if traj_p.is_file():
-                    self.remaining_steps = util.calx_remaining_steps(
-                        str(traj_p),
-                        self.config['top_fn'],
-                        self.total_steps,
-                        self.config['write_interval']
-                    )
-                    # Traj of an unstarted sim can be an empty file, which breaks many appenders.
-                    if self.remaining_steps == self.total_steps:
-                        print(
-                            '{} found, but zero steps. Removing and attempting restart {} '
-                            'for this gen.'.format(
-                                traj_p, self.restart_attempts)
-                        )
-                        traj_p.unlink()
-                        no_failure = self.start_current(overwrite=overwrite)
-                    # if this, the trajectory has steps remaining before it is a full gen.
-                    # Run those.
-                    elif self.remaining_steps > 0:
-                        self.config['steps'] = self.remaining_steps
-                        self.check_set_restart_seed()
-                        no_failure = self.start_current(overwrite=overwrite)
-                    else:  # trajectory was created, and finished running.
-                        self.restart_attempts = 0
-                        self.config['steps'] = self.total_steps
-                        print('Preparing to move to next generation!')
-                        # do any automated traj postprocessing encoded by harvester
-                        if self.harvester:
-                            print('running harvester!')
-                            self.harvester.reap(self.current_gen_dir, dry_run=self.dry_run)
-                        no_failure = self.start_next(overwrite=overwrite)
-                else:  # no trajectory file, start from here just as if we'd found an empty file.
+        if self.job_number in scheduler_report:
+            print('Job', self.job_number, 'still running',
+                    self.job_name_fstring.format(**self.config))
+            no_failure = True
+        else:
+            traj_p = (self.current_gen_dir / self.config['traj_name']
+                        ).with_suffix(self.config['traj_suffix'])
+            if traj_p.is_file():
+                self.remaining_steps = util.calx_remaining_steps(
+                    str(traj_p),
+                    self.config['top_fn'],
+                    self.total_steps,
+                    self.config['write_interval']
+                )
+                # Traj of an unstarted sim can be an empty file, which breaks many appenders.
+                if self.remaining_steps == self.total_steps:
                     print(
-                        '{} not found, problem here. Attempting restart {} '
-                        'for this gen.'.format(traj_p, self.restart_attempts)
+                        f'{traj_p} found, but zero steps. ',
+                        f'Removing and attempting restart number {self.restart_attempts}.',
                     )
-                    self.restart_attempts += 1
+                    traj_p.unlink()
                     no_failure = self.start_current(overwrite=overwrite)
-        else:  # this triggers if no JN bound to clone ==> we should start one
-            no_failure = self.start_current(overwrite=overwrite)
+                # if this, the trajectory has steps remaining before it is a full gen.
+                # Run those.
+                elif self.remaining_steps > 0:
+                    self.config['steps'] = self.remaining_steps
+                    self.check_set_restart_seed()
+                    no_failure = self.start_current(overwrite=overwrite)
+                else:  # trajectory was created, and finished running.
+                    self.restart_attempts = 0
+                    self.config['steps'] = self.total_steps
+                    print('Preparing to move to next generation!')
+                    # do any automated traj postprocessing encoded by harvester
+                    if self.harvester:
+                        print('running harvester!')
+                        self.harvester.reap(self.current_gen_dir, dry_run=self.dry_run)
+                    no_failure = self.start_next(overwrite=overwrite)
+            else:  # no trajectory file, start from here just as if we'd found an empty file.
+                print(
+                    '{} not found, problem here. Attempting restart {} '
+                    'for this gen.'.format(traj_p, self.restart_attempts)
+                )
+                self.restart_attempts += 1
+                no_failure = self.start_current(overwrite=overwrite)
+        # else:  # this triggers if no JN bound to clone ==> we should start one
+            # no_failure = self.start_current(overwrite=overwrite)
         return no_failure

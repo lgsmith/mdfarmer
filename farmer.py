@@ -61,6 +61,26 @@ class Farmer:
                 print('done_before_launch', clone.get_tag())
         return enough_gens
 
+    def seed_from_prior_restart(self, gen_paths, highest_gen):
+        try:
+            prev_prev_dirp = gen_paths[-2]
+            prev_prev_config_raw = (
+                prev_prev_dirp/'config.json').read_text()
+            prev_prev_config = json.loads(
+                prev_prev_config_raw)
+            restart_p = prev_prev_dirp / \
+                prev_prev_config['restart_name']
+            seed_fn = str(restart_p.resolve())
+        except IndexError:
+            print('Starting over since first generation is borked')
+            highest_gen = None
+            seed_fn = None
+        except json.JSONDecodeError:
+            print('Prev gen Config illegible, so starting over')
+            highest_gen = None
+            seed_fn = None
+        return seed_fn, highest_gen
+
     def make_clone_check_running(self, tdir, seed_index, clone_index, rep_dict):
         # First, determine which (if any) generations for each run and clone have finished.
         clone_dir = util.dir_seeds_clones(tdir, seed_index,
@@ -85,6 +105,7 @@ class Farmer:
                 prev_config_raw = config_p.read_text()
                 prev_config = json.loads(prev_config_raw)
                 gen_index = prev_config['gen_index']
+                seed_fn = prev_config['seed_fn']
                 try:
                     traj_name = prev_config['traj_name']
                     traj_suff = prev_config['traj_suffix']
@@ -93,13 +114,13 @@ class Farmer:
                     traj_suff = config['traj_suffix']
                 traj_p = (highest_gen / traj_name).with_suffix(
                     traj_suff)
-                try: 
+                if traj_p.is_file(): 
                     if traj_p.stat().st_size > 0:
                         if config['append']:
                             # Because jobs will be launched from traj_p.parent file should be there
                             restart_p = highest_gen / prev_config['restart_name']
                             if restart_p.is_file():
-                                config['seed_fn'] = str(restart_p.resolve())
+                                seed_fn = str(restart_p.resolve())
                                 remaining_steps = util.calx_remaining_steps(
                                     str(traj_p),
                                     prev_config['top_fn'],
@@ -112,21 +133,10 @@ class Farmer:
                                 else:  # this generation is done: increment gen counter.
                                     gen_index += 1
                             else:
-                                print(traj_p, 'found, but no restart at', restart_p, 
+                                print(traj_p, 'found, but no restart at', restart_p,
                                       'so unlinking and building fresh.')
-                                traj_p.unlink() 
-                                try:
-                                    prev_prev_dirp = gen_paths[-2]
-                                    prev_prev_config_raw = (prev_prev_dirp/'config.json').read_text()
-                                    prev_prev_config = json.loads(prev_prev_config_raw)
-                                    restart_p = prev_prev_dirp/ prev_prev_config['restart_name']
-                                    config['seed_fn'] = str(restart_p.resolve())
-                                except IndexError:
-                                    print('Starting over since first generation is borked')
-                                    highest_gen = None
-                                except json.JSONDecodeError:
-                                    print('Prev gen Config illegible, so starting over')
-                                    highest_gen = None
+                                traj_p.unlink()
+                                seed_fn, highest_gen = self.seed_from_prior_restart(gen_paths, highest_gen)
                         else:
                             old_traj_p = traj_p.parent / 'old_' + traj_p.name
                             print(
@@ -134,14 +144,17 @@ class Farmer:
                             print('Moving', str(traj_p), 'to',
                                 str(old_traj_p))
                             traj_p.rename(old_traj_p)
+                            seed_fn, highest_gen = self.seed_from_prior_restart(gen_paths, highest_gen)
                     else:
                         print('Empty trajectory found from looking in:', config_p,)
                         traj_p.unlink()
-                except FileNotFoundError:
-                    print(f'No traj found from looking in {config_p}.')
+                        seed_fn, highest_gen = self.seed_from_prior_restart(gen_paths, highest_gen)
+                else:
+                    print(f'No traj found from looking in {config_p.parent}.')
                     print('Starting from fresh dir for seed {seed_index},'
                           ' clone {clone_index},'
                           ' gen {gen_index}.'.format(**prev_config))
+                    seed_fn, highest_gen = self.seed_from_prior_restart(gen_paths, highest_gen)
             except FileNotFoundError:
                 print(
                     'Could not find config, parsing gen_index from path.')
@@ -154,6 +167,7 @@ class Farmer:
         else:
             # if we get here in control flow,  then we start fresh
             gen_index = 0
+            seed_fn = self.seed_state_fns[seed_index]
         # Now try to see if there's a currently running job with this
         # seed_index, clone_index, and gen_index
         try:
@@ -181,7 +195,7 @@ class Farmer:
             self.scheduler,
             self.scheduler_fstring,
             self.scheduler_kws,
-            self.seed_state_fns[seed_index],
+            seed_fn,
             job_number=jid,
             job_number_re=self.job_number_re,
             job_name_fstring=self.job_name_fstring,
