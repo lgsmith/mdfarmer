@@ -9,7 +9,7 @@ import copy
 
 
 class Farmer:
-    __slots__ = ('priority_ordered_clones', 'n_seeds', 'n_clones', 'n_gens', 'runner',
+    __slots__ = ('priority_ordered_clones', 'n_seeds', 'n_clones', 'n_gens', 'runner', 'jids_file',
                  'config_template', 'jn_regex', 'current_jids', 'dry_run', 'overwrite',
                  'active_clone_threshold', 'active_clone_set', 'failed_clone_set', 'seeds_first',
                  'job_name_fstring', 'job_number_re', 'finished_clones', 'harvester',
@@ -22,10 +22,9 @@ class Farmer:
             self.scheduler_report_cmd,
             shell=True, text=True,
             executable='/bin/bash').strip()
-        print('jids_string:')
-        print(jids_string)
+        print(f'jids_string:\n{jids_string}')
         self.current_jids = set(map(int, jids_string.split()))
-        print(self.current_jids)
+        self.jids_file.write_text(jids_string)
 
     def check_path(self, p: Path):
         if p.is_file():
@@ -272,6 +271,7 @@ class Farmer:
         self.dirname_pad = dirname_pad
         self.config_template['dirname_pad'] = self.dirname_pad
         self.quiet = quiet
+        self.jids_file = Path(f'{config_template['title']}-jids.txt')
         # important to pass this down through the clones
         self.job_name_fstring = self.sep.join(job_name_elements)
         self.current_jids = set()
@@ -392,7 +392,7 @@ class Farmer:
         still_running = self.launch(sleep=None, update_jids=False)
         brake_file_p = Path('stop')
         # this needs to be while all(list of T/F for completed seeds/clones)
-        print('still_running:', *still_running)
+        print('still_running:', *still_running, flush=True)
         # If dry run, short circuit the tending loop.
         if self.dry_run:
             still_running = [False]
@@ -408,7 +408,7 @@ class Farmer:
             if not self.quiet:
                 print('The following (seed clone gen) are complete:', ', '.join((
                     map(lambda c: c.get_tag(), self.finished_clones))))
-            print('STILL RUNNING:', *still_running)
+            print('STILL RUNNING:', *still_running, flush=True)
         # If we get here, that means the minder thinks all clones have finished.
         return True
 
