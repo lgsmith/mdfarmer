@@ -357,7 +357,9 @@ class Farmer:
                     elif clone in self.active_clone_set:
                         print('clone is in active clone list')
                         # Try to start another.
-                        if clone.check_start_gen( self.current_jids, overwrite=self.overwrite):
+                        did_start = clone.check_start_gen(
+                            self.current_jids, overwrite=self.overwrite)
+                        if did_start:
                             still_running.append(True)
                         else:
                             self.mark_clone_failed(clone)
