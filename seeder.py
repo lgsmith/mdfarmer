@@ -219,6 +219,13 @@ class Clone:
     def start_next(self, overwrite=False):
         # Set seed to be current restart file, but full path so it will be found in next gen dir.
         self.set_seed((self.current_gen_dir/self.config['restart_name']).resolve())
+        # reset number of restart attempts
+        self.restart_attempts = 0
+        # reset number of steps to take
+        # first for accounting inside the clone
+        self.remaining_steps = self.total_steps
+        # then with respect to the number of steps to write to the config.json
+        self.config['steps'] = self.total_steps
         # because we want to start next, increment the gen before building
         self.config['gen_index'] += 1
         self.current_gen += 1
