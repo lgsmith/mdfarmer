@@ -45,8 +45,8 @@ class Farmer:
             pass
         print('FAILED CLONE:', clone.get_tag())
 
-    # Check if clone has finished all its generations. 
-    # Remove from clone_list, and active set, and add to finished set. 
+    # Check if clone has finished all its generations.
+    # Remove from clone_list, and active set, and add to finished set.
     # return True if finished, False if not.
     def check_mark_clone_finished(self, clone):
         next_up_gen = clone.current_gen
@@ -62,12 +62,12 @@ class Farmer:
 
     def seed_from_prior_restart(self, gen_paths, highest_gen):
         try:
-            prev_prev_dirp = gen_paths[-2]
+            highest_gen = gen_paths[-2]
             prev_prev_config_raw = (
-                prev_prev_dirp/'config.json').read_text()
+                highest_gen/'config.json').read_text()
             prev_prev_config = json.loads(
                 prev_prev_config_raw)
-            restart_p = prev_prev_dirp / \
+            restart_p = highest_gen / \
                 prev_prev_config['restart_name']
             seed_fn = str(restart_p.resolve())
         except IndexError:
@@ -91,7 +91,7 @@ class Farmer:
             # relies on padding to cause lex sort to yield highest
             # gen dir as last element
             try:
-                gen_paths =  sorted(clone_dir.iterdir())
+                gen_paths = sorted(clone_dir.iterdir())
                 highest_gen = gen_paths[-1]
             except IndexError:
                 highest_gen = None
@@ -113,11 +113,12 @@ class Farmer:
                     traj_suff = config['traj_suffix']
                 traj_p = (highest_gen / traj_name).with_suffix(
                     traj_suff)
-                if traj_p.is_file(): 
+                if traj_p.is_file():
                     if traj_p.stat().st_size > 0:
                         if config['append']:
                             # Because jobs will be launched from traj_p.parent file should be there
-                            restart_p = highest_gen / prev_config['restart_name']
+                            restart_p = highest_gen / \
+                                prev_config['restart_name']
                             if restart_p.is_file():
                                 seed_fn = str(restart_p.resolve())
                                 remaining_steps = util.calx_remaining_steps(
@@ -128,40 +129,49 @@ class Farmer:
                                 )
                                 if remaining_steps > 0:
                                     config['steps'] = remaining_steps
-                                    # change the config's seed to look at the checkpoint/state file in the traj_dir
+
                                 else:  # this generation is done: increment gen counter.
                                     gen_index += 1
                             else:
                                 print(traj_p, 'found, but no restart at', restart_p,
                                       'so unlinking and building fresh.')
                                 traj_p.unlink()
-                                seed_fn, highest_gen = self.seed_from_prior_restart(gen_paths, highest_gen)
+                                seed_fn, highest_gen = self.seed_from_prior_restart(
+                                    gen_paths, highest_gen)
                         else:
                             old_traj_p = traj_p.parent / 'old_' + traj_p.name
                             print(
                                 'Traj found, but not operating in append mode.')
                             print('Moving', str(traj_p), 'to',
-                                str(old_traj_p))
+                                  str(old_traj_p))
                             traj_p.rename(old_traj_p)
-                            seed_fn, highest_gen = self.seed_from_prior_restart(gen_paths, highest_gen)
+                            seed_fn, highest_gen = self.seed_from_prior_restart(
+                                gen_paths, highest_gen)
                     else:
                         print('Empty trajectory found from looking in:', config_p,)
                         traj_p.unlink()
-                        seed_fn, highest_gen = self.seed_from_prior_restart(gen_paths, highest_gen)
+                        seed_fn, highest_gen = self.seed_from_prior_restart(
+                            gen_paths, highest_gen)
                 else:
                     print(f'No traj found from looking in {config_p.parent}.')
                     print('Starting from fresh dir for seed {seed_index},'
                           ' clone {clone_index},'
                           ' gen {gen_index}.'.format(**prev_config))
-                    seed_fn, highest_gen = self.seed_from_prior_restart(gen_paths, highest_gen)
+                    seed_fn, highest_gen = self.seed_from_prior_restart(
+                        gen_paths, highest_gen)
             except FileNotFoundError:
                 print(
-                    'Could not find config, parsing gen_index from path.')
+                    f'Could not find {config_p}, parsing gen_index from path.')
                 gen_index = int(highest_gen.name.split(self.sep)[-1])
+                seed_fn, highest_gen = self.seed_from_prior_restart(
+                    gen_paths, highest_gen
+                )
             except json.decoder.JSONDecodeError:
                 print('Config at', config_p,
                       'appears to contain malformed json; here is the raw string:')
                 print(prev_config_raw, '\nProceeding to obtain gen index from path.')
+                seed_fn, highest_gen = self.seed_from_prior_restart(
+                    gen_paths, highest_gen)
                 gen_index = int(highest_gen.name.split(self.sep)[-1])
         else:
             # if we get here in control flow,  then we start fresh
@@ -340,12 +350,13 @@ class Farmer:
             else:
                 clone_indexes_to_remove = []
                 for i, clone in enumerate(clone_list):
-                    print('starting into clone loop for clone index', i, clone.get_tag())
+                    print('starting into clone loop for clone index',
+                          i, clone.get_tag())
                     if sleep:
                         time.sleep(sleep)
                     # This probably shouldn't happen, but it's worth checking for
                     if clone in self.finished_clones or \
-                          clone in self.failed_clone_set:
+                            clone in self.failed_clone_set:
                         print('clone is finished clones or failed clones')
                         still_running.append(False)
                         clone_indexes_to_remove.append(i)
@@ -353,7 +364,7 @@ class Farmer:
                         print('clone was just marked finished')
                         still_running.append(False)
                         clone_indexes_to_remove.append(i)
-                    # If clone is in active set, it may have just finished a generation. 
+                    # If clone is in active set, it may have just finished a generation.
                     elif clone in self.active_clone_set:
                         print('clone is in active clone list')
                         # Try to start another.
@@ -366,10 +377,11 @@ class Farmer:
                             still_running.append(False)
                             clone_indexes_to_remove.append(i)
 
-                    # This condition arises when there are few enough active clones 
+                    # This condition arises when there are few enough active clones
                     # that we could launch more.
                     elif len(self.active_clone_set) < self.active_clone_threshold:
-                        print('there are some more active clones, let us launch', clone.get_tag())
+                        print(
+                            'there are some more active clones, let us launch', clone.get_tag())
                         #  So we try to launch another.
                         if clone.check_start_gen(self.current_jids, overwrite=self.overwrite):
                             print('started clone, adding to active_clone_set')
@@ -380,7 +392,8 @@ class Farmer:
                             still_running.append(False)
                             clone_indexes_to_remove.append(i)
                     else:
-                        print('WARNING:', clone.get_tag(), 'is not accounted for by launch logic.')
+                        print('WARNING:', clone.get_tag(),
+                              'is not accounted for by launch logic.')
                 # Because we are changing the length of the list, this must be done in reverse order
                 clone_indexes_to_remove.reverse()
                 for i in clone_indexes_to_remove:
