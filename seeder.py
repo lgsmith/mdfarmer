@@ -123,7 +123,7 @@ class Clone:
     # Note if the two clones are using different compare keys this will nearly always be false
     def __eq__(self, other: Clone) -> bool:
         return hash(self) == hash(other)
-    
+
     # Return a string representing key features of this clone
     def get_tag(self):
         return ' '.join((f'{k}: {self.config[k]}'
@@ -196,7 +196,8 @@ class Clone:
 
     def start_current(self, overwrite=False):
         should_launch = self.plow_harrow_plant(overwrite=overwrite)
-        print(self.get_tag(), 'should_launch', should_launch, 'dry_run', self.dry_run)
+        print(self.get_tag(), 'should_launch',
+              should_launch, 'dry_run', self.dry_run)
         if should_launch and not self.dry_run:
             print('launching', self.get_tag())
             # SIMULATION RUNS HERE. OUTPUT SCANNED FOR JOB NUMBER.
@@ -218,7 +219,8 @@ class Clone:
 
     def start_next(self, overwrite=False):
         # Set seed to be current restart file, but full path so it will be found in next gen dir.
-        self.set_seed((self.current_gen_dir/self.config['restart_name']).resolve())
+        self.set_seed(
+            (self.current_gen_dir/self.config['restart_name']).resolve())
         # reset number of restart attempts
         self.restart_attempts = 0
         # reset number of steps to take
@@ -236,11 +238,11 @@ class Clone:
     def check_start_gen(self, scheduler_report: set, overwrite=False):
         if self.job_number in scheduler_report:
             print('Job', self.job_number, 'still running',
-                    self.job_name_fstring.format(**self.config))
+                  self.job_name_fstring.format(**self.config))
             no_failure = True
         else:
             traj_p = (self.current_gen_dir / self.config['traj_name']
-                        ).with_suffix(self.config['traj_suffix'])
+                      ).with_suffix(self.config['traj_suffix'])
             if traj_p.is_file():
                 self.remaining_steps = util.calx_remaining_steps(
                     str(traj_p),
@@ -269,14 +271,12 @@ class Clone:
                     # do any automated traj postprocessing encoded by harvester
                     if self.harvester:
                         print('running harvester!')
-                        self.harvester.reap(self.current_gen_dir, dry_run=self.dry_run)
+                        self.harvester.reap(
+                            self.current_gen_dir, dry_run=self.dry_run)
                     no_failure = self.start_next(overwrite=overwrite)
             else:  # no trajectory file, start from here just as if we'd found an empty file.
-                print(
-                    '{} not found, problem here. Attempting restart {} '
-                    'for this gen.'.format(traj_p, self.restart_attempts)
-                )
-                self.restart_attempts += 1
+                print('{traj_p} not found, attempting start number '
+                      '{self.restart_attempts} for this gen.')
                 no_failure = self.start_current(overwrite=overwrite)
         # else:  # this triggers if no JN bound to clone ==> we should start one
             # no_failure = self.start_current(overwrite=overwrite)
