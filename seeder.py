@@ -275,8 +275,8 @@ class Clone:
                             self.current_gen_dir, dry_run=self.dry_run)
                     no_failure = self.start_next(overwrite=overwrite)
             else:  # no trajectory file, start from here just as if we'd found an empty file.
-                print('{traj_p} not found, attempting start number '
-                      '{self.restart_attempts} for this gen.')
+                print(f'{traj_p} not found, attempting start number '
+                      f'{self.restart_attempts} for this gen.')
                 no_failure = self.start_current(overwrite=overwrite)
         # else:  # this triggers if no JN bound to clone ==> we should start one
             # no_failure = self.start_current(overwrite=overwrite)
