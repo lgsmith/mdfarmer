@@ -93,7 +93,6 @@ def strip_and_downsample(config_fn, harvester_config_fn):
 basic_scheduler_fstrings = {
     "lsf": inspect.cleandoc("""#!/bin/bash
                 #BSUB -J {job_name}
-                #BSUB -e lsf.out
                 #BSUB -o lsf.out
                 {gpu_line}
                 #BSUB -q {queue_name}
