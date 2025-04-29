@@ -58,6 +58,13 @@ def omm_generation(traj_dir_top_level: str,
         '.xtc': app.XTCReporter,
     }
 
+    topology_readers = {
+        '.top':app.GromacsTopFile,
+        '.prmtop': app.AmberPrmtopFile,
+        '.psf': app.CharmmPsfFile,
+        '.pdb': app.PDBFile
+    }
+
     if not state_data_kwargs:
         state_data_kwargs = dict(
             totalSteps=steps,
@@ -74,7 +81,7 @@ def omm_generation(traj_dir_top_level: str,
                                       clone_index,
                                       gen_index, dirname_pad, sep=sep)
     traj_path = (traj_dir / traj_name).with_suffix(traj_suffix)
-
+    # set up trajectory reporter
     try:
         if traj_path.is_file():
             traj_reporter = reporters[traj_suffix](str(traj_path),
@@ -88,7 +95,17 @@ def omm_generation(traj_dir_top_level: str,
               traj_suffix, 'for which no reporter is implemented yet.\n',
               'Your current choices are:', *reporters.keys())
         raise
-
+    # Read topology
+    try:
+        top_p = Path(top_fn)
+        top_ext = top_p.suffix
+        topology = topology_readers[top_ext](top_fn).topology
+    except KeyError:
+        print('You seem to have used a topology format', top_ext,
+              'for which we have not included a reader. Choices are:',
+              *topology_readers.keys())
+        raise
+    # Set up reporters
     data_reporter_p = traj_path.with_suffix('.out')
     data_reporter = app.StateDataReporter(
         str(data_reporter_p),
@@ -103,7 +120,6 @@ def omm_generation(traj_dir_top_level: str,
         writeState=True)
 
     system = mm.XmlSerializer.deserialize(Path(system_fn).read_text())
-    topology = app.PDBFile(top_fn).topology
 
     integrator = mm.XmlSerializer.deserialize(Path(integrator_xml).read_text())
     if platform_name:
