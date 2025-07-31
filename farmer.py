@@ -281,7 +281,7 @@ class Farmer:
         self.dirname_pad = dirname_pad
         self.config_template['dirname_pad'] = self.dirname_pad
         self.quiet = quiet
-        self.jids_file = Path(f'{config_template['title']}-jids.txt')
+        self.jids_file = Path(f'{config_template["title"]}-jids.txt')
         # important to pass this down through the clones
         self.job_name_fstring = self.sep.join(job_name_elements)
         self.current_jids = set()
