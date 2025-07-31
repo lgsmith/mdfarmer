@@ -3,6 +3,7 @@ import inspect
 from . import utilities as util
 from pathlib import Path
 import subprocess as sp
+import shutil  # for copy--will be obviated by python 3.14
 import re
 import json
 
@@ -66,11 +67,7 @@ class Clone:
         self.total_steps = config['steps']
         self.remaining_steps = self.total_steps
         seed_p = Path(seed_fn)
-        if seed_p.is_file():
-            self.current_seed = seed_p
-            self.config['seed_fn'] = seed_fn
-        else:
-            raise FileNotFoundError(seed_p)
+        self.set_seed(seed_p)
         self.scheduler = scheduler
         if cleandoc_sched_fstring:
             self.scheduler_fstring = inspect.cleandoc(scheduler_fstring)
@@ -109,6 +106,7 @@ class Clone:
         self.compare_keys = compare_keys
         self.harvester = harvester
         self.run_script = run_script
+        self.scheduler_script_p = None  # always redefined each run
 
     # Compare a value across self config and other config in other Clone.
     def conf_value_eq(self, other: Clone, conf_key: str) -> bool:
@@ -131,15 +129,29 @@ class Clone:
 
     def set_seed(self, seed_fp):
         if seed_fp.is_file():
+            if seed_fp.stat().st_size == 0:
+                print('ERROR: CLONE', self.get_tag(),
+                      'found seed, but it is an empty file.')
+                raise IOError(seed_fp)
             self.current_seed = seed_fp
             self.config['seed_fn'] = str(seed_fp)
         else:
             print('ERROR: CLONE', self.get_tag(), 'could not find seed.')
             raise FileNotFoundError(seed_fp)
+
+    def check_copy_set_restart_seed(self):
+        # Check if there's a state save matching current state here
+        seed_p = self.current_seed
+        seed_dir = seed_p.parent
+        if seed_dir != self.current_gen_dir:
+            cg_seed_p = self.current_gen_dir/self.config['restart_name']
+            # Critical! Copy the old seed file into the new dir!
+            shutil.copy(seed_p, cg_seed_p)
+            self.set_seed(cg_seed_p)
+
     # note this gets the gen index from config then builds the dir for that gen
     # So, if you want to start a new generation, you have to increment/change
     # self.config['gen_index'] before calling this.
-
     # Tries to set up directory, and checks if we've gone over the number of restart limits
     # Returns a bool based on success (True) or failure (False) of these efforts.
     def plow_harrow_plant(self, overwrite=False):
@@ -157,6 +169,9 @@ class Clone:
             sep=self.config['sep'],
             mkdir=True
         )
+        # If we've made a fresh directory this should copy the
+        # previous seed into the new directory.
+        self.check_copy_set_restart_seed()
         config_p = self.current_gen_dir / 'config.json'
         if overwrite or not config_p.is_file():
             with config_p.open('w') as f:
@@ -183,17 +198,6 @@ class Clone:
                   self.restart_attempts, 'times. Aborting this clone.')
             return False
 
-    def check_set_restart_seed(self):
-        # Check if there's a state save matching current state here
-        seed_dir = self.current_seed.parent
-        if seed_dir != self.current_gen_dir:
-            cg_seed_p = self.current_gen_dir/self.config['restart_name']
-            if cg_seed_p.is_file():
-                self.current_seed = cg_seed_p
-            else:
-                raise FileNotFoundError(cg_seed_p)
-            self.config['seed_fn'] = str(self.current_seed)
-
     def start_current(self, overwrite=False):
         should_launch = self.plow_harrow_plant(overwrite=overwrite)
         print(self.get_tag(), 'should_launch',
@@ -219,8 +223,8 @@ class Clone:
 
     def start_next(self, overwrite=False):
         # Set seed to be current restart file, but full path so it will be found in next gen dir.
-        self.set_seed(
-            (self.current_gen_dir/self.config['restart_name']).resolve())
+        new_seed = self.current_gen_dir/self.config['restart_name']
+        self.set_seed(new_seed.resolve())
         # reset number of restart attempts
         self.restart_attempts = 0
         # reset number of steps to take
@@ -262,7 +266,9 @@ class Clone:
                 # Run those.
                 elif self.remaining_steps > 0:
                     self.config['steps'] = self.remaining_steps
-                    self.check_set_restart_seed()
+                    # set the reporters to append
+                    self.config['append'] = True
+                    self.check_copy_set_restart_seed()
                     no_failure = self.start_current(overwrite=overwrite)
                 else:  # trajectory was created, and finished running.
                     self.restart_attempts = 0

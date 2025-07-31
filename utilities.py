@@ -1,6 +1,30 @@
 import inspect
 from pathlib import Path
 import json
+import openmm as mm
+from openmm import app
+
+
+openmm_topology_readers = {
+    '.top': app.GromacsTopFile,
+    '.prmtop': app.AmberPrmtopFile,
+    '.psf': app.CharmmPsfFile,
+    '.pdb': app.PDBFile
+}
+
+
+def read_openmm_top(top_fn):
+    try:
+        top_p = Path(top_fn)
+        top_ext = top_p.suffix
+        topology = openmm_topology_readers[top_ext](top_fn).topology
+    except KeyError:
+        print('You seem to have used a topology format', top_ext,
+              'for which we have not included a reader. Choices are:',
+              *openmm_topology_readers.keys())
+        raise
+    return topology
+
 
 try:
     import loos
@@ -18,6 +42,8 @@ try:
                 print('Assumming empty file; cannot read:', traj_fn)
                 length = 0
         return length
+
+
 except ImportError:
     print('LOOS not in import path; falling back to MDTraj.')
     print('Expect restarting a mature dataset to be slow.')
@@ -36,6 +62,8 @@ To run this one, hconfig needs to contain the following keys:
  - `'harvester_subset'`: a LOOS selection string that produces the desired system subsetting.
  - `'downsample_frq'`: An int---the number of frames to skip over before writing another solvated frame.
 """
+
+
 def strip_and_downsample(config_fn, harvester_config_fn):
     import loos
     from loos import pyloos as pl
@@ -47,7 +75,7 @@ def strip_and_downsample(config_fn, harvester_config_fn):
     model = loos.createSystem(config['top_fn'])
     subset_selection = hconfig['harvester_subset']
     subset = loos.selectAtoms(model, subset_selection)
-    
+
     traj_name = config['traj_name']
     traj_suffix = config['traj_suffix']
     traj_fn = f'{traj_name}{traj_suffix}'
@@ -65,7 +93,8 @@ def strip_and_downsample(config_fn, harvester_config_fn):
         dry_outtraj = loos.DCDWriter(dry_outfn)
         downsampe_outtraj = loos.DCDWriter(down_outfn)
     else:
-        raise NotImplementedError(f'{traj_suffix}: not implemented for basic strip and downsample')
+        raise NotImplementedError(
+            f'{traj_suffix}: not implemented for basic strip and downsample')
     print('Preparing to loop over trj in strip and downsample.')
     while next(traj, False):
         dry_outtraj.writeFrame(subset)
@@ -75,9 +104,9 @@ def strip_and_downsample(config_fn, harvester_config_fn):
     subset.pruneBonds()  # Need to do this to ensure connects are correct.
     pdb = loos.PDB.fromAtomicGroup(subset)
     Path('dry-top.pdb').write_text(str(pdb))
-    
+
     # if we've subset and also dried the trajectories, remove the original.
-    # Should raise a file not found error if the call to stat() 
+    # Should raise a file not found error if the call to stat()
     # is applied to a file that was never created
     if dry_outp.stat().st_size > 0 and down_outp.stat().st_size > 0:
         traj_p = Path(traj_fn)
@@ -85,7 +114,8 @@ def strip_and_downsample(config_fn, harvester_config_fn):
         # leave a symlink to dry traj so that frame counting efforts don't go awry
         traj_p.symlink_to(dry_outp)
     else:
-        print('either', dry_outp, 'or', down_outp,'are size zero, refusing to unlink')
+        print('either', dry_outp, 'or', down_outp,
+              'are size zero, refusing to unlink')
 
 
 # These basic strings are useful in many cases on clusters using the scheduler named as the key.
@@ -157,7 +187,7 @@ def fdir(dirpre, num, pad, sep='-', padchar='0'):
 
 
 def dir_seeds_clones(top_lvl: Path, seed_index, clone_index, pad, sep='-',
-                    padchar='0', mkdir=True):
+                     padchar='0', mkdir=True):
     p = top_lvl / fdir('seed', seed_index, pad, sep=sep, padchar=padchar) / \
         fdir('clone', clone_index, pad, sep=sep, padchar=padchar)
     if mkdir:
@@ -166,7 +196,7 @@ def dir_seeds_clones(top_lvl: Path, seed_index, clone_index, pad, sep='-',
 
 
 def dir_seeds_clones_gens(top_lvl: Path, seed_index, clone_index, gen_index, pad,
-                         sep='-', padchar='0', mkdir=True):
+                          sep='-', padchar='0', mkdir=True):
     p = top_lvl / fdir('seed', seed_index, pad, sep=sep, padchar=padchar) / \
         fdir('clone', clone_index, pad, sep=sep, padchar=padchar) / \
         fdir('gen', gen_index, pad, sep=sep, padchar=padchar)
@@ -180,8 +210,8 @@ traj_suffixes = ['.dcd',
                  '.xtc']
 
 
-default_steps = int(2.5e7)  # Given 0.004 ps timestep, 
-                            # this is 100 ns of simulation.
+default_steps = int(2.5e7)  # Given 0.004 ps timestep,
+# this is 100 ns of simulation.
 default_state_data_kwargs = dict(
     totalSteps=default_steps,
     step=True,
@@ -203,7 +233,7 @@ default_straight_sampling_config_template = dict(
     traj_suffix='.xtc',
     restart_name='state.xml',
     platform_name='CUDA',  # CHECK TO BE SURE!
-    platform_properties=dict(Precision='mixed'),
+    platform_properties={'Precision': 'mixed'},
     steps=default_steps,
     state_data_kwargs=default_state_data_kwargs,
     eq_steps=None,
@@ -217,7 +247,8 @@ default_straight_sampling_config_template = dict(
 default_straight_sampling_init_config = dict(
     title='samplingX',  # This you should def overwrite for your own jobs!
     seeds=[
-        'state.xml'  # Expect that len(seeds) == len(top_fns) == len(system_fns)
+        # Expect that len(seeds) == len(top_fns) == len(system_fns)
+        'state.xml'
     ],
     top_fns=[
         "my_system.pdb"
@@ -226,7 +257,6 @@ default_straight_sampling_init_config = dict(
         'system.xml'
     ]
 )
-
 
 
 #  make two trajs--one stripped of solvent, the _other_ downsampled by some integer factor but not dried.
