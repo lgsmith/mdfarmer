@@ -11,22 +11,17 @@ from os import environ
 # instances of calls. It returns the path to the trajectory written.
 
 
-def omm_generation(traj_dir_top_level: str,
-                   system_fn: str,
+def omm_generation(system_fn: str,
                    top_fn: str,
+                   # Begin from these coordinates/velocities. Expects a path to an OpenMM State.
+                   seed_fn: str,
                    seed_index: int,
                    clone_index: int,
                    gen_index: int,
                    title: str,
                    integrator_xml: str,
-                   # Begin from these coordinates/velocities. Expects a path to an OpenMM State.
-                   seed_fn: str,
                    # if restarting, Do we start fresh or do we append?
                    append=False,
-                   # dir-name indexes zero padded by this value. If 'None', then no padding.
-                   dirname_pad=2,
-                   # job and dir name separator
-                   sep='-',
                    # mimics fah directory structure for processed trjs.
                    traj_name='traj',
                    traj_suffix='.xtc',
@@ -77,10 +72,7 @@ def omm_generation(traj_dir_top_level: str,
         )
 
     print('starting', title, seed_index, clone_index, gen_index)
-    traj_dir = util.dir_seeds_clones_gens(Path(traj_dir_top_level), seed_index,
-                                      clone_index,
-                                      gen_index, dirname_pad, sep=sep)
-    traj_path = (traj_dir / traj_name).with_suffix(traj_suffix)
+    traj_path = Path(traj_name).with_suffix(traj_suffix)
     # set up trajectory reporter
     try:
         if traj_path.is_file():
@@ -163,7 +155,7 @@ def omm_generation(traj_dir_top_level: str,
     print('Done!')
     return traj_path.resolve()
 
-
+# Expects to run on the files that are _in_ the directory it's launched from
 def omm_basic_sim_block_json(config):
     with open(config, 'r') as f:
         conf_dict = json.load(f)
@@ -181,6 +173,7 @@ def omm_basic_sim_block_json(config):
             conf_dict['platform_properties'] = {'DeviceIndex': device_idx}
 
     traj_list_path = Path(conf_dict['traj_list'])
+    # get rid of inputs the basic generation cant ingest:
     del conf_dict['traj_list']
     new_traj_path = omm_generation(**conf_dict)
     with traj_list_path.open('a') as tl:

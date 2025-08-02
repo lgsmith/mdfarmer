@@ -134,7 +134,7 @@ class Clone:
                       'found seed, but it is an empty file.')
                 raise IOError(seed_fp)
             self.current_seed = seed_fp
-            self.config['seed_fn'] = str(seed_fp)
+            self.config['seed_fn'] = str(seed_fp.name)
         else:
             print('ERROR: CLONE', self.get_tag(), 'could not find seed.')
             raise FileNotFoundError(seed_fp)
@@ -173,6 +173,12 @@ class Clone:
         # previous seed into the new directory.
         self.check_copy_set_restart_seed()
         config_p = self.current_gen_dir / 'config.json'
+        conf_dict = self.config.copy()
+        # get rid of inputs the basic generation cant ingest:
+        del conf_dict['traj_dir_top_level']
+        del conf_dict['sep']
+        del conf_dict['dirname_pad']
+        # set seed to
         if overwrite or not config_p.is_file():
             with config_p.open('w') as f:
                 json.dump(self.config, f, indent=4)
@@ -284,6 +290,4 @@ class Clone:
                 print(f'{traj_p} not found, attempting start number '
                       f'{self.restart_attempts} for this gen.')
                 no_failure = self.start_current(overwrite=overwrite)
-        # else:  # this triggers if no JN bound to clone ==> we should start one
-            # no_failure = self.start_current(overwrite=overwrite)
         return no_failure

@@ -111,8 +111,7 @@ class Farmer:
                 except KeyError:
                     traj_name = config['traj_name']
                     traj_suff = config['traj_suffix']
-                traj_p = (highest_gen / traj_name).with_suffix(
-                    traj_suff)
+                traj_p = (highest_gen / traj_name).with_suffix(traj_suff)
                 if traj_p.is_file():
                     if traj_p.stat().st_size > 0:
                         if config['append']:
