@@ -87,6 +87,7 @@ def omm_generation(system_fn: str,
               traj_suffix, 'for which no reporter is implemented yet.\n',
               'Your current choices are:', *reporters.keys())
         raise
+    print('Writing coordinates to', traj_path, flush=True)
     # Read topology
     try:
         top_p = Path(top_fn)
