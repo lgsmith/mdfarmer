@@ -181,7 +181,7 @@ class Clone:
         # set seed to
         if overwrite or not config_p.is_file():
             with config_p.open('w') as f:
-                json.dump(self.config, f, indent=4)
+                json.dump(conf_dict, f, indent=4)
         else:
             print("There is already a config at:", str(config_p.resolve()),
                   'Proceeding with old config; did not ask for overwrite.')
