@@ -282,7 +282,7 @@ class Clone:
                     print('Preparing to move to next generation!')
                     # do any automated traj postprocessing encoded by harvester
                     if self.harvester:
-                        print('running harvester!')
+                        print('Running harvester!')
                         self.harvester.reap(
                             self.current_gen_dir, dry_run=self.dry_run)
                     no_failure = self.start_next(overwrite=overwrite)

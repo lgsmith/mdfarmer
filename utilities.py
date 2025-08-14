@@ -71,7 +71,10 @@ def strip_and_downsample(config_fn, harvester_config_fn):
     config = json.loads(config_fp.read_text())
     hconfig_fp = Path(harvester_config_fn)
     hconfig = json.loads(hconfig_fp.read_text())
-    sep = config['sep']
+    try:
+        sep = hconfig['sep']
+    except KeyError:
+        sep = '-'
     model = loos.createSystem(config['top_fn'])
     subset_selection = hconfig['harvester_subset']
     subset = loos.selectAtoms(model, subset_selection)
