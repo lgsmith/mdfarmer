@@ -6,7 +6,8 @@ from . import seeder
 from . import simulate as sims
 import time
 import copy
-
+import datetime
+import pytz
 
 class Farmer:
     __slots__ = ('priority_ordered_clones', 'n_seeds', 'n_clones', 'n_gens', 'runner', 'jids_file',
@@ -15,7 +16,7 @@ class Farmer:
                  'job_name_fstring', 'job_number_re', 'finished_clones', 'harvester',
                  'quiet', 'sep', 'dirname_pad', 'seed_state_fns', 'scheduler',
                  'scheduler_report_cmd', 'scheduler_fstring', 'scheduler_kws',
-                 'scheduler_assoc_rep_cmd', 'system_fns', 'top_fns')
+                 'scheduler_assoc_rep_cmd', 'system_fns', 'top_fns', 'timezone')
 
     def update_jids(self):
         jids_string = sp.check_output(
@@ -241,7 +242,8 @@ class Farmer:
                  overwrite=False,
                  harvester=None,
                  runner=sims.omm_generation,
-                 dry_run=False
+                 dry_run=False,
+                 timezone_str='US/Eastern'
                  ):
         self.n_seeds = n_seeds
         self.n_clones = n_clones
@@ -260,6 +262,7 @@ class Farmer:
         self.job_number_re = job_number_re
         self.harvester = harvester
         self.dry_run = dry_run
+        self.timezone = pytz.timezone(timezone_str)
         # Ensure that all file-names are in the config as full paths
         self.config_template['traj_dir_top_level'] = str(
             Path(self.config_template['traj_dir_top_level']).resolve()
@@ -405,8 +408,9 @@ class Farmer:
     def start_tending_fields(self, update_interval=120):
         still_running = self.launch(sleep=None, update_jids=False)
         brake_file_p = Path('stop')
+        current_time = datetime.datetime.now(self.timezone)
         # this needs to be while all(list of T/F for completed seeds/clones)
-        print('still_running:', *still_running, flush=True)
+        print('STILL RUNNING:', current_time.isoformat(), *still_running, flush=True)
         # If dry run, short circuit the tending loop.
         if self.dry_run:
             still_running = [False]
@@ -419,10 +423,11 @@ class Farmer:
                 return False
             time.sleep(update_interval)
             still_running = self.launch(sleep=None)
+            current_time = datetime.datetime.now(self.timezone)
             if not self.quiet:
                 print('The following (seed clone gen) are complete:', ', '.join((
                     map(lambda c: c.get_tag(), self.finished_clones))))
-            print('STILL RUNNING:', *still_running, flush=True)
+            print('STILL RUNNING:', current_time.isoformat(), *still_running, flush=True)
         # If we get here, that means the minder thinks all clones have finished.
         return True
 
