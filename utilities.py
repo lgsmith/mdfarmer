@@ -118,31 +118,45 @@ def strip_and_downsample(config_fn, harvester_config_fn):
               'are size zero, refusing to unlink')
 
 
-def strip_ds_mdtraj(config_fn, harvester_config_fn):
+def strip_ds_mdtraj(config_fn, harvester_config_fn, sep='-', image_molecules=True):
     import mdtraj as md
     config_fp = Path(config_fn)
     config = json.loads(config_fp.read_text())
     hconfig_fp = Path(harvester_config_fn)
     hconfig = json.loads(hconfig_fp.read_text())
-    sep = config['sep']
     model_name = str(config['top_fn'])
-    subset_selection = hconfig['harvester_subset']
     # subset = loos.selectAtoms(model, subset_selection)
 
     traj_name = config['traj_name']
     traj_suffix = config['traj_suffix']
     traj_fn = f'{traj_name}{traj_suffix}'
-    traj = md.Trajectory(traj_fn, model_name)
-    downsample_frq = hconfig['downsample_frq']
+    traj = md.load(traj_fn, top=model_name)
+    if image_molecules:
+        traj.make_molecules_whole(inplace=True)
+        traj.image_molecules(inplace=True)
+    top = traj.top
+    subset_selection = hconfig['harvester_subset']
+    if subset_selection:
+        subset_iis = top.select(subset_selection)
+        dry_traj = traj.atom_slice(subset_iis)
+    else:
+        dry_traj = traj.remove_solvent()
+    
     dry_outfn = f'dry{sep}{traj_fn}'
     dry_outp = Path(dry_outfn)
+    dry_traj.save(dry_outfn)
+    dry_topp = dry_outp.with_suffix('.pdb')
+    # dump to PDB for topology
+    dry_traj[-1].save(str(dry_topp))
+    del dry_traj
+
+    # make and save downsampled traj
+    downsample_frq = hconfig['downsample_frq']
+    downsample_traj = traj[::downsample_frq]
 
     down_outfn = f'downsample{sep}{traj_fn}'
     down_outp = Path(down_outfn)
-    print('Preparing to loop over trj in strip and downsample.')
-    # dump to PDB for topology
-    pdb = md.PDB(subset)
-    Path('dry-top.pdb').write_text(str(pdb))
+    downsample_traj.save(down_outfn)
 
     # if we've subset and also dried the trajectories, remove the original.
     # Should raise a file not found error if the call to stat()
@@ -155,6 +169,8 @@ def strip_ds_mdtraj(config_fn, harvester_config_fn):
     else:
         print('either', dry_outp, 'or', down_outp,
               'are size zero, refusing to unlink')
+        
+
 # These basic strings are useful in many cases on clusters using the scheduler named as the key.
 # NOTE the format target '{job_name}' has to appear for the default queue parser to find the job.
 basic_scheduler_fstrings = {
