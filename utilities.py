@@ -318,5 +318,5 @@ default_harvest_shellscript = inspect.cleandoc("""#!/bin/bash
                 #BSUB -o harvest.out
                 #BSUB -q {queue_name}
 
-                python -c 'from mdfarmer.utilities import strip_and_downsample; strip_and_downsample("config.json", "hconfig.json")'
+                python -c 'from mdfarmer.utilities import strip_ds_mdtraj; strip_ds_mdtraj("config.json", "hconfig.json")'
                 """)
