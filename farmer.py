@@ -96,7 +96,8 @@ class Farmer:
             except IndexError:
                 highest_gen = None
         else:
-            print('No clone-dir found.')
+            print('No clone-dir found. Making', clone_dir)
+            clone_dir.mkdir(parents=True)
             highest_gen = None
         if highest_gen:
             config_p = highest_gen / 'config.json'
