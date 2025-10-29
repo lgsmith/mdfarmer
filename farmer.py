@@ -120,7 +120,9 @@ class Farmer:
                             # Because jobs will be launched from traj_p.parent file should be there
                             restart_p = highest_gen / \
                                 prev_config['restart_name']
-                            if restart_p.is_file():
+                            # Assumes systems can't change in size within a seed.
+                            orig_seed_fz = Path(self.seed_state_fns[seed_index]).stat().st_size
+                            if restart_p.is_file() and restart_p.stat().st_size != orig_seed_fz:
                                 seed_fn = str(restart_p.resolve())
                                 remaining_steps = util.calx_remaining_steps(
                                     str(traj_p),
@@ -134,7 +136,7 @@ class Farmer:
                                 else:  # this generation is done: increment gen counter.
                                     gen_index += 1
                             else:
-                                print(traj_p, 'found, but no restart at', restart_p,
+                                print(traj_p, 'found, but no usable restart at', restart_p,
                                       'so unlinking and building fresh.')
                                 traj_p.unlink()
                                 seed_fn, highest_gen = self.seed_from_prior_restart(
