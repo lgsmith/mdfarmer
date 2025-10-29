@@ -67,6 +67,9 @@ class Clone:
         self.total_steps = config['steps']
         self.remaining_steps = self.total_steps
         seed_p = Path(seed_fn)
+        # Not a required arg, but required for set_seed function
+        self.compare_keys = compare_keys
+        # contining with required args.
         self.set_seed(seed_p)
         self.scheduler = scheduler
         if cleandoc_sched_fstring:
@@ -103,7 +106,6 @@ class Clone:
             self.job_name_fstring = self.sep.join(job_name_elements)
         self.dirname_pad = dirname_pad
         self.job_number_re = re.compile(job_number_re)
-        self.compare_keys = compare_keys
         self.harvester = harvester
         self.run_script = run_script
         self.scheduler_script_p = None  # always redefined each run
