@@ -426,6 +426,7 @@ class Farmer:
                     map(lambda c: c.get_tag(), self.finished_clones))))
             print('STILL RUNNING:', *still_running, flush=True)
         # If we get here, that means the minder thinks all clones have finished.
+        print('ENDING submission loop because there are no clones still running', flush=True)
         return True
 
 

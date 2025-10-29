@@ -137,18 +137,22 @@ def strip_ds_mdtraj(config_fn, harvester_config_fn, sep='-', image_molecules=Tru
     top = traj.top
     subset_selection = hconfig['harvester_subset']
     if subset_selection:
+        print('Selecting using', subset_selection)
         subset_iis = top.select(subset_selection)
-        dry_traj = traj.atom_slice(subset_iis)
+        subset_traj = traj.atom_slice(subset_iis)
+        print('Resulting subsetted traj', subset_traj)
     else:
-        dry_traj = traj.remove_solvent()
+        subset_traj = traj.remove_solvent()
+        print('"subset_selection" was', subset_selection, 
+              'so removing all "solvent" according to mdtraj:\n', subset_traj)
     
-    dry_outfn = f'dry{sep}{traj_fn}'
-    dry_outp = Path(dry_outfn)
-    dry_traj.save(dry_outfn)
-    dry_topp = dry_outp.with_suffix('.pdb')
+    subset_fn = f'subset{sep}{traj_fn}'
+    subset_p = Path(subset_fn)
+    subset_traj.save(subset_fn)
+    subset_topp = subset_p.with_suffix('.pdb')
     # dump to PDB for topology
-    dry_traj[-1].save(str(dry_topp))
-    del dry_traj
+    subset_traj[-1].save(str(subset_topp))
+    del subset_traj
 
     # make and save downsampled traj
     downsample_frq = hconfig['downsample_frq']
@@ -161,13 +165,13 @@ def strip_ds_mdtraj(config_fn, harvester_config_fn, sep='-', image_molecules=Tru
     # if we've subset and also dried the trajectories, remove the original.
     # Should raise a file not found error if the call to stat()
     # is applied to a file that was never created
-    if dry_outp.stat().st_size > 0 and down_outp.stat().st_size > 0:
+    if subset_p.stat().st_size > 0 and down_outp.stat().st_size > 0:
         traj_p = Path(traj_fn)
         traj_p.unlink()
         # leave a symlink to dry traj so that frame counting efforts don't go awry
-        traj_p.symlink_to(dry_outp)
+        traj_p.symlink_to(subset_p)
     else:
-        print('either', dry_outp, 'or', down_outp,
+        print('either', subset_p, 'or', down_outp,
               'are size zero, refusing to unlink')
         
 
