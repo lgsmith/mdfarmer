@@ -122,7 +122,7 @@ class Farmer:
                                 prev_config['restart_name']
                             # Assumes systems can't change in size within a seed.
                             orig_seed_fz = Path(self.seed_state_fns[seed_index]).stat().st_size
-                            if restart_p.is_file() and restart_p.stat().st_size != orig_seed_fz:
+                            if restart_p.is_file() and restart_p.stat().st_size == orig_seed_fz:
                                 seed_fn = str(restart_p.resolve())
                                 remaining_steps = util.calx_remaining_steps(
                                     str(traj_p),
