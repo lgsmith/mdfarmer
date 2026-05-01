@@ -62,7 +62,8 @@ def omm_generation(traj_dir_top_level: str,
         '.top':app.GromacsTopFile,
         '.prmtop': app.AmberPrmtopFile,
         '.psf': app.CharmmPsfFile,
-        '.pdb': app.PDBFile
+        '.pdb': app.PDBFile,
+        '.cif': app.PDBxFle
     }
 
     if not state_data_kwargs:
