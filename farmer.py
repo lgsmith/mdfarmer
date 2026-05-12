@@ -229,6 +229,7 @@ class Farmer:
             dirname_pad=self.dirname_pad,
             sep=self.sep,
             harvester=self.harvester,
+            preemption_checker=util.preemption_checkers.get(self.scheduler),
             dry_run=self.dry_run
         )
         if jid:
