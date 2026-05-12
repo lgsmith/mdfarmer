@@ -4,6 +4,7 @@ import openmm as mm
 from openmm import unit
 from . import utilities as util
 from pathlib import Path
+import mdtraj as md
 
 from os import environ
 
@@ -58,13 +59,6 @@ def omm_generation(traj_dir_top_level: str,
         '.xtc': app.XTCReporter,
     }
 
-    topology_readers = {
-        '.top':app.GromacsTopFile,
-        '.prmtop': app.AmberPrmtopFile,
-        '.psf': app.CharmmPsfFile,
-        '.pdb': app.PDBFile
-    }
-
     if not state_data_kwargs:
         state_data_kwargs = dict(
             totalSteps=steps,
@@ -95,16 +89,14 @@ def omm_generation(traj_dir_top_level: str,
               traj_suffix, 'for which no reporter is implemented yet.\n',
               'Your current choices are:', *reporters.keys())
         raise
+    
     # Read topology
-    try:
-        top_p = Path(top_fn)
-        top_ext = top_p.suffix
-        topology = topology_readers[top_ext](top_fn).topology
-    except KeyError:
-        print('You seem to have used a topology format', top_ext,
-              'for which we have not included a reader. Choices are:',
-              *topology_readers.keys())
-        raise
+    if Path(top_fn).suffix != '.prmtop':
+        topology = md.load(top_fn).topology.to_openmm()
+    else: 
+        topology = md.load_prmtop(top_fn).to_openmm()
+    
+    
     # Set up reporters
     data_reporter_p = traj_path.with_suffix('.out')
     data_reporter = app.StateDataReporter(
