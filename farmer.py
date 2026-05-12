@@ -202,10 +202,21 @@ class Farmer:
         top_fn = self.top_fns[seed_index]
         config['top_fn'] = str(self.check_path(Path(top_fn)).resolve())
 
-        if gen_index == 0:
-            config['new_velocities'] = True
-        else:
+        # Fresh seeds (initial structures, adaptively-selected configurations,
+        # anything outside the trajectory tree) should resample velocities.
+        # Seeds that live inside the trajectory tree are our own
+        # CheckpointReporter output and their velocities must be preserved
+        # across a preempt-restart.
+        seed_p = Path(seed_fn).resolve()
+        try:
+            seed_p.relative_to(tdir.resolve())
+            seed_is_internal_restart = True
+        except ValueError:
+            seed_is_internal_restart = False
+        if seed_is_internal_restart:
             config['new_velocities'] = False
+        else:
+            config['new_velocities'] = True
         clone = seeder.Clone(
             config,
             self.scheduler,
