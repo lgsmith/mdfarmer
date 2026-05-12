@@ -9,7 +9,9 @@ openmm_topology_readers = {
     '.top': app.GromacsTopFile,
     '.prmtop': app.AmberPrmtopFile,
     '.psf': app.CharmmPsfFile,
-    '.pdb': app.PDBFile
+    '.pdb': app.PDBFile,
+    '.cif': app.PDBxFile,
+    '.pdbx': app.PDBxFile,
 }
 
 

@@ -4,7 +4,6 @@ import openmm as mm
 from openmm import unit
 from . import utilities as util
 from pathlib import Path
-import mdtraj as md
 
 from os import environ
 
@@ -90,13 +89,9 @@ def omm_generation(traj_dir_top_level: str,
               'Your current choices are:', *reporters.keys())
         raise
     
-    # Read topology
-    if Path(top_fn).suffix != '.prmtop':
-        topology = md.load(top_fn).topology.to_openmm()
-    else: 
-        topology = md.load_prmtop(top_fn).to_openmm()
-    
-    
+    topology = util.read_openmm_top(top_fn)
+
+
     # Set up reporters
     data_reporter_p = traj_path.with_suffix('.out')
     data_reporter = app.StateDataReporter(
