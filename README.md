@@ -146,6 +146,10 @@ There are two modes of analysis with this type of dataset. If you have fewer clo
 
 We're hoping to add some scripts for both modes of analysis--mostly these will be simple functions that just use the configurations you've given for the farmer and or the structure of the data-set tree to provide you with lists of trajectories that might be useful, such as a nested list of file-paths that follows the overall structure of the tree. If you're writing functions like this yourself, note that python's `glob` and `iterdir` functionalities provide sub-paths in no particular order. The reason the directory names are padded is so that the built-in `sorted` will 'just work' with a semantic sort on the file names, but you do have to bother to use sorted if you're writing your own iterator and you want the order to be 1. the same and 2. for the generations to be sequential each time you read the files. Note that the top level file titled `traj_list.txt` records the trajectory paths in the order they are produced, which could be good for some things like a function that surveys how much data has been collected thus far, but is probably not what you want for most analysis.
 
+## AI assistance
+
+Parts of this codebase have been developed with assistance from Anthropic's Claude (Opus 4.x family). Individual commits are not tagged with `Co-Authored-By` trailers; this section is the project-level attribution.
+
 ## Extensions
 
 We'd love to get your PRs for any extensions you think could be helpful. Even if you have a hacky solution to some problem you face, it might be interesting if the problem seems general. Feel free to post these kinds of solutions, or requests for development, as issues. If we get to it we get to it! We'll at least try to talk with you about how to improve any hacky solutions you've made.
