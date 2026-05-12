@@ -170,11 +170,18 @@ class Farmer:
                 print('Config at', config_p,
                       'appears to contain malformed json; here is the raw string:')
                 print(prev_config_raw, '\nProceeding to obtain gen index from path.')
+                gen_index = int(highest_gen.name.split(self.sep)[-1])
                 seed_fn, highest_gen = self.seed_from_prior_restart(
                     gen_paths, highest_gen)
-                gen_index = int(highest_gen.name.split(self.sep)[-1])
         else:
             # if we get here in control flow,  then we start fresh
+            gen_index = 0
+            seed_fn = self.seed_state_fns[seed_index]
+        # Error paths above can leave seed_fn=None (e.g. only one gen dir exists
+        # and its state.xml is missing). Restart this clone from its initial seed.
+        if seed_fn is None:
+            print(f'No usable seed found for clone {seed_index}-{clone_index}; '
+                  'falling back to initial seed.')
             gen_index = 0
             seed_fn = self.seed_state_fns[seed_index]
         # Now try to see if there's a currently running job with this
