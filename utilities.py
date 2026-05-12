@@ -261,6 +261,49 @@ preemption_checkers = {
 }
 
 
+# Resolve which OpenMM Platform to use and which platformProperties to apply.
+# If platform_name is set, demand that exact platform (raise if it can't load).
+# Otherwise pick the fastest available non-Reference platform; raise if only
+# Reference is available, since AMOEBA / large-system MD on Reference is
+# effectively a hang from the scheduler's perspective. Filter platform_properties
+# to those the chosen platform actually exposes so e.g. {'Precision': 'mixed'}
+# applies cleanly on CUDA/HIP/OpenCL but is silently dropped on CPU.
+def select_platform(platform_name=None, platform_properties=None):
+    if platform_name is not None:
+        platform = mm.Platform.getPlatformByName(platform_name)
+    else:
+        candidates = []
+        for i in range(mm.Platform.getNumPlatforms()):
+            p = mm.Platform.getPlatform(i)
+            if p.getName() != 'Reference':
+                candidates.append(p)
+        if not candidates:
+            raise RuntimeError(
+                'No non-Reference OpenMM platform available; refusing to launch '
+                'a simulation that would silently hang on Reference.'
+            )
+        platform = max(candidates, key=lambda p: p.getSpeed())
+    if platform_properties is None:
+        filtered_properties = None
+    else:
+        supported = set(platform.getPropertyNames())
+        filtered_properties = {}
+        ignored = []
+        for k, v in platform_properties.items():
+            if k in supported:
+                filtered_properties[k] = v
+            else:
+                ignored.append(k)
+        if ignored:
+            print(
+                f'Platform {platform.getName()} does not support these '
+                f'properties; ignoring them: {ignored}'
+            )
+        if not filtered_properties:
+            filtered_properties = None
+    return platform, filtered_properties
+
+
 def calx_remaining_steps(traj_fn, top_fn, total_steps, write_interval):
     traj_len = get_traj_len(traj_fn, top_fn)
     return total_steps - traj_len * write_interval
@@ -326,7 +369,11 @@ default_straight_sampling_config_template = dict(
     traj_name='traj',
     traj_suffix='.xtc',
     restart_name='state.xml',
-    platform_name='CUDA',  # CHECK TO BE SURE!
+    # None -> auto-select fastest available non-Reference platform.
+    # Set explicitly (e.g. 'CUDA', 'HIP', 'OpenCL') if you want to force one.
+    platform_name=None,
+    # Precision is filtered against the chosen platform's supported properties,
+    # so this works on CUDA/HIP/OpenCL and is silently dropped on CPU.
     platform_properties={'Precision': 'mixed'},
     steps=default_steps,
     state_data_kwargs=default_state_data_kwargs,

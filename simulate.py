@@ -109,11 +109,10 @@ def omm_generation(traj_dir_top_level: str,
     system = mm.XmlSerializer.deserialize(Path(system_fn).read_text())
 
     integrator = mm.XmlSerializer.deserialize(Path(integrator_xml).read_text())
-    if platform_name:
-        platform = mm.Platform.getPlatformByName(platform_name)
-    else:
-        platform = None
-    if platform_properties:
+    platform, platform_properties = util.select_platform(
+        platform_name=platform_name, platform_properties=platform_properties)
+    print(f'Using OpenMM platform: {platform.getName()}')
+    if platform_properties is not None:
         simulation = app.Simulation(topology, system, integrator,
                                     platform=platform,
                                     platformProperties=platform_properties)
