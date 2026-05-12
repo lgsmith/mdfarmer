@@ -1,6 +1,7 @@
 import inspect
 from pathlib import Path
 import json
+import subprocess as sp
 import openmm as mm
 from openmm import app
 
@@ -221,6 +222,42 @@ basic_scheduler_reports = {
 basic_scheduler_assoc_reports = {
     "lsf": "bjobs -o 'JOBID JOB_NAME' -noheader -J '{title}-*'",
     "slurm": "squeue --me -h -o '%i %j' | grep -F '{title}'"
+}
+
+
+# Per-scheduler post-mortem checks for whether a finished job was preempted.
+# Used by Clone.check_start_gen to avoid charging preemptions against the
+# per-gen restart_attempts budget. Returns False on any error (missing
+# binary, timeout, accounting gap, unknown state) so a true failure still
+# counts as a restart.
+def slurm_was_preempted(jid):
+    try:
+        out = sp.check_output(
+            ['sacct', '-j', str(jid), '-n', '-o', 'State', '-X'],
+            text=True, timeout=30
+        ).strip()
+    except (sp.CalledProcessError, sp.TimeoutExpired, FileNotFoundError):
+        return False
+    for line in out.splitlines():
+        if 'PREEMPTED' in line:
+            return True
+    return False
+
+
+def lsf_was_preempted(jid):
+    try:
+        out = sp.check_output(
+            ['bjobs', '-d', '-o', 'exit_reason', '-noheader', str(jid)],
+            text=True, timeout=30
+        ).strip()
+    except (sp.CalledProcessError, sp.TimeoutExpired, FileNotFoundError):
+        return False
+    return 'TERM_PREEMPT' in out
+
+
+preemption_checkers = {
+    'sbatch': slurm_was_preempted,
+    'bsub': lsf_was_preempted,
 }
 
 

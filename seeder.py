@@ -20,7 +20,8 @@ class Clone:
         'current_gen_dir', 'current_gen', 'config_p', 'scheduler_script_p', 'compare_keys',
         'scheduler_fstring', 'scheduler', 'traj_list', 'sep', 'dirname_pad',
         'scheduler_kws', 'restarts_per_gen', 'restart_attempts', 'run_script',
-        'harvester', 'remaining_steps', 'run_script_name', 'total_steps')
+        'harvester', 'remaining_steps', 'run_script_name', 'total_steps',
+        'preemption_checker')
 
     # This should mostly be used by the init function, and by adaptive sampling scripts.
 
@@ -60,6 +61,10 @@ class Clone:
                  # Compare keys are used by eq and hash to determine whether two clones are equal.
                  compare_keys=('seed_index', 'clone_index'),
                  harvester=None,
+                 # Callable jid -> bool, returns True if the named job was
+                 # preempted by the scheduler. If provided, preemption restarts
+                 # don't count against restarts_per_gen.
+                 preemption_checker=None,
                  dry_run=False
                  ):
         # REQUIRED ARGS below here
@@ -105,6 +110,7 @@ class Clone:
         self.job_number_re = re.compile(job_number_re)
         self.compare_keys = compare_keys
         self.harvester = harvester
+        self.preemption_checker = preemption_checker
         self.run_script = run_script
         self.scheduler_script_p = None  # always redefined each run
 
@@ -149,12 +155,24 @@ class Clone:
             shutil.copy(seed_p, cg_seed_p)
             self.set_seed(cg_seed_p)
 
+    # Returns True if the scheduler reports this clone's last job was
+    # preempted (so the upcoming restart shouldn't count against the
+    # per-gen restart_attempts budget).
+    def was_preempted(self):
+        if self.preemption_checker is None:
+            return False
+        if self.job_number is None:
+            return False
+        return self.preemption_checker(self.job_number)
+
     # note this gets the gen index from config then builds the dir for that gen
     # So, if you want to start a new generation, you have to increment/change
     # self.config['gen_index'] before calling this.
     # Tries to set up directory, and checks if we've gone over the number of restart limits
     # Returns a bool based on success (True) or failure (False) of these efforts.
-    def plow_harrow_plant(self, overwrite=False):
+    # If count_as_restart is False (e.g. last job was preempted), skip the
+    # restart_attempts increment so the budget isn't burned by preemption.
+    def plow_harrow_plant(self, overwrite=False, count_as_restart=True):
         # If we're running subsequent generations, we want to restart from prev.
         # positions and velocities.
         if self.config['gen_index'] != 0:
@@ -190,6 +208,8 @@ class Clone:
         run_script_p = self.current_gen_dir / self.run_script_name
         if overwrite or not run_script_p.is_file():
             run_script_p.write_text(self.run_script)
+        if not count_as_restart:
+            return True
         if self.restart_attempts < self.restarts_per_gen:
             self.restart_attempts += 1
             return True
@@ -198,8 +218,9 @@ class Clone:
                   self.restart_attempts, 'times. Aborting this clone.')
             return False
 
-    def start_current(self, overwrite=False):
-        should_launch = self.plow_harrow_plant(overwrite=overwrite)
+    def start_current(self, overwrite=False, count_as_restart=True):
+        should_launch = self.plow_harrow_plant(
+            overwrite=overwrite, count_as_restart=count_as_restart)
         print(self.get_tag(), 'should_launch',
               should_launch, 'dry_run', self.dry_run)
         if should_launch and not self.dry_run:
@@ -245,6 +266,13 @@ class Clone:
                   self.job_name_fstring.format(**self.config))
             no_failure = True
         else:
+            # If the scheduler reports this job as preempted, the upcoming
+            # restart shouldn't burn a restart_attempt. Genuine failures
+            # (segfault, OOM, GPU error) still count.
+            if self.was_preempted():
+                count_as_restart = False
+            else:
+                count_as_restart = True
             traj_p = (self.current_gen_dir / self.config['traj_name']
                       ).with_suffix(self.config['traj_suffix'])
             if traj_p.is_file():
@@ -261,7 +289,8 @@ class Clone:
                         f'Removing and attempting restart number {self.restart_attempts}.',
                     )
                     traj_p.unlink()
-                    no_failure = self.start_current(overwrite=overwrite)
+                    no_failure = self.start_current(
+                        overwrite=overwrite, count_as_restart=count_as_restart)
                 # if this, the trajectory has steps remaining before it is a full gen.
                 # Run those.
                 elif self.remaining_steps > 0:
@@ -269,7 +298,8 @@ class Clone:
                     # set the reporters to append
                     self.config['append'] = True
                     self.check_copy_set_restart_seed()
-                    no_failure = self.start_current(overwrite=overwrite)
+                    no_failure = self.start_current(
+                        overwrite=overwrite, count_as_restart=count_as_restart)
                 else:  # trajectory was created, and finished running.
                     self.restart_attempts = 0
                     self.config['steps'] = self.total_steps
@@ -283,7 +313,8 @@ class Clone:
             else:  # no trajectory file, start from here just as if we'd found an empty file.
                 print(f'{traj_p} not found, attempting start number '
                       f'{self.restart_attempts} for this gen.')
-                no_failure = self.start_current(overwrite=overwrite)
+                no_failure = self.start_current(
+                    overwrite=overwrite, count_as_restart=count_as_restart)
         # else:  # this triggers if no JN bound to clone ==> we should start one
             # no_failure = self.start_current(overwrite=overwrite)
         return no_failure
