@@ -206,8 +206,10 @@ basic_gpu_lines = {
 #   self.scheduler_report_fstring.format(title=self.config_template['title'])
 basic_scheduler_reports = {
     "lsf": "bjobs -o JOBID -noheader -J '{title}-*'",
-    # note when using pipes to awk, curly braces must be escaped with curly braces.
-    "slurm": "squeue --me --noheader -O JobID,name | awk '/{title}/ {{print $1}}'"
+    # -h -o '%i %j' prints JobID and untruncated JobName, two whitespace-separated columns.
+    # The default -O Name truncates to 8 chars, which silently breaks title matching.
+    # Curly braces must be escaped with curly braces when using awk via str.format.
+    "slurm": "squeue --me -h -o '%i %j' | awk '/{title}/ {{print $1}}'"
 }
 
 # Basic report to print the name, and then the jobid, for each job with job title
@@ -218,7 +220,7 @@ basic_scheduler_reports = {
 #   self.scheduler_assoc_fstring.format(title=self.config_template['title'])
 basic_scheduler_assoc_reports = {
     "lsf": "bjobs -o 'JOBID JOB_NAME' -noheader -J '{title}-*'",
-    "slurm": "squeue --me --noheader -O JobID,name | grep '{title}'"
+    "slurm": "squeue --me -h -o '%i %j' | grep -F '{title}'"
 }
 
 
