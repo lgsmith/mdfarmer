@@ -139,6 +139,9 @@ class Farmer:
         self.config_template['traj_dir_top_level'] = str(
             Path(self.config_template['traj_dir_top_level']).resolve()
         )
+        self.config_template['integrator_xml'] = str(
+            self.check_path(Path(self.config_template['integrator_xml'])).resolve()
+        )
 
         seed_structure_fps = [Path(s).resolve()
                               for s in seed_structure_fns]
