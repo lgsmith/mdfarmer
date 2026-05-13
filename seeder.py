@@ -1,4 +1,5 @@
 from __future__ import annotations
+import copy
 import inspect
 from . import utilities as util
 from pathlib import Path
@@ -12,6 +13,77 @@ default_run_script = """
 from mdfarmer.simulate import omm_basic_sim_block_json as runner
 runner('config.json')
 """
+
+
+# A "usable" seed is a state file that exists and is non-empty. Zero-byte
+# state.xml files are a common preempt failure mode (job died before the
+# CheckpointReporter completed a write) and must not be picked as seeds.
+def _is_usable_seed(p: Path) -> bool:
+    if not p.is_file():
+        return False
+    if p.stat().st_size == 0:
+        return False
+    return True
+
+
+# Examine one gen directory and decide whether it can seed the next launch.
+#
+# Returns (gen_index, seed_fn, steps_to_run, append) on success:
+#   - gen_index: which gen the next launch is for (may equal this dir's
+#     gen, or be one higher if this gen is complete and we advance).
+#   - seed_fn: absolute path to the state.xml to load from.
+#   - steps_to_run: how many sim steps the next launch should take.
+#   - append: whether trajectory reporters should open in append mode.
+#
+# Returns None if this gen is unrecoverable (missing/corrupt config, no
+# usable state.xml, partial traj in non-append mode). Caller should try
+# an older gen, then fall back to the initial seed.
+#
+# Side effect (non-append mode only): a partial traj in this gen gets
+# renamed to old_<name> so the next launch starts cleanly. This matches
+# the documented "cut the ends off the tree" reset behavior.
+def _try_recover_gen(gen_path: Path, *,
+                     append_mode: bool,
+                     restart_name: str,
+                     traj_name: str,
+                     traj_suffix: str,
+                     write_interval: int,
+                     total_steps: int,
+                     top_fn: str):
+    config_p = gen_path / 'config.json'
+    if not config_p.is_file():
+        return None
+    try:
+        prev_config = json.loads(config_p.read_text())
+    except json.JSONDecodeError:
+        print(f'_try_recover_gen: malformed config at {config_p}; skipping gen.')
+        return None
+    gen_index = prev_config['gen_index']
+
+    restart_p = gen_path / restart_name
+    if not _is_usable_seed(restart_p):
+        return None
+    seed_fn = str(restart_p.resolve())
+
+    traj_p = (gen_path / traj_name).with_suffix(traj_suffix)
+    if (not traj_p.is_file()) or traj_p.stat().st_size == 0:
+        # No (or zero-size) traj yet; start this gen fresh from the in-dir state.
+        return gen_index, seed_fn, total_steps, False
+
+    remaining = util.calx_remaining_steps(
+        str(traj_p), top_fn, total_steps, write_interval)
+    if remaining > 0:
+        if append_mode:
+            return gen_index, seed_fn, remaining, True
+        # Non-append mode: preserve the partial traj for later inspection
+        # and fall through to an older gen.
+        old_traj_p = traj_p.parent / ('old_' + traj_p.name)
+        print(f'_try_recover_gen: non-append mode, renaming partial '
+              f'{traj_p} -> {old_traj_p}')
+        traj_p.rename(old_traj_p)
+        return None
+    # Gen is complete; advance to gen+1 seeded from this gen's terminal state.
+    return gen_index + 1, seed_fn, total_steps, False
 
 
 class Clone:
@@ -65,12 +137,21 @@ class Clone:
                  # preempted by the scheduler. If provided, preemption restarts
                  # don't count against restarts_per_gen.
                  preemption_checker=None,
+                 # The full per-gen step count from the template. On a resume
+                 # config['steps'] is the steps-remaining-this-gen, not the
+                 # template total, so we have to track the total separately
+                 # or start_next will reset gens to the shortened count. If
+                 # None, fall back to config['steps'] for backwards compat.
+                 steps_per_gen=None,
                  dry_run=False
                  ):
         # REQUIRED ARGS below here
         self.config = config  # dict keys and values must be json serializable.
-        self.total_steps = config['steps']
-        self.remaining_steps = self.total_steps
+        if steps_per_gen is None:
+            self.total_steps = config['steps']
+        else:
+            self.total_steps = steps_per_gen
+        self.remaining_steps = config['steps']
         seed_p = Path(seed_fn)
         self.set_seed(seed_p)
         self.scheduler = scheduler
@@ -113,6 +194,118 @@ class Clone:
         self.preemption_checker = preemption_checker
         self.run_script = run_script
         self.scheduler_script_p = None  # always redefined each run
+
+    # Construct a Clone by walking the on-disk state for (seed_index,
+    # clone_index) under tdir. Decides which gen to run next, what to seed
+    # it from, and whether to append or start fresh. Falls through extant
+    # gens newest -> oldest, then falls back to initial_seed_fn if nothing
+    # is recoverable.
+    @classmethod
+    def from_disk(cls,
+                  tdir: Path,
+                  seed_index: int,
+                  clone_index: int,
+                  *,
+                  # The user-provided initial structure for this seed. Used
+                  # when no on-disk gen is recoverable.
+                  initial_seed_fn: str,
+                  # Resolved, validated top and system paths for this seed.
+                  top_fn: str,
+                  system_fn: str,
+                  # The Farmer's full config_template. Read-only here; we
+                  # deepcopy before mutating.
+                  config_template: dict,
+                  # Scheduler context (passed straight through to __init__).
+                  scheduler: str,
+                  scheduler_fstring: str,
+                  scheduler_kws: dict,
+                  # Discovery / Clone wiring.
+                  dirname_pad: int,
+                  sep: str,
+                  job_number_re: str,
+                  job_name_fstring: str,
+                  harvester=None,
+                  preemption_checker=None,
+                  # (seed, clone, gen) -> jid for jobs currently in the
+                  # scheduler queue, so we can re-associate after an
+                  # orchestrator restart.
+                  rep_dict: dict = None,
+                  dry_run: bool = False):
+        if rep_dict is None:
+            rep_dict = {}
+        append_mode = config_template['append']
+        steps_per_gen = config_template['steps']
+
+        clone_dir = util.dir_seeds_clones(
+            tdir, seed_index, clone_index, dirname_pad, sep=sep, mkdir=False)
+        if clone_dir.is_dir():
+            gen_paths = sorted(clone_dir.iterdir())
+        else:
+            gen_paths = []
+
+        recovered = None
+        for gen_path in reversed(gen_paths):
+            recovered = _try_recover_gen(
+                gen_path,
+                append_mode=append_mode,
+                restart_name=config_template['restart_name'],
+                traj_name=config_template['traj_name'],
+                traj_suffix=config_template['traj_suffix'],
+                write_interval=config_template['write_interval'],
+                total_steps=steps_per_gen,
+                top_fn=top_fn,
+            )
+            if recovered is not None:
+                break
+
+        if recovered is not None:
+            gen_index, seed_fn, steps_this_launch, append_now = recovered
+            is_internal_restart = True
+        else:
+            gen_index = 0
+            seed_fn = initial_seed_fn
+            steps_this_launch = steps_per_gen
+            append_now = False
+            is_internal_restart = False
+
+        config = copy.deepcopy(config_template)
+        config['seed_index'] = seed_index
+        config['clone_index'] = clone_index
+        config['gen_index'] = gen_index
+        config['steps'] = steps_this_launch
+        config['append'] = append_now
+        if is_internal_restart:
+            config['new_velocities'] = False
+        else:
+            config['new_velocities'] = True
+        config['system_fn'] = system_fn
+        config['top_fn'] = top_fn
+        # Keep the StateDataReporter progress display consistent with the
+        # actual run length so % complete isn't misleading on a resume.
+        if isinstance(config.get('state_data_kwargs'), dict):
+            config['state_data_kwargs'] = {
+                **config['state_data_kwargs'],
+                'totalSteps': steps_this_launch,
+            }
+
+        jid = rep_dict.get((seed_index, clone_index, gen_index))
+
+        return cls(
+            config,
+            scheduler,
+            scheduler_fstring,
+            scheduler_kws,
+            seed_fn,
+            steps_per_gen=steps_per_gen,
+            job_number=jid,
+            job_number_re=job_number_re,
+            job_name_fstring=job_name_fstring,
+            dirname_pad=dirname_pad,
+            sep=sep,
+            harvester=harvester,
+            preemption_checker=preemption_checker,
+            dry_run=dry_run,
+        )
 
     # Compare a value across self config and other config in other Clone.
     def conf_value_eq(self, other: Clone, conf_key: str) -> bool:
