@@ -228,7 +228,9 @@ basic_scheduler_reports = {
 #   self.scheduler_assoc_fstring.format(title=self.config_template['title'])
 basic_scheduler_assoc_reports = {
     "lsf": "bjobs -o 'JOBID JOB_NAME' -noheader -J '{title}-*'",
-    "slurm": "squeue --me -h -o '%i %j' | grep -F '{title}'"
+    # awk (not grep) so a clean queue exits 0 instead of grep's exit-1-on-no-match,
+    # which would crash the boot-time sp.check_output in Farmer.__init__.
+    "slurm": "squeue --me -h -o '%i %j' | awk '/{title}/'"
 }
 
 
