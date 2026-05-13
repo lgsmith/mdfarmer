@@ -1,11 +1,9 @@
 import subprocess as sp
 from . import utilities as util
 from pathlib import Path
-import json
 from . import seeder
 from . import simulate as sims
 import time
-import copy
 
 
 class Farmer:
@@ -60,181 +58,34 @@ class Farmer:
                 print('done_before_launch', clone.get_tag())
         return enough_gens
 
-    def seed_from_prior_restart(self, gen_paths, highest_gen):
+    # Build one Clone via disk-state discovery, isolating failures so one
+    # corrupt clone dir can't kill orchestrator boot.
+    def _setup_one_clone(self, tdir, seed_index, clone_index, rep_dict):
         try:
-            highest_gen = gen_paths[-2]
-            prev_prev_config_raw = (
-                highest_gen/'config.json').read_text()
-            prev_prev_config = json.loads(
-                prev_prev_config_raw)
-            restart_p = highest_gen / \
-                prev_prev_config['restart_name']
-            seed_fn = str(restart_p.resolve())
-        except IndexError:
-            print('Starting over since first generation is borked')
-            highest_gen = None
-            seed_fn = None
-        except json.JSONDecodeError:
-            print('Prev gen Config illegible, so starting over')
-            highest_gen = None
-            seed_fn = None
-        return seed_fn, highest_gen
-
-    def make_clone_check_running(self, tdir, seed_index, clone_index, rep_dict):
-        # First, determine which (if any) generations for each run and clone have finished.
-        clone_dir = util.dir_seeds_clones(tdir, seed_index,
-                                          clone_index,
-                                          self.dirname_pad,
-                                          mkdir=False)
-        config = copy.deepcopy(self.config_template)
-        if clone_dir.is_dir():
-            # relies on padding to cause lex sort to yield highest
-            # gen dir as last element
-            try:
-                gen_paths = sorted(clone_dir.iterdir())
-                highest_gen = gen_paths[-1]
-            except IndexError:
-                highest_gen = None
-        else:
-            print('No clone-dir found.')
-            highest_gen = None
-        if highest_gen:
-            config_p = highest_gen / 'config.json'
-            try:
-                prev_config_raw = config_p.read_text()
-                prev_config = json.loads(prev_config_raw)
-                gen_index = prev_config['gen_index']
-                seed_fn = prev_config['seed_fn']
-                try:
-                    traj_name = prev_config['traj_name']
-                    traj_suff = prev_config['traj_suffix']
-                except KeyError:
-                    traj_name = config['traj_name']
-                    traj_suff = config['traj_suffix']
-                traj_p = (highest_gen / traj_name).with_suffix(
-                    traj_suff)
-                if traj_p.is_file():
-                    if traj_p.stat().st_size > 0:
-                        if config['append']:
-                            # Because jobs will be launched from traj_p.parent file should be there
-                            restart_p = highest_gen / \
-                                prev_config['restart_name']
-                            if restart_p.is_file():
-                                seed_fn = str(restart_p.resolve())
-                                remaining_steps = util.calx_remaining_steps(
-                                    str(traj_p),
-                                    prev_config['top_fn'],
-                                    prev_config['steps'],
-                                    prev_config['write_interval']
-                                )
-                                if remaining_steps > 0:
-                                    config['steps'] = remaining_steps
-
-                                else:  # this generation is done: increment gen counter.
-                                    gen_index += 1
-                            else:
-                                print(traj_p, 'found, but no restart at', restart_p,
-                                      'so unlinking and building fresh.')
-                                traj_p.unlink()
-                                seed_fn, highest_gen = self.seed_from_prior_restart(
-                                    gen_paths, highest_gen)
-                        else:
-                            old_traj_p = traj_p.parent / 'old_' + traj_p.name
-                            print(
-                                'Traj found, but not operating in append mode.')
-                            print('Moving', str(traj_p), 'to',
-                                  str(old_traj_p))
-                            traj_p.rename(old_traj_p)
-                            seed_fn, highest_gen = self.seed_from_prior_restart(
-                                gen_paths, highest_gen)
-                    else:
-                        print('Empty trajectory found from looking in:', config_p,)
-                        traj_p.unlink()
-                        seed_fn, highest_gen = self.seed_from_prior_restart(
-                            gen_paths, highest_gen)
-                else:
-                    print(f'No traj found from looking in {config_p.parent}.')
-                    print('Starting from fresh dir for seed {seed_index},'
-                          ' clone {clone_index},'
-                          ' gen {gen_index}.'.format(**prev_config))
-                    seed_fn, highest_gen = self.seed_from_prior_restart(
-                        gen_paths, highest_gen)
-            except FileNotFoundError:
-                print(
-                    f'Could not find {config_p}, parsing gen_index from path.')
-                gen_index = int(highest_gen.name.split(self.sep)[-1])
-                seed_fn, highest_gen = self.seed_from_prior_restart(
-                    gen_paths, highest_gen
-                )
-            except json.decoder.JSONDecodeError:
-                print('Config at', config_p,
-                      'appears to contain malformed json; here is the raw string:')
-                print(prev_config_raw, '\nProceeding to obtain gen index from path.')
-                gen_index = int(highest_gen.name.split(self.sep)[-1])
-                seed_fn, highest_gen = self.seed_from_prior_restart(
-                    gen_paths, highest_gen)
-        else:
-            # if we get here in control flow,  then we start fresh
-            gen_index = 0
-            seed_fn = self.seed_state_fns[seed_index]
-        # Error paths above can leave seed_fn=None (e.g. only one gen dir exists
-        # and its state.xml is missing). Restart this clone from its initial seed.
-        if seed_fn is None:
-            print(f'No usable seed found for clone {seed_index}-{clone_index}; '
-                  'falling back to initial seed.')
-            gen_index = 0
-            seed_fn = self.seed_state_fns[seed_index]
-        # Now try to see if there's a currently running job with this
-        # seed_index, clone_index, and gen_index
-        try:
-            jid = rep_dict[(seed_index, clone_index, gen_index)]
-        except KeyError:
-            jid = None
-
-        # Finally, build the clone with whichver setting needed to be started.
-        config['seed_index'] = seed_index
-        config['clone_index'] = clone_index
-        config['gen_index'] = gen_index
-        # Pick top and sys based on seed index:
-        sys_fn = self.system_fns[seed_index]
-        config['system_fn'] = str(self.check_path(Path(sys_fn)).resolve())
-
-        top_fn = self.top_fns[seed_index]
-        config['top_fn'] = str(self.check_path(Path(top_fn)).resolve())
-
-        # Fresh seeds (initial structures, adaptively-selected configurations,
-        # anything outside the trajectory tree) should resample velocities.
-        # Seeds that live inside the trajectory tree are our own
-        # CheckpointReporter output and their velocities must be preserved
-        # across a preempt-restart.
-        seed_p = Path(seed_fn).resolve()
-        try:
-            seed_p.relative_to(tdir.resolve())
-            seed_is_internal_restart = True
-        except ValueError:
-            seed_is_internal_restart = False
-        if seed_is_internal_restart:
-            config['new_velocities'] = False
-        else:
-            config['new_velocities'] = True
-        clone = seeder.Clone(
-            config,
-            self.scheduler,
-            self.scheduler_fstring,
-            self.scheduler_kws,
-            seed_fn,
-            job_number=jid,
-            job_number_re=self.job_number_re,
-            job_name_fstring=self.job_name_fstring,
-            dirname_pad=self.dirname_pad,
-            sep=self.sep,
-            harvester=self.harvester,
-            preemption_checker=util.preemption_checkers.get(self.scheduler),
-            dry_run=self.dry_run
-        )
-        if jid:
+            clone = seeder.Clone.from_disk(
+                tdir, seed_index, clone_index,
+                initial_seed_fn=self.seed_state_fns[seed_index],
+                top_fn=self.top_fns[seed_index],
+                system_fn=self.system_fns[seed_index],
+                config_template=self.config_template,
+                scheduler=self.scheduler,
+                scheduler_fstring=self.scheduler_fstring,
+                scheduler_kws=self.scheduler_kws,
+                dirname_pad=self.dirname_pad,
+                sep=self.sep,
+                job_number_re=self.job_number_re,
+                job_name_fstring=self.job_name_fstring,
+                harvester=self.harvester,
+                preemption_checker=util.preemption_checkers.get(self.scheduler),
+                rep_dict=rep_dict,
+                dry_run=self.dry_run,
+            )
+        except Exception as exc:
+            print(f'Skipping clone seed={seed_index} clone={clone_index} '
+                  f'during setup: {type(exc).__name__}: {exc}')
+            return None
+        if clone.job_number is not None:
             self.active_clone_set.add(clone)
-
         return clone
 
     def __init__(self, n_seeds: int, n_clones: int, n_gens: int,
@@ -268,8 +119,12 @@ class Farmer:
         self.n_gens = n_gens
         self.overwrite = overwrite
         self.config_template = config_template
-        self.system_fns = system_fns
-        self.top_fns = top_fns
+        # Resolve and validate top / system paths once up front so per-clone
+        # setup doesn't repeat the work and a bad file fails loudly at boot.
+        self.system_fns = [str(self.check_path(Path(p)).resolve())
+                           for p in system_fns]
+        self.top_fns = [str(self.check_path(Path(p)).resolve())
+                        for p in top_fns]
         self.runner = runner
         self.seeds_first = seeds_first
         self.scheduler = scheduler
@@ -337,25 +192,23 @@ class Farmer:
 
         tdir = Path(self.config_template['traj_dir_top_level'])
         self.priority_ordered_clones = []
-        # try to figure out how 'complete' all extant clones are
         if self.seeds_first:
-            # order list so that we try to start an unfinished clone in each
-            # seed before moving to the next clone.
-            for clone_index in range(self.n_clones):
-                clone_queue = []
-                for seed_index in range(self.n_seeds):
-                    clone_queue.append(self.make_clone_check_running(
-                        tdir, seed_index, clone_index, rep_dict))
-                self.priority_ordered_clones.append(clone_queue)
+            outer_range = range(self.n_clones)
+            inner_range = range(self.n_seeds)
+            indexed = lambda outer, inner: (inner, outer)  # (seed, clone)
         else:
-            # else order list so to start each unfinished clone in
-            # a given seed before moving to the next seed.
-            for seed_index in range(self.n_seeds):
-                clone_queue = []
-                for clone_index in range(self.n_clones):
-                    clone_queue.append(self.make_clone_check_running(
-                        tdir, seed_index, clone_index, rep_dict))
-                self.priority_ordered_clones.append(clone_queue)
+            outer_range = range(self.n_seeds)
+            inner_range = range(self.n_clones)
+            indexed = lambda outer, inner: (outer, inner)  # (seed, clone)
+        for outer in outer_range:
+            clone_queue = []
+            for inner in inner_range:
+                seed_index, clone_index = indexed(outer, inner)
+                clone = self._setup_one_clone(
+                    tdir, seed_index, clone_index, rep_dict)
+                if clone is not None:
+                    clone_queue.append(clone)
+            self.priority_ordered_clones.append(clone_queue)
 
     def launch(self, sleep=None, update_jids=True):
         still_running = []  # note, this will be flat
