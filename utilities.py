@@ -49,15 +49,22 @@ try:
 
 except ImportError:
     print('LOOS not in import path; falling back to MDTraj.')
-    print('Expect restarting a mature dataset to be slow.')
     import mdtraj
 
+    # mdtraj.open(...) returns a format-specific file handle (DCD/XTC) whose
+    # __len__ reports frame count without loading coordinates. Avoids the
+    # mdtraj.load(...) round-trip that materialized the whole traj just to
+    # measure it -- which was prohibitive for mature datasets.
     def get_traj_len(traj_fn, top_fn):
         if Path(traj_fn).stat().st_size == 0:
-            length = 0
-        else:
-            length = len(mdtraj.load(traj_fn, top=top_fn))
-        return length
+            return 0
+        try:
+            with mdtraj.open(traj_fn) as fh:
+                return len(fh)
+        except (OSError, ValueError) as exc:
+            print(f'mdtraj.open could not read {traj_fn}: {exc}; '
+                  'treating as empty.')
+            return 0
 
 
 """
