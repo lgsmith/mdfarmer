@@ -306,7 +306,18 @@ def select_platform(platform_name=None, platform_properties=None):
 
 def calx_remaining_steps(traj_fn, top_fn, total_steps, write_interval):
     traj_len = get_traj_len(traj_fn, top_fn)
-    return total_steps - traj_len * write_interval
+    remaining = total_steps - traj_len * write_interval
+    # A negative result means the traj has more frames than the gen
+    # should contain — usually duplicated frames from an append against
+    # a stale state.xml, or a write_interval / total_steps mismatch
+    # between the on-disk config and the current run. Surface it so it
+    # doesn't masquerade as "gen complete."
+    if remaining < 0:
+        print(f'WARNING: calx_remaining_steps({traj_fn}) = {remaining}; '
+              f'traj has {traj_len} frames at write_interval={write_interval} '
+              f'but total_steps={total_steps}. Treating as complete; check '
+              f'for over-appended trajectory.')
+    return remaining
 
 
 # This won't be nicely jsonizable unless all default and provided vals are.
