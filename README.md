@@ -84,6 +84,8 @@ Right now, the actual tender process (i.e. the one that the instance of Farmer i
 
 You launch the tender process by just calling the correct python on the script above. For debugging I recommend doing this in an interactive session, but normally these datasets take weeks or even months to collect so I often run them using the shell utility `nohup`, in a script such as the following. This allows me to call `tail` on `straight-sampling-farmer.out` to read what's going on.
 
+Launch the tender from the directory that holds your seed structures, system, integrator, and topology files. `Farmer.__init__` resolves any relative paths in the config to absolute paths once at boot, against the cwd it was started in. Absolute paths in your script work from anywhere; relative paths only work if you launch from the right directory.
+
 ```bash
 #!/bin/bash
 
