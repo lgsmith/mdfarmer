@@ -173,22 +173,37 @@ class Farmer:
                 self.config_template['traj_list'] = str(Path('traj_list.txt')
                                                         .resolve())
 
-        # Update in case we're restarting an orchestrator that had been running
-        self.update_jids()
+        # One scheduler query at boot, used to populate both current_jids and
+        # rep_dict. Calling scheduler_report_cmd and scheduler_assoc_rep_cmd
+        # separately let a job appear / disappear between the two, producing a
+        # stale jid that would be bound to a Clone and double-launched on the
+        # first tick.
+        self.current_jids = set()
         rep_dict = {}
-        if self.current_jids:
-            # try to re-associate jobs if possible.
-            report = sp.check_output(self.scheduler_assoc_rep_cmd,
-                                     shell=True,
-                                     executable='/bin/bash',
-                                     text=True).strip().split('\n')
-            print('re-association scheduler report:')
-            print(report)
-            for line in report:
-                ls = line.split()
+        assoc_raw = sp.check_output(self.scheduler_assoc_rep_cmd,
+                                    shell=True,
+                                    executable='/bin/bash',
+                                    text=True).strip()
+        print('boot re-association scheduler report:')
+        print(assoc_raw)
+        for line in assoc_raw.split('\n'):
+            if not line.strip():
+                continue
+            ls = line.split()
+            try:
                 jid = int(ls[0])
+            except (ValueError, IndexError):
+                continue
+            self.current_jids.add(jid)
+            try:
                 six, cix, gix = map(int, ls[1].split(self.sep)[1:])
                 rep_dict[(six, cix, gix)] = jid
+            except (ValueError, IndexError):
+                # Job name doesn't fit our seed-clone-gen suffix scheme;
+                # leave it in current_jids so we don't relaunch over it
+                # but don't try to bind it to a Clone.
+                continue
+        self.jids_file.write_text(' '.join(map(str, sorted(self.current_jids))))
 
         tdir = Path(self.config_template['traj_dir_top_level'])
         self.priority_ordered_clones = []
