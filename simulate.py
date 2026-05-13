@@ -128,7 +128,11 @@ def omm_generation(traj_dir_top_level: str,
     if minimize_first:
         print('Performing energy minimization...')
         simulation.minimizeEnergy()
-    if eq_steps:
+    # Equilibration runs only when starting a generation from scratch. On a
+    # resume (append=True) the eq has already been done; re-running it would
+    # also wind simulation.currentStep backwards, desyncing reporter triggers
+    # from the loaded state.
+    if eq_steps and not append:
         print('Equilibrating...')
         simulation.step(eq_steps)
         simulation.currentStep = simulation.currentStep - eq_steps
@@ -139,13 +143,11 @@ def omm_generation(traj_dir_top_level: str,
     simulation.reporters.append(data_reporter)
     simulation.reporters.append(restart_reporter)
     simulation.step(steps)
-
-    # To cover the case where the restart reporter's interval isn't an
-    # integer multiple of the number of steps taken, make sure the last frame
-    # gets reported.
-    state = simulation.context.getState(getPositions=True, getVelocities=True,
-                                        enforcePeriodicBox=True)
-    restart_reporter.report(simulation, state)
+    # The CheckpointReporter writes at every write_interval, so the most
+    # recent state.xml on disk already aligns with the trajectory's last
+    # frame. Writing one final state at a non-write_interval boundary
+    # desyncs state.xml from the traj frame count, breaking the next
+    # resume's calx_remaining_steps math.
     print('Done!')
     return traj_path.resolve()
 
