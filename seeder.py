@@ -419,14 +419,25 @@ class Clone:
         if should_launch and not self.dry_run:
             print('launching', self.get_tag())
             # SIMULATION RUNS HERE. OUTPUT SCANNED FOR JOB NUMBER.
-            try:
-                with self.scheduler_script_p.open() as f:
-                    scheduler_output = sp.check_output(
-                        self.scheduler, stdin=f, cwd=self.current_gen_dir, text=True)
-            except sp.CalledProcessError as err:
-                print(f'{self.scheduler} call threw error',
-                      err.stdout, err.stderr)
-                raise
+            # sp.run with capture_output=True (not check_output) so stderr is
+            # captured and surfaced — check_output leaves err.stderr=None,
+            # which made the previous failure print uninformative.
+            with self.scheduler_script_p.open() as f:
+                result = sp.run(
+                    self.scheduler, stdin=f, cwd=self.current_gen_dir,
+                    text=True, capture_output=True)
+            if result.returncode != 0:
+                # Submission failed (bad QOS, account, scheduler hiccup,
+                # malformed script). Return False so the Farmer marks this
+                # clone failed via mark_clone_failed and keeps tending the
+                # rest, rather than letting one bad sbatch kill the
+                # orchestrator.
+                print(f'{self.scheduler} call for {self.get_tag()} returned '
+                      f'exit code {result.returncode}')
+                print('  stdout:', result.stdout)
+                print('  stderr:', result.stderr)
+                return False
+            scheduler_output = result.stdout
             # NOTE: this assumes that some text is printed when a job is started,
             # and that within that text the first number matching job_number_re
             # is the Job number.
