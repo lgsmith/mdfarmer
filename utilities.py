@@ -1,4 +1,6 @@
 import inspect
+import os
+import struct
 from pathlib import Path
 import json
 import subprocess as sp
@@ -311,6 +313,109 @@ def select_platform(platform_name=None, platform_properties=None):
         if not filtered_properties:
             filtered_properties = None
     return platform, filtered_properties
+
+
+# Resume-correctness helpers: state.xml ↔ DCD alignment.
+#
+# On every resume we need the DCD's last frame's logical step to equal
+# the state.xml's stepCount exactly, otherwise the next append lands at
+# the wrong place in time and gen-to-gen concatenation drifts. The
+# helpers below validate the state file, read the DCD header's frame
+# accounting, and (if the kill happened between the DCD report and the
+# checkpoint report) truncate the DCD to match.
+
+
+def is_state_xml_usable(p: Path) -> bool:
+    if not p.is_file() or p.stat().st_size == 0:
+        return False
+    try:
+        mm.XmlSerializer.deserialize(p.read_text())
+    except Exception as exc:
+        print(f'is_state_xml_usable: deserialize failed for {p}: {exc}')
+        return False
+    return True
+
+
+def state_xml_step_count(p: Path) -> int:
+    import xml.etree.ElementTree as ET
+    root = ET.parse(p).getroot()
+    sc = root.attrib.get('stepCount')
+    if sc is None:
+        raise ValueError(f'state.xml at {p} has no stepCount attribute '
+                         '(pre-OpenMM-8 writeState?)')
+    return int(sc)
+
+
+def dcd_header_info(p: Path) -> dict:
+    """Parse a DCD header. Returns nset, istart, nsavc, with_unitcell,
+    n_atoms, and header_size (file offset where the first frame begins).
+    """
+    with open(p, 'rb') as f:
+        bs1 = struct.unpack('<i', f.read(4))[0]
+        if bs1 != 84:
+            raise ValueError(f'DCD block-1 size {bs1} != 84 at {p}')
+        magic = f.read(4)
+        if magic != b'CORD':
+            raise ValueError(f'DCD magic {magic!r} != b"CORD" at {p}')
+        ints = struct.unpack('<20i', f.read(80))
+        nset, istart, nsavc = ints[0], ints[1], ints[2]
+        # ints[10] is at byte offset 48 from file start — the
+        # with-unit-cell flag (1 if frames carry the 6-double box record).
+        with_unitcell = ints[10]
+        be1 = struct.unpack('<i', f.read(4))[0]
+        if be1 != 84:
+            raise ValueError(f'DCD block-1 end marker {be1} != 84 at {p}')
+        # title block
+        bs2 = struct.unpack('<i', f.read(4))[0]
+        f.read(bs2)
+        be2 = struct.unpack('<i', f.read(4))[0]
+        if be2 != bs2:
+            raise ValueError(f'DCD title block markers disagree at {p}')
+        # natoms block: always 4-byte payload
+        bs3 = struct.unpack('<i', f.read(4))[0]
+        if bs3 != 4:
+            raise ValueError(f'DCD natoms block size {bs3} != 4 at {p}')
+        n_atoms = struct.unpack('<i', f.read(4))[0]
+        be3 = struct.unpack('<i', f.read(4))[0]
+        if be3 != 4:
+            raise ValueError(f'DCD natoms block end marker {be3} != 4 at {p}')
+        header_size = f.tell()
+    return {'nset': nset, 'istart': istart, 'nsavc': nsavc,
+            'with_unitcell': bool(with_unitcell), 'n_atoms': n_atoms,
+            'header_size': header_size}
+
+
+def dcd_frame_size(with_unitcell: bool, n_atoms: int) -> int:
+    # PBC block: 4 + 6*8 + 4 = 56 bytes
+    # Each coord record: 4 + 4*n_atoms + 4 = 8 + 4n
+    # 3 coord records: 3*(8+4n) = 24 + 12n
+    return (56 if with_unitcell else 0) + 24 + 12 * n_atoms
+
+
+def truncate_dcd_to_nframes(p: Path, target_nframes: int) -> int:
+    """Reduce a DCD's frame count to target_nframes by rewriting the
+    header nset field and truncating trailing bytes. No-op if already
+    at target. Refuses to grow. Idempotent on partial completion.
+    """
+    info = dcd_header_info(p)
+    cur_nset = info['nset']
+    if target_nframes > cur_nset:
+        raise ValueError(f'truncate_dcd_to_nframes refuses to grow '
+                         f'{p}: current nset={cur_nset}, target='
+                         f'{target_nframes}')
+    if target_nframes == cur_nset:
+        return cur_nset
+    frame_size = dcd_frame_size(info['with_unitcell'], info['n_atoms'])
+    new_size = info['header_size'] + target_nframes * frame_size
+    # Rewrite nset first, then truncate. If interrupted between, the
+    # file's nset is below its byte length; the next call computes the
+    # same target and is a no-op (trailing bytes stay as harmless
+    # padding that mdtraj/LOOS ignore since they honor nset).
+    with open(p, 'r+b') as f:
+        f.seek(8)
+        f.write(struct.pack('<i', target_nframes))
+    os.truncate(str(p), new_size)
+    return target_nframes
 
 
 def calx_remaining_steps(traj_fn, top_fn, total_steps, write_interval):
