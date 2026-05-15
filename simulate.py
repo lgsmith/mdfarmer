@@ -4,9 +4,33 @@ import openmm as mm
 from openmm import unit
 from . import utilities as util
 from pathlib import Path
-import mdtraj as md
 
 from os import environ
+
+
+# Subclass that pushes Python's user-space buffer to the kernel after each
+# frame write. A SIGKILL from Slurm preempt otherwise loses bytes still
+# sitting in the BufferedWriter; flushing promotes them to the kernel page
+# cache, which survives the process death (node stays up). flush() is
+# microseconds and never blocks on disk — the kernel writes to disk
+# asynchronously, on its own schedule, independent of the simulation loop.
+#
+# Don't be tempted to substitute buffering=0 on the underlying open():
+# DCDFile.writeModel emits many small struct.pack writes per frame, each
+# of which would become its own syscall under buffering=0, slowing the
+# write loop dramatically. Buffered writes + explicit flush is the
+# correct combination.
+class FlushingDCDReporter(app.DCDReporter):
+    def report(self, simulation, state):
+        super().report(simulation, state)
+        try:
+            self._dcd._file.flush()
+        except AttributeError:
+            raise RuntimeError(
+                'FlushingDCDReporter could not reach self._dcd._file; '
+                'OpenMM internals likely changed. Update the wrapper.'
+            )
+
 
 # This function is written so that you could use jug's 'Task' class to uplift
 # instances of calls. It returns the path to the trajectory written.
@@ -55,7 +79,7 @@ def omm_generation(traj_dir_top_level: str,
 
     # make reporter by extension
     reporters = {
-        '.dcd': app.DCDReporter,
+        '.dcd': FlushingDCDReporter,
         '.xtc': app.XTCReporter,
     }
 
@@ -90,13 +114,9 @@ def omm_generation(traj_dir_top_level: str,
               'Your current choices are:', *reporters.keys())
         raise
     
-    # Read topology
-    if Path(top_fn).suffix != '.prmtop':
-        topology = md.load(top_fn).topology.to_openmm()
-    else: 
-        topology = md.load_prmtop(top_fn).to_openmm()
-    
-    
+    topology = util.read_openmm_top(top_fn)
+
+
     # Set up reporters
     data_reporter_p = traj_path.with_suffix('.out')
     data_reporter = app.StateDataReporter(
@@ -114,11 +134,10 @@ def omm_generation(traj_dir_top_level: str,
     system = mm.XmlSerializer.deserialize(Path(system_fn).read_text())
 
     integrator = mm.XmlSerializer.deserialize(Path(integrator_xml).read_text())
-    if platform_name:
-        platform = mm.Platform.getPlatformByName(platform_name)
-    else:
-        platform = None
-    if platform_properties:
+    platform, platform_properties = util.select_platform(
+        platform_name=platform_name, platform_properties=platform_properties)
+    print(f'Using OpenMM platform: {platform.getName()}')
+    if platform_properties is not None:
         simulation = app.Simulation(topology, system, integrator,
                                     platform=platform,
                                     platformProperties=platform_properties)
@@ -127,6 +146,16 @@ def omm_generation(traj_dir_top_level: str,
                                     platform=platform)
     simulation.loadState(seed_fn)
 
+    # CUDA context warmup. When several GPU jobs initialize concurrently
+    # on a shared node, the first getState(getPositions=True) readback
+    # can race with kernel completion and return uninitialized device
+    # memory — observed as a single garbage frame at frame 0 in
+    # clone-{028,030,031,032}/gen-000 and clone-{046..049}/gen-001 of
+    # the antifreeze dataset (four H200 jobs per node, same SLURM job
+    # ID block). Pulling positions back here forces the device→host
+    # sync before any reporter fires, so DCDReporter's first frame is
+    # from a settled context.
+    _ = simulation.context.getState(getPositions=True)
 
     if new_velocities:
         simulation.context.setVelocitiesToTemperature(temperature * unit.kelvin)
@@ -134,7 +163,11 @@ def omm_generation(traj_dir_top_level: str,
     if minimize_first:
         print('Performing energy minimization...')
         simulation.minimizeEnergy()
-    if eq_steps:
+    # Equilibration runs only when starting a generation from scratch. On a
+    # resume (append=True) the eq has already been done; re-running it would
+    # also wind simulation.currentStep backwards, desyncing reporter triggers
+    # from the loaded state.
+    if eq_steps and not append:
         print('Equilibrating...')
         simulation.step(eq_steps)
         simulation.currentStep = simulation.currentStep - eq_steps
@@ -145,13 +178,11 @@ def omm_generation(traj_dir_top_level: str,
     simulation.reporters.append(data_reporter)
     simulation.reporters.append(restart_reporter)
     simulation.step(steps)
-
-    # To cover the case where the restart reporter's interval isn't an
-    # integer multiple of the number of steps taken, make sure the last frame
-    # gets reported.
-    state = simulation.context.getState(getPositions=True, getVelocities=True,
-                                        enforcePeriodicBox=True)
-    restart_reporter.report(simulation, state)
+    # The CheckpointReporter writes at every write_interval, so the most
+    # recent state.xml on disk already aligns with the trajectory's last
+    # frame. Writing one final state at a non-write_interval boundary
+    # desyncs state.xml from the traj frame count, breaking the next
+    # resume's calx_remaining_steps math.
     print('Done!')
     return traj_path.resolve()
 

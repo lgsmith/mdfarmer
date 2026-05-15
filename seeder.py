@@ -1,4 +1,5 @@
 from __future__ import annotations
+import copy
 import inspect
 from . import utilities as util
 from pathlib import Path
@@ -14,13 +15,118 @@ runner('config.json')
 """
 
 
+# Examine one gen directory and decide whether it can seed the next launch.
+#
+# Returns (gen_index, seed_fn, steps_to_run, append) on success:
+#   - gen_index: which gen the next launch is for (may equal this dir's
+#     gen, or be one higher if this gen is complete and we advance).
+#   - seed_fn: absolute path to the state.xml to load from.
+#   - steps_to_run: how many sim steps the next launch should take.
+#   - append: whether trajectory reporters should open in append mode.
+#
+# Returns None if this gen is unrecoverable. Caller cascades to an older
+# gen, then falls back to the initial seed.
+#
+# Three failures collapse into "unrecoverable" (β policy — prune & redo):
+#   1. state.xml unparseable or missing — torn-mid-write or never landed.
+#   2. state.xml's stepCount is ahead of the DCD's last frame's logical
+#      step — frames the simulation produced were lost in Python's user
+#      buffer at kill time, so the time series has an unfillable hole.
+#   3. state.xml stepCount doesn't sit on a DCD frame boundary — header
+#      doesn't match the checkpoint, both probably bad.
+#
+# For state-behind-DCD (kill between DCDReporter and CheckpointReporter,
+# expected single-frame drift), we truncate the DCD to align and resume.
+def _try_recover_gen(gen_path: Path, *,
+                     append_mode: bool,
+                     restart_name: str,
+                     traj_name: str,
+                     traj_suffix: str,
+                     write_interval: int,
+                     total_steps: int,
+                     top_fn: str):
+    config_p = gen_path / 'config.json'
+    if not config_p.is_file():
+        return None
+    try:
+        prev_config = json.loads(config_p.read_text())
+    except json.JSONDecodeError:
+        print(f'_try_recover_gen: malformed config at {config_p}; skipping gen.')
+        return None
+    gen_index = prev_config['gen_index']
+
+    restart_p = gen_path / restart_name
+    if not util.is_state_xml_usable(restart_p):
+        return None
+    seed_fn = str(restart_p.resolve())
+    try:
+        state_step = util.state_xml_step_count(restart_p)
+    except ValueError as exc:
+        print(f'_try_recover_gen: {exc}; skipping gen.')
+        return None
+
+    traj_p = (gen_path / traj_name).with_suffix(traj_suffix)
+    if (not traj_p.is_file()) or traj_p.stat().st_size == 0:
+        # No traj yet for this gen. Start it now from this state.
+        return gen_index, seed_fn, total_steps, False
+
+    try:
+        info = util.dcd_header_info(traj_p)
+    except Exception as exc:
+        print(f'_try_recover_gen: bad DCD header at {traj_p}: {exc}; '
+              f'skipping gen.')
+        return None
+    nset, istart, nsavc = info['nset'], info['istart'], info['nsavc']
+    if nset == 0:
+        return gen_index, seed_fn, total_steps, False
+
+    # state_step must sit on a DCD frame boundary; otherwise the
+    # checkpoint and trajectory aren't from the same point in the
+    # simulation and we have no clean way to resume.
+    if (state_step - istart) % nsavc != 0:
+        print(f'_try_recover_gen: state stepCount={state_step} not aligned '
+              f'to DCD istart={istart} nsavc={nsavc} at {gen_path}; '
+              f'cascading.')
+        return None
+    target_nset = (state_step - istart) // nsavc + 1
+    if target_nset > nset:
+        # Buffered frames lost on kill (clone-028-style 49-frame ghost).
+        print(f'_try_recover_gen: state ahead of DCD by '
+              f'{target_nset - nset} frames at {gen_path}; cascading.')
+        return None
+    if target_nset < nset:
+        # Kill between DCDReporter and CheckpointReporter writes.
+        print(f'_try_recover_gen: trimming {traj_p} from {nset} to '
+              f'{target_nset} frames to match state.xml stepCount.')
+        actual = util.truncate_dcd_to_nframes(traj_p, target_nset)
+        if actual != target_nset:
+            print(f'_try_recover_gen: truncate returned {actual} != '
+                  f'target {target_nset}; cascading.')
+            return None
+        nset = actual
+
+    remaining = total_steps - nset * nsavc
+    if remaining > 0:
+        if append_mode:
+            return gen_index, seed_fn, remaining, True
+        # Non-append: preserve the partial traj and try an older gen.
+        old_traj_p = traj_p.parent / ('old_' + traj_p.name)
+        print(f'_try_recover_gen: non-append mode, renaming partial '
+              f'{traj_p} -> {old_traj_p}')
+        traj_p.rename(old_traj_p)
+        return None
+    # Gen complete; advance.
+    return gen_index + 1, seed_fn, total_steps, False
+
+
 class Clone:
     __slots__ = (
         'config', 'dry_run', 'job_number', 'job_number_re', 'job_name_fstring', 'current_seed',
         'current_gen_dir', 'current_gen', 'config_p', 'scheduler_script_p', 'compare_keys',
         'scheduler_fstring', 'scheduler', 'traj_list', 'sep', 'dirname_pad',
         'scheduler_kws', 'restarts_per_gen', 'restart_attempts', 'run_script',
-        'harvester', 'remaining_steps', 'run_script_name', 'total_steps')
+        'harvester', 'remaining_steps', 'run_script_name', 'total_steps',
+        'preemption_checker')
 
     # This should mostly be used by the init function, and by adaptive sampling scripts.
 
@@ -60,12 +166,25 @@ class Clone:
                  # Compare keys are used by eq and hash to determine whether two clones are equal.
                  compare_keys=('seed_index', 'clone_index'),
                  harvester=None,
+                 # Callable jid -> bool, returns True if the named job was
+                 # preempted by the scheduler. If provided, preemption restarts
+                 # don't count against restarts_per_gen.
+                 preemption_checker=None,
+                 # The full per-gen step count from the template. On a resume
+                 # config['steps'] is the steps-remaining-this-gen, not the
+                 # template total, so we have to track the total separately
+                 # or start_next will reset gens to the shortened count. If
+                 # None, fall back to config['steps'] for backwards compat.
+                 steps_per_gen=None,
                  dry_run=False
                  ):
         # REQUIRED ARGS below here
         self.config = config  # dict keys and values must be json serializable.
-        self.total_steps = config['steps']
-        self.remaining_steps = self.total_steps
+        if steps_per_gen is None:
+            self.total_steps = config['steps']
+        else:
+            self.total_steps = steps_per_gen
+        self.remaining_steps = config['steps']
         seed_p = Path(seed_fn)
         self.set_seed(seed_p)
         self.scheduler = scheduler
@@ -105,8 +224,121 @@ class Clone:
         self.job_number_re = re.compile(job_number_re)
         self.compare_keys = compare_keys
         self.harvester = harvester
+        self.preemption_checker = preemption_checker
         self.run_script = run_script
         self.scheduler_script_p = None  # always redefined each run
+
+    # Construct a Clone by walking the on-disk state for (seed_index,
+    # clone_index) under tdir. Decides which gen to run next, what to seed
+    # it from, and whether to append or start fresh. Falls through extant
+    # gens newest -> oldest, then falls back to initial_seed_fn if nothing
+    # is recoverable.
+    @classmethod
+    def from_disk(cls,
+                  tdir: Path,
+                  seed_index: int,
+                  clone_index: int,
+                  *,
+                  # The user-provided initial structure for this seed. Used
+                  # when no on-disk gen is recoverable.
+                  initial_seed_fn: str,
+                  # Resolved, validated top and system paths for this seed.
+                  top_fn: str,
+                  system_fn: str,
+                  # The Farmer's full config_template. Read-only here; we
+                  # deepcopy before mutating.
+                  config_template: dict,
+                  # Scheduler context (passed straight through to __init__).
+                  scheduler: str,
+                  scheduler_fstring: str,
+                  scheduler_kws: dict,
+                  # Discovery / Clone wiring.
+                  dirname_pad: int,
+                  sep: str,
+                  job_number_re: str,
+                  job_name_fstring: str,
+                  harvester=None,
+                  preemption_checker=None,
+                  # (seed, clone, gen) -> jid for jobs currently in the
+                  # scheduler queue, so we can re-associate after an
+                  # orchestrator restart.
+                  rep_dict: dict = None,
+                  dry_run: bool = False):
+        if rep_dict is None:
+            rep_dict = {}
+        append_mode = config_template['append']
+        steps_per_gen = config_template['steps']
+
+        clone_dir = util.dir_seeds_clones(
+            tdir, seed_index, clone_index, dirname_pad, sep=sep, mkdir=False)
+        if clone_dir.is_dir():
+            gen_paths = sorted(clone_dir.iterdir())
+        else:
+            gen_paths = []
+
+        recovered = None
+        for gen_path in reversed(gen_paths):
+            recovered = _try_recover_gen(
+                gen_path,
+                append_mode=append_mode,
+                restart_name=config_template['restart_name'],
+                traj_name=config_template['traj_name'],
+                traj_suffix=config_template['traj_suffix'],
+                write_interval=config_template['write_interval'],
+                total_steps=steps_per_gen,
+                top_fn=top_fn,
+            )
+            if recovered is not None:
+                break
+
+        if recovered is not None:
+            gen_index, seed_fn, steps_this_launch, append_now = recovered
+            is_internal_restart = True
+        else:
+            gen_index = 0
+            seed_fn = initial_seed_fn
+            steps_this_launch = steps_per_gen
+            append_now = False
+            is_internal_restart = False
+
+        config = copy.deepcopy(config_template)
+        config['seed_index'] = seed_index
+        config['clone_index'] = clone_index
+        config['gen_index'] = gen_index
+        config['steps'] = steps_this_launch
+        config['append'] = append_now
+        if is_internal_restart:
+            config['new_velocities'] = False
+        else:
+            config['new_velocities'] = True
+        config['system_fn'] = system_fn
+        config['top_fn'] = top_fn
+        # Keep the StateDataReporter progress display consistent with the
+        # actual run length so % complete isn't misleading on a resume.
+        if isinstance(config.get('state_data_kwargs'), dict):
+            config['state_data_kwargs'] = {
+                **config['state_data_kwargs'],
+                'totalSteps': steps_this_launch,
+            }
+
+        jid = rep_dict.get((seed_index, clone_index, gen_index))
+
+        return cls(
+            config,
+            scheduler,
+            scheduler_fstring,
+            scheduler_kws,
+            seed_fn,
+            steps_per_gen=steps_per_gen,
+            job_number=jid,
+            job_number_re=job_number_re,
+            job_name_fstring=job_name_fstring,
+            dirname_pad=dirname_pad,
+            sep=sep,
+            harvester=harvester,
+            preemption_checker=preemption_checker,
+            dry_run=dry_run,
+        )
 
     # Compare a value across self config and other config in other Clone.
     def conf_value_eq(self, other: Clone, conf_key: str) -> bool:
@@ -149,12 +381,24 @@ class Clone:
             shutil.copy(seed_p, cg_seed_p)
             self.set_seed(cg_seed_p)
 
+    # Returns True if the scheduler reports this clone's last job was
+    # preempted (so the upcoming restart shouldn't count against the
+    # per-gen restart_attempts budget).
+    def was_preempted(self):
+        if self.preemption_checker is None:
+            return False
+        if self.job_number is None:
+            return False
+        return self.preemption_checker(self.job_number)
+
     # note this gets the gen index from config then builds the dir for that gen
     # So, if you want to start a new generation, you have to increment/change
     # self.config['gen_index'] before calling this.
     # Tries to set up directory, and checks if we've gone over the number of restart limits
     # Returns a bool based on success (True) or failure (False) of these efforts.
-    def plow_harrow_plant(self, overwrite=False):
+    # If count_as_restart is False (e.g. last job was preempted), skip the
+    # restart_attempts increment so the budget isn't burned by preemption.
+    def plow_harrow_plant(self, overwrite=False, count_as_restart=True):
         # If we're running subsequent generations, we want to restart from prev.
         # positions and velocities.
         if self.config['gen_index'] != 0:
@@ -190,6 +434,8 @@ class Clone:
         run_script_p = self.current_gen_dir / self.run_script_name
         if overwrite or not run_script_p.is_file():
             run_script_p.write_text(self.run_script)
+        if not count_as_restart:
+            return True
         if self.restart_attempts < self.restarts_per_gen:
             self.restart_attempts += 1
             return True
@@ -198,21 +444,33 @@ class Clone:
                   self.restart_attempts, 'times. Aborting this clone.')
             return False
 
-    def start_current(self, overwrite=False):
-        should_launch = self.plow_harrow_plant(overwrite=overwrite)
+    def start_current(self, overwrite=False, count_as_restart=True):
+        should_launch = self.plow_harrow_plant(
+            overwrite=overwrite, count_as_restart=count_as_restart)
         print(self.get_tag(), 'should_launch',
               should_launch, 'dry_run', self.dry_run)
         if should_launch and not self.dry_run:
             print('launching', self.get_tag())
             # SIMULATION RUNS HERE. OUTPUT SCANNED FOR JOB NUMBER.
-            try:
-                with self.scheduler_script_p.open() as f:
-                    scheduler_output = sp.check_output(
-                        self.scheduler, stdin=f, cwd=self.current_gen_dir, text=True)
-            except sp.CalledProcessError as err:
-                print(f'{self.scheduler} call threw error',
-                      err.stdout, err.stderr)
-                raise
+            # sp.run with capture_output=True (not check_output) so stderr is
+            # captured and surfaced — check_output leaves err.stderr=None,
+            # which made the previous failure print uninformative.
+            with self.scheduler_script_p.open() as f:
+                result = sp.run(
+                    self.scheduler, stdin=f, cwd=self.current_gen_dir,
+                    text=True, capture_output=True)
+            if result.returncode != 0:
+                # Submission failed (bad QOS, account, scheduler hiccup,
+                # malformed script). Return False so the Farmer marks this
+                # clone failed via mark_clone_failed and keeps tending the
+                # rest, rather than letting one bad sbatch kill the
+                # orchestrator.
+                print(f'{self.scheduler} call for {self.get_tag()} returned '
+                      f'exit code {result.returncode}')
+                print('  stdout:', result.stdout)
+                print('  stderr:', result.stderr)
+                return False
+            scheduler_output = result.stdout
             # NOTE: this assumes that some text is printed when a job is started,
             # and that within that text the first number matching job_number_re
             # is the Job number.
@@ -245,6 +503,13 @@ class Clone:
                   self.job_name_fstring.format(**self.config))
             no_failure = True
         else:
+            # If the scheduler reports this job as preempted, the upcoming
+            # restart shouldn't burn a restart_attempt. Genuine failures
+            # (segfault, OOM, GPU error) still count.
+            if self.was_preempted():
+                count_as_restart = False
+            else:
+                count_as_restart = True
             traj_p = (self.current_gen_dir / self.config['traj_name']
                       ).with_suffix(self.config['traj_suffix'])
             if traj_p.is_file():
@@ -261,7 +526,8 @@ class Clone:
                         f'Removing and attempting restart number {self.restart_attempts}.',
                     )
                     traj_p.unlink()
-                    no_failure = self.start_current(overwrite=overwrite)
+                    no_failure = self.start_current(
+                        overwrite=overwrite, count_as_restart=count_as_restart)
                 # if this, the trajectory has steps remaining before it is a full gen.
                 # Run those.
                 elif self.remaining_steps > 0:
@@ -269,7 +535,8 @@ class Clone:
                     # set the reporters to append
                     self.config['append'] = True
                     self.check_copy_set_restart_seed()
-                    no_failure = self.start_current(overwrite=overwrite)
+                    no_failure = self.start_current(
+                        overwrite=overwrite, count_as_restart=count_as_restart)
                 else:  # trajectory was created, and finished running.
                     self.restart_attempts = 0
                     self.config['steps'] = self.total_steps
@@ -283,7 +550,8 @@ class Clone:
             else:  # no trajectory file, start from here just as if we'd found an empty file.
                 print(f'{traj_p} not found, attempting start number '
                       f'{self.restart_attempts} for this gen.')
-                no_failure = self.start_current(overwrite=overwrite)
+                no_failure = self.start_current(
+                    overwrite=overwrite, count_as_restart=count_as_restart)
         # else:  # this triggers if no JN bound to clone ==> we should start one
             # no_failure = self.start_current(overwrite=overwrite)
         return no_failure

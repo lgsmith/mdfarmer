@@ -84,6 +84,8 @@ Right now, the actual tender process (i.e. the one that the instance of Farmer i
 
 You launch the tender process by just calling the correct python on the script above. For debugging I recommend doing this in an interactive session, but normally these datasets take weeks or even months to collect so I often run them using the shell utility `nohup`, in a script such as the following. This allows me to call `tail` on `straight-sampling-farmer.out` to read what's going on.
 
+Launch the tender from the directory that holds your seed structures, system, integrator, and topology files. `Farmer.__init__` resolves any relative paths in the config to absolute paths once at boot, against the cwd it was started in. Absolute paths in your script work from anywhere; relative paths only work if you launch from the right directory.
+
 ```bash
 #!/bin/bash
 
@@ -145,6 +147,10 @@ Another nice troubleshooting step can be simply trying to resubmit the job gener
 There are two modes of analysis with this type of dataset. If you have fewer clones, but long length per clone, you could do a classical 'replicate' analysis of an observable across contiguous trajectories. If you have multiple seeds, or many clones with short generations, or some combination thereof, you're better off making some kind of transition-counting model from the data, such as a Markov State Model.
 
 We're hoping to add some scripts for both modes of analysis--mostly these will be simple functions that just use the configurations you've given for the farmer and or the structure of the data-set tree to provide you with lists of trajectories that might be useful, such as a nested list of file-paths that follows the overall structure of the tree. If you're writing functions like this yourself, note that python's `glob` and `iterdir` functionalities provide sub-paths in no particular order. The reason the directory names are padded is so that the built-in `sorted` will 'just work' with a semantic sort on the file names, but you do have to bother to use sorted if you're writing your own iterator and you want the order to be 1. the same and 2. for the generations to be sequential each time you read the files. Note that the top level file titled `traj_list.txt` records the trajectory paths in the order they are produced, which could be good for some things like a function that surveys how much data has been collected thus far, but is probably not what you want for most analysis.
+
+## AI assistance
+
+Parts of this codebase have been developed with assistance from Anthropic's Claude (Opus 4.x family). Individual commits are not tagged with `Co-Authored-By` trailers; this section is the project-level attribution.
 
 ## Extensions
 
