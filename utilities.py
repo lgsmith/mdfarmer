@@ -1,6 +1,9 @@
 import inspect
+import os
+import struct
 from pathlib import Path
 import json
+import subprocess as sp
 import openmm as mm
 from openmm import app
 
@@ -9,7 +12,9 @@ openmm_topology_readers = {
     '.top': app.GromacsTopFile,
     '.prmtop': app.AmberPrmtopFile,
     '.psf': app.CharmmPsfFile,
-    '.pdb': app.PDBFile
+    '.pdb': app.PDBFile,
+    '.cif': app.PDBxFile,
+    '.pdbx': app.PDBxFile,
 }
 
 
@@ -46,15 +51,22 @@ try:
 
 except ImportError:
     print('LOOS not in import path; falling back to MDTraj.')
-    print('Expect restarting a mature dataset to be slow.')
     import mdtraj
 
+    # mdtraj.open(...) returns a format-specific file handle (DCD/XTC) whose
+    # __len__ reports frame count without loading coordinates. Avoids the
+    # mdtraj.load(...) round-trip that materialized the whole traj just to
+    # measure it -- which was prohibitive for mature datasets.
     def get_traj_len(traj_fn, top_fn):
         if Path(traj_fn).stat().st_size == 0:
-            length = 0
-        else:
-            length = len(mdtraj.load(traj_fn, top=top_fn))
-        return length
+            return 0
+        try:
+            with mdtraj.open(traj_fn) as fh:
+                return len(fh)
+        except (OSError, ValueError) as exc:
+            print(f'mdtraj.open could not read {traj_fn}: {exc}; '
+                  'treating as empty.')
+            return 0
 
 
 """
@@ -204,8 +216,10 @@ basic_gpu_lines = {
 #   self.scheduler_report_fstring.format(title=self.config_template['title'])
 basic_scheduler_reports = {
     "lsf": "bjobs -o JOBID -noheader -J '{title}-*'",
-    # note when using pipes to awk, curly braces must be escaped with curly braces.
-    "slurm": "squeue --me --noheader -O JobID,name | awk '/{title}/ {{print $1}}'"
+    # -h -o '%i %j' prints JobID and untruncated JobName, two whitespace-separated columns.
+    # The default -O Name truncates to 8 chars, which silently breaks title matching.
+    # Curly braces must be escaped with curly braces when using awk via str.format.
+    "slurm": "squeue --me -h -o '%i %j' | awk '/{title}/ {{print $1}}'"
 }
 
 # Basic report to print the name, and then the jobid, for each job with job title
@@ -216,13 +230,208 @@ basic_scheduler_reports = {
 #   self.scheduler_assoc_fstring.format(title=self.config_template['title'])
 basic_scheduler_assoc_reports = {
     "lsf": "bjobs -o 'JOBID JOB_NAME' -noheader -J '{title}-*'",
-    "slurm": "squeue --me --noheader -O JobID,name | grep '{title}'"
+    # awk (not grep) so a clean queue exits 0 instead of grep's exit-1-on-no-match,
+    # which would crash the boot-time sp.check_output in Farmer.__init__.
+    "slurm": "squeue --me -h -o '%i %j' | awk '/{title}/'"
 }
+
+
+# Per-scheduler post-mortem checks for whether a finished job was preempted.
+# Used by Clone.check_start_gen to avoid charging preemptions against the
+# per-gen restart_attempts budget. Returns False on any error (missing
+# binary, timeout, accounting gap, unknown state) so a true failure still
+# counts as a restart.
+def slurm_was_preempted(jid):
+    try:
+        out = sp.check_output(
+            ['sacct', '-j', str(jid), '-n', '-o', 'State', '-X'],
+            text=True, timeout=30
+        ).strip()
+    except (sp.CalledProcessError, sp.TimeoutExpired, FileNotFoundError):
+        return False
+    for line in out.splitlines():
+        if 'PREEMPTED' in line:
+            return True
+    return False
+
+
+def lsf_was_preempted(jid):
+    try:
+        out = sp.check_output(
+            ['bjobs', '-d', '-o', 'exit_reason', '-noheader', str(jid)],
+            text=True, timeout=30
+        ).strip()
+    except (sp.CalledProcessError, sp.TimeoutExpired, FileNotFoundError):
+        return False
+    return 'TERM_PREEMPT' in out
+
+
+preemption_checkers = {
+    'sbatch': slurm_was_preempted,
+    'bsub': lsf_was_preempted,
+}
+
+
+# Resolve which OpenMM Platform to use and which platformProperties to apply.
+# If platform_name is set, demand that exact platform (raise if it can't load).
+# Otherwise pick the fastest available non-Reference platform; raise if only
+# Reference is available, since AMOEBA / large-system MD on Reference is
+# effectively a hang from the scheduler's perspective. Filter platform_properties
+# to those the chosen platform actually exposes so e.g. {'Precision': 'mixed'}
+# applies cleanly on CUDA/HIP/OpenCL but is silently dropped on CPU.
+def select_platform(platform_name=None, platform_properties=None):
+    if platform_name is not None:
+        platform = mm.Platform.getPlatformByName(platform_name)
+    else:
+        candidates = []
+        for i in range(mm.Platform.getNumPlatforms()):
+            p = mm.Platform.getPlatform(i)
+            if p.getName() != 'Reference':
+                candidates.append(p)
+        if not candidates:
+            raise RuntimeError(
+                'No non-Reference OpenMM platform available; refusing to launch '
+                'a simulation that would silently hang on Reference.'
+            )
+        platform = max(candidates, key=lambda p: p.getSpeed())
+    if platform_properties is None:
+        filtered_properties = None
+    else:
+        supported = set(platform.getPropertyNames())
+        filtered_properties = {}
+        ignored = []
+        for k, v in platform_properties.items():
+            if k in supported:
+                filtered_properties[k] = v
+            else:
+                ignored.append(k)
+        if ignored:
+            print(
+                f'Platform {platform.getName()} does not support these '
+                f'properties; ignoring them: {ignored}'
+            )
+        if not filtered_properties:
+            filtered_properties = None
+    return platform, filtered_properties
+
+
+# Resume-correctness helpers: state.xml ↔ DCD alignment.
+#
+# On every resume we need the DCD's last frame's logical step to equal
+# the state.xml's stepCount exactly, otherwise the next append lands at
+# the wrong place in time and gen-to-gen concatenation drifts. The
+# helpers below validate the state file, read the DCD header's frame
+# accounting, and (if the kill happened between the DCD report and the
+# checkpoint report) truncate the DCD to match.
+
+
+def is_state_xml_usable(p: Path) -> bool:
+    if not p.is_file() or p.stat().st_size == 0:
+        return False
+    try:
+        mm.XmlSerializer.deserialize(p.read_text())
+    except Exception as exc:
+        print(f'is_state_xml_usable: deserialize failed for {p}: {exc}')
+        return False
+    return True
+
+
+def state_xml_step_count(p: Path) -> int:
+    import xml.etree.ElementTree as ET
+    root = ET.parse(p).getroot()
+    sc = root.attrib.get('stepCount')
+    if sc is None:
+        raise ValueError(f'state.xml at {p} has no stepCount attribute '
+                         '(pre-OpenMM-8 writeState?)')
+    return int(sc)
+
+
+def dcd_header_info(p: Path) -> dict:
+    """Parse a DCD header. Returns nset, istart, nsavc, with_unitcell,
+    n_atoms, and header_size (file offset where the first frame begins).
+    """
+    with open(p, 'rb') as f:
+        bs1 = struct.unpack('<i', f.read(4))[0]
+        if bs1 != 84:
+            raise ValueError(f'DCD block-1 size {bs1} != 84 at {p}')
+        magic = f.read(4)
+        if magic != b'CORD':
+            raise ValueError(f'DCD magic {magic!r} != b"CORD" at {p}')
+        ints = struct.unpack('<20i', f.read(80))
+        nset, istart, nsavc = ints[0], ints[1], ints[2]
+        # ints[10] is at byte offset 48 from file start — the
+        # with-unit-cell flag (1 if frames carry the 6-double box record).
+        with_unitcell = ints[10]
+        be1 = struct.unpack('<i', f.read(4))[0]
+        if be1 != 84:
+            raise ValueError(f'DCD block-1 end marker {be1} != 84 at {p}')
+        # title block
+        bs2 = struct.unpack('<i', f.read(4))[0]
+        f.read(bs2)
+        be2 = struct.unpack('<i', f.read(4))[0]
+        if be2 != bs2:
+            raise ValueError(f'DCD title block markers disagree at {p}')
+        # natoms block: always 4-byte payload
+        bs3 = struct.unpack('<i', f.read(4))[0]
+        if bs3 != 4:
+            raise ValueError(f'DCD natoms block size {bs3} != 4 at {p}')
+        n_atoms = struct.unpack('<i', f.read(4))[0]
+        be3 = struct.unpack('<i', f.read(4))[0]
+        if be3 != 4:
+            raise ValueError(f'DCD natoms block end marker {be3} != 4 at {p}')
+        header_size = f.tell()
+    return {'nset': nset, 'istart': istart, 'nsavc': nsavc,
+            'with_unitcell': bool(with_unitcell), 'n_atoms': n_atoms,
+            'header_size': header_size}
+
+
+def dcd_frame_size(with_unitcell: bool, n_atoms: int) -> int:
+    # PBC block: 4 + 6*8 + 4 = 56 bytes
+    # Each coord record: 4 + 4*n_atoms + 4 = 8 + 4n
+    # 3 coord records: 3*(8+4n) = 24 + 12n
+    return (56 if with_unitcell else 0) + 24 + 12 * n_atoms
+
+
+def truncate_dcd_to_nframes(p: Path, target_nframes: int) -> int:
+    """Reduce a DCD's frame count to target_nframes by rewriting the
+    header nset field and truncating trailing bytes. No-op if already
+    at target. Refuses to grow. Idempotent on partial completion.
+    """
+    info = dcd_header_info(p)
+    cur_nset = info['nset']
+    if target_nframes > cur_nset:
+        raise ValueError(f'truncate_dcd_to_nframes refuses to grow '
+                         f'{p}: current nset={cur_nset}, target='
+                         f'{target_nframes}')
+    if target_nframes == cur_nset:
+        return cur_nset
+    frame_size = dcd_frame_size(info['with_unitcell'], info['n_atoms'])
+    new_size = info['header_size'] + target_nframes * frame_size
+    # Rewrite nset first, then truncate. If interrupted between, the
+    # file's nset is below its byte length; the next call computes the
+    # same target and is a no-op (trailing bytes stay as harmless
+    # padding that mdtraj/LOOS ignore since they honor nset).
+    with open(p, 'r+b') as f:
+        f.seek(8)
+        f.write(struct.pack('<i', target_nframes))
+    os.truncate(str(p), new_size)
+    return target_nframes
 
 
 def calx_remaining_steps(traj_fn, top_fn, total_steps, write_interval):
     traj_len = get_traj_len(traj_fn, top_fn)
-    return total_steps - traj_len * write_interval
+    remaining = total_steps - traj_len * write_interval
+    # A negative result means the traj has more frames than the gen
+    # should contain — usually duplicated frames from an append against
+    # a stale state.xml, or a write_interval / total_steps mismatch
+    # between the on-disk config and the current run. Surface it so it
+    # doesn't masquerade as "gen complete."
+    if remaining < 0:
+        print(f'WARNING: calx_remaining_steps({traj_fn}) = {remaining}; '
+              f'traj has {traj_len} frames at write_interval={write_interval} '
+              f'but total_steps={total_steps}. Treating as complete; check '
+              f'for over-appended trajectory.')
+    return remaining
 
 
 # This won't be nicely jsonizable unless all default and provided vals are.
@@ -285,7 +494,11 @@ default_straight_sampling_config_template = dict(
     traj_name='traj',
     traj_suffix='.xtc',
     restart_name='state.xml',
-    platform_name='CUDA',  # CHECK TO BE SURE!
+    # None -> auto-select fastest available non-Reference platform.
+    # Set explicitly (e.g. 'CUDA', 'HIP', 'OpenCL') if you want to force one.
+    platform_name=None,
+    # Precision is filtered against the chosen platform's supported properties,
+    # so this works on CUDA/HIP/OpenCL and is silently dropped on CPU.
     platform_properties={'Precision': 'mixed'},
     steps=default_steps,
     state_data_kwargs=default_state_data_kwargs,
