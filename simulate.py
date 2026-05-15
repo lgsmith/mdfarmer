@@ -7,6 +7,31 @@ from pathlib import Path
 
 from os import environ
 
+
+# Subclass that pushes Python's user-space buffer to the kernel after each
+# frame write. A SIGKILL from Slurm preempt otherwise loses bytes still
+# sitting in the BufferedWriter; flushing promotes them to the kernel page
+# cache, which survives the process death (node stays up). flush() is
+# microseconds and never blocks on disk — the kernel writes to disk
+# asynchronously, on its own schedule, independent of the simulation loop.
+#
+# Don't be tempted to substitute buffering=0 on the underlying open():
+# DCDFile.writeModel emits many small struct.pack writes per frame, each
+# of which would become its own syscall under buffering=0, slowing the
+# write loop dramatically. Buffered writes + explicit flush is the
+# correct combination.
+class FlushingDCDReporter(app.DCDReporter):
+    def report(self, simulation, state):
+        super().report(simulation, state)
+        try:
+            self._dcd._file.flush()
+        except AttributeError:
+            raise RuntimeError(
+                'FlushingDCDReporter could not reach self._dcd._file; '
+                'OpenMM internals likely changed. Update the wrapper.'
+            )
+
+
 # This function is written so that you could use jug's 'Task' class to uplift
 # instances of calls. It returns the path to the trajectory written.
 
@@ -54,7 +79,7 @@ def omm_generation(traj_dir_top_level: str,
 
     # make reporter by extension
     reporters = {
-        '.dcd': app.DCDReporter,
+        '.dcd': FlushingDCDReporter,
         '.xtc': app.XTCReporter,
     }
 
@@ -121,6 +146,16 @@ def omm_generation(traj_dir_top_level: str,
                                     platform=platform)
     simulation.loadState(seed_fn)
 
+    # CUDA context warmup. When several GPU jobs initialize concurrently
+    # on a shared node, the first getState(getPositions=True) readback
+    # can race with kernel completion and return uninitialized device
+    # memory — observed as a single garbage frame at frame 0 in
+    # clone-{028,030,031,032}/gen-000 and clone-{046..049}/gen-001 of
+    # the antifreeze dataset (four H200 jobs per node, same SLURM job
+    # ID block). Pulling positions back here forces the device→host
+    # sync before any reporter fires, so DCDReporter's first frame is
+    # from a settled context.
+    _ = simulation.context.getState(getPositions=True)
 
     if new_velocities:
         simulation.context.setVelocitiesToTemperature(temperature * unit.kelvin)

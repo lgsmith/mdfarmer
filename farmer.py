@@ -143,6 +143,19 @@ class Farmer:
             self.check_path(Path(self.config_template['integrator_xml'])).resolve()
         )
 
+        # buffering=0 on the DCD reporter's underlying file would make every
+        # struct.pack inside DCDFile.writeModel its own syscall — much slower
+        # than buffered writes plus an explicit flush per frame (which is what
+        # FlushingDCDReporter does, microseconds per fire). If a user has put
+        # buffering=0 in the config template they probably meant "flush per
+        # frame" but reached for the wrong knob.
+        if self.config_template.get('buffering') == 0:
+            print('WARNING: config_template["buffering"] == 0 will make each '
+                  'DCDFile.writeModel struct.pack a separate syscall and slow '
+                  'trajectory writes dramatically. FlushingDCDReporter already '
+                  'flushes the kernel buffer after every frame; remove the '
+                  'buffering=0 entry.')
+
         seed_structure_fps = [Path(s).resolve()
                               for s in seed_structure_fns]
         self.seed_state_fns = []

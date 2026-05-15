@@ -15,17 +15,6 @@ runner('config.json')
 """
 
 
-# A "usable" seed is a state file that exists and is non-empty. Zero-byte
-# state.xml files are a common preempt failure mode (job died before the
-# CheckpointReporter completed a write) and must not be picked as seeds.
-def _is_usable_seed(p: Path) -> bool:
-    if not p.is_file():
-        return False
-    if p.stat().st_size == 0:
-        return False
-    return True
-
-
 # Examine one gen directory and decide whether it can seed the next launch.
 #
 # Returns (gen_index, seed_fn, steps_to_run, append) on success:
@@ -35,13 +24,19 @@ def _is_usable_seed(p: Path) -> bool:
 #   - steps_to_run: how many sim steps the next launch should take.
 #   - append: whether trajectory reporters should open in append mode.
 #
-# Returns None if this gen is unrecoverable (missing/corrupt config, no
-# usable state.xml, partial traj in non-append mode). Caller should try
-# an older gen, then fall back to the initial seed.
+# Returns None if this gen is unrecoverable. Caller cascades to an older
+# gen, then falls back to the initial seed.
 #
-# Side effect (non-append mode only): a partial traj in this gen gets
-# renamed to old_<name> so the next launch starts cleanly. This matches
-# the documented "cut the ends off the tree" reset behavior.
+# Three failures collapse into "unrecoverable" (β policy — prune & redo):
+#   1. state.xml unparseable or missing — torn-mid-write or never landed.
+#   2. state.xml's stepCount is ahead of the DCD's last frame's logical
+#      step — frames the simulation produced were lost in Python's user
+#      buffer at kill time, so the time series has an unfillable hole.
+#   3. state.xml stepCount doesn't sit on a DCD frame boundary — header
+#      doesn't match the checkpoint, both probably bad.
+#
+# For state-behind-DCD (kill between DCDReporter and CheckpointReporter,
+# expected single-frame drift), we truncate the DCD to align and resume.
 def _try_recover_gen(gen_path: Path, *,
                      append_mode: bool,
                      restart_name: str,
@@ -61,28 +56,66 @@ def _try_recover_gen(gen_path: Path, *,
     gen_index = prev_config['gen_index']
 
     restart_p = gen_path / restart_name
-    if not _is_usable_seed(restart_p):
+    if not util.is_state_xml_usable(restart_p):
         return None
     seed_fn = str(restart_p.resolve())
+    try:
+        state_step = util.state_xml_step_count(restart_p)
+    except ValueError as exc:
+        print(f'_try_recover_gen: {exc}; skipping gen.')
+        return None
 
     traj_p = (gen_path / traj_name).with_suffix(traj_suffix)
     if (not traj_p.is_file()) or traj_p.stat().st_size == 0:
-        # No (or zero-size) traj yet; start this gen fresh from the in-dir state.
+        # No traj yet for this gen. Start it now from this state.
         return gen_index, seed_fn, total_steps, False
 
-    remaining = util.calx_remaining_steps(
-        str(traj_p), top_fn, total_steps, write_interval)
+    try:
+        info = util.dcd_header_info(traj_p)
+    except Exception as exc:
+        print(f'_try_recover_gen: bad DCD header at {traj_p}: {exc}; '
+              f'skipping gen.')
+        return None
+    nset, istart, nsavc = info['nset'], info['istart'], info['nsavc']
+    if nset == 0:
+        return gen_index, seed_fn, total_steps, False
+
+    # state_step must sit on a DCD frame boundary; otherwise the
+    # checkpoint and trajectory aren't from the same point in the
+    # simulation and we have no clean way to resume.
+    if (state_step - istart) % nsavc != 0:
+        print(f'_try_recover_gen: state stepCount={state_step} not aligned '
+              f'to DCD istart={istart} nsavc={nsavc} at {gen_path}; '
+              f'cascading.')
+        return None
+    target_nset = (state_step - istart) // nsavc + 1
+    if target_nset > nset:
+        # Buffered frames lost on kill (clone-028-style 49-frame ghost).
+        print(f'_try_recover_gen: state ahead of DCD by '
+              f'{target_nset - nset} frames at {gen_path}; cascading.')
+        return None
+    if target_nset < nset:
+        # Kill between DCDReporter and CheckpointReporter writes.
+        print(f'_try_recover_gen: trimming {traj_p} from {nset} to '
+              f'{target_nset} frames to match state.xml stepCount.')
+        actual = util.truncate_dcd_to_nframes(traj_p, target_nset)
+        if actual != target_nset:
+            print(f'_try_recover_gen: truncate returned {actual} != '
+                  f'target {target_nset}; cascading.')
+            return None
+        nset = actual
+
+    remaining = total_steps - nset * nsavc
     if remaining > 0:
         if append_mode:
             return gen_index, seed_fn, remaining, True
-        # Non-append mode: preserve the partial traj for later inspection
-        # and fall through to an older gen.
+        # Non-append: preserve the partial traj and try an older gen.
         old_traj_p = traj_p.parent / ('old_' + traj_p.name)
         print(f'_try_recover_gen: non-append mode, renaming partial '
               f'{traj_p} -> {old_traj_p}')
         traj_p.rename(old_traj_p)
         return None
-    # Gen is complete; advance to gen+1 seeded from this gen's terminal state.
+    # Gen complete; advance.
     return gen_index + 1, seed_fn, total_steps, False
 
 
