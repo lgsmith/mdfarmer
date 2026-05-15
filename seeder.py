@@ -27,16 +27,23 @@ runner('config.json')
 # Returns None if this gen is unrecoverable. Caller cascades to an older
 # gen, then falls back to the initial seed.
 #
-# Three failures collapse into "unrecoverable" (β policy — prune & redo):
+# Two failures collapse into "unrecoverable" (β policy — prune & redo):
 #   1. state.xml unparseable or missing — torn-mid-write or never landed.
-#   2. state.xml's stepCount is ahead of the DCD's last frame's logical
-#      step — frames the simulation produced were lost in Python's user
-#      buffer at kill time, so the time series has an unfillable hole.
-#   3. state.xml stepCount doesn't sit on a DCD frame boundary — header
+#   2. state.xml stepCount doesn't sit on a DCD frame boundary — header
 #      doesn't match the checkpoint, both probably bad.
 #
 # For state-behind-DCD (kill between DCDReporter and CheckpointReporter,
 # expected single-frame drift), we truncate the DCD to align and resume.
+# For state-ahead-of-DCD (buffered DCD frames lost at kill before
+# flush-per-frame existed), we accept state.xml as authoritative and
+# advance to the next gen — the lost DCD tail is unrecoverable but the
+# integrator state is intact and the next gen can seed from it.
+#
+# Note on the gen-relative step math: OpenMM's DCDReporter hard-codes the
+# DCD header's `istart` to `reportInterval`, regardless of cumulative
+# simulation step. state.xml's stepCount, by contrast, accumulates across
+# gens. So we derive the absolute step at gen start from gen_index and
+# total_steps rather than trusting the DCD header's istart.
 def _try_recover_gen(gen_path: Path, *,
                      append_mode: bool,
                      restart_name: str,
@@ -76,24 +83,24 @@ def _try_recover_gen(gen_path: Path, *,
         print(f'_try_recover_gen: bad DCD header at {traj_p}: {exc}; '
               f'skipping gen.')
         return None
-    nset, istart, nsavc = info['nset'], info['istart'], info['nsavc']
+    nset, nsavc = info['nset'], info['nsavc']
     if nset == 0:
         return gen_index, seed_fn, total_steps, False
 
-    # state_step must sit on a DCD frame boundary; otherwise the
-    # checkpoint and trajectory aren't from the same point in the
-    # simulation and we have no clean way to resume.
-    if (state_step - istart) % nsavc != 0:
+    gen_start_step = gen_index * total_steps
+    state_offset = state_step - gen_start_step
+    if state_offset <= 0 or state_offset % nsavc != 0:
         print(f'_try_recover_gen: state stepCount={state_step} not aligned '
-              f'to DCD istart={istart} nsavc={nsavc} at {gen_path}; '
+              f'to gen start {gen_start_step} at nsavc={nsavc} ({gen_path}); '
               f'cascading.')
         return None
-    target_nset = (state_step - istart) // nsavc + 1
+    target_nset = state_offset // nsavc
+
     if target_nset > nset:
-        # Buffered frames lost on kill (clone-028-style 49-frame ghost).
-        print(f'_try_recover_gen: state ahead of DCD by '
-              f'{target_nset - nset} frames at {gen_path}; cascading.')
-        return None
+        # State ahead of DCD — legacy preempt-buffer-drift from before
+        # FlushingDCDReporter existed. state.xml's integrator state is
+        # intact; advance and let the next gen seed from it.
+        return gen_index + 1, seed_fn, total_steps, False
     if target_nset < nset:
         # Kill between DCDReporter and CheckpointReporter writes.
         print(f'_try_recover_gen: trimming {traj_p} from {nset} to '
