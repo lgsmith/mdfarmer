@@ -112,7 +112,13 @@ class Farmer:
                  overwrite=False,
                  harvester=None,
                  runner=sims.omm_generation,
-                 dry_run=False
+                 dry_run=False,
+                 # If True, expect the scheduler_fstring to install a SIGTERM
+                 # trap that touches a sentinel file (see
+                 # basic_scheduler_fstrings_preempt), and propagate the flag
+                 # into config_template so omm_generation installs a
+                 # SentinelReporter. Validated at boot.
+                 handle_preempt=False,
                  ):
         self.n_seeds = n_seeds
         self.n_clones = n_clones
@@ -130,6 +136,16 @@ class Farmer:
         self.scheduler = scheduler
         self.scheduler_kws = scheduler_kws
         self.scheduler_fstring = scheduler_fstring
+        if handle_preempt:
+            if 'PREEMPT_SIGTERM' not in scheduler_fstring or 'trap' not in scheduler_fstring:
+                raise ValueError(
+                    'Farmer(handle_preempt=True) requires a scheduler_fstring '
+                    'with a SIGTERM trap that touches PREEMPT_SIGTERM. Use '
+                    'basic_scheduler_fstrings_preempt[<scheduler>] or include '
+                    'an equivalent trap+background+wait pattern in your custom '
+                    'template.'
+                )
+            self.config_template['handle_preempt'] = True
         self.scheduler_report_cmd = scheduler_report_cmd
         self.scheduler_assoc_rep_cmd = scheduler_assoc_rep_cmd
         self.job_number_re = job_number_re

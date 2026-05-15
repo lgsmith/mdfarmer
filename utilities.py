@@ -200,8 +200,42 @@ basic_scheduler_fstrings = {
                 #SBATCH -o slurm.out
                 {gpu_line}
                 #SBATCH -p {queue_name}
-                
+
                 python {run_script_name}
+                """)
+}
+
+# Preempt-aware variants: install a SIGTERM trap that touches the sentinel
+# file SentinelReporter watches for, then background+wait the python
+# invocation so the trap can fire (bash blocks signal delivery while a
+# non-builtin foreground command runs). The trailing `sleep 70` keeps the
+# script alive past the 60s preempt grace period so Slurm records the job
+# as CANCELLED rather than FAILED. Pair with Farmer(handle_preempt=True).
+basic_scheduler_fstrings_preempt = {
+    "lsf": inspect.cleandoc("""#!/bin/bash
+                #BSUB -J {job_name}
+                #BSUB -o lsf.out
+                {gpu_line}
+                #BSUB -q {queue_name}
+
+                preempt_handler() {{ touch PREEMPT_SIGTERM; sleep 70; }}
+                trap preempt_handler SIGTERM
+
+                python {run_script_name} &
+                wait
+                """),
+    "slurm": inspect.cleandoc("""
+                #SBATCH -j {job_name}
+                #SBATCH -e slurm.out
+                #SBATCH -o slurm.out
+                {gpu_line}
+                #SBATCH -p {queue_name}
+
+                preempt_handler() {{ touch PREEMPT_SIGTERM; sleep 70; }}
+                trap preempt_handler SIGTERM
+
+                python {run_script_name} &
+                wait
                 """)
 }
 

@@ -195,6 +195,35 @@ _PARALLEL_REPORTER_CLS = {
 _SUPPORTED_PARALLEL_SUFFIXES = set(_PARALLEL_REPORTER_CLS)
 
 
+# Sentinel file the bash SIGTERM trap touches when Slurm preempts the job.
+# SentinelReporter watches for it on each write_interval cycle and raises
+# Preempted, which unwinds the simulation loop cleanly.
+PREEMPT_SENTINEL_NAME = 'PREEMPT_SIGTERM'
+
+
+class Preempted(Exception):
+    pass
+
+
+class SentinelReporter:
+    """Detects a Slurm-preempt SIGTERM via a sentinel file written by the
+    batch script's trap handler. Appended LAST in the reporter list so the
+    position / state / data writers for the current cycle have already
+    fired and produced aligned on-disk output before we raise."""
+
+    def __init__(self, reportInterval, sentinel_path=None):
+        self._reportInterval = reportInterval
+        self._sentinel = Path(sentinel_path or PREEMPT_SENTINEL_NAME)
+
+    def describeNextReport(self, simulation):
+        steps = self._reportInterval - simulation.currentStep % self._reportInterval
+        return {'steps': steps, 'periodic': None, 'include': []}
+
+    def report(self, simulation, state):
+        if self._sentinel.is_file():
+            raise Preempted(f'preempt sentinel detected at {self._sentinel.resolve()}')
+
+
 # This function is written so that you could use jug's 'Task' class to uplift
 # instances of calls. It returns the path to the trajectory written.
 
@@ -253,6 +282,13 @@ def omm_generation(traj_dir_top_level: str,
                    # Extension for a parallel force file. One of '.dcd', '.xtc', '.h5'.
                    # None means no parallel force file is written.
                    force_traj_suffix=None,
+                   # If True, install a SentinelReporter that watches for a
+                   # PREEMPT_SIGTERM file in cwd (touched by the batch
+                   # script's SIGTERM trap on Slurm preempt) and raises
+                   # Preempted at the next write_interval cycle. Requires the
+                   # batch script to install the trap and background+wait
+                   # the python invocation; see basic_scheduler_fstrings_preempt.
+                   handle_preempt=False,
                    ):
 
     # Validate embedded-output requests up front.
@@ -428,7 +464,21 @@ def omm_generation(traj_dir_top_level: str,
     simulation.reporters.append(restart_reporter)
     for r in extra_reporters:
         simulation.reporters.append(r)
-    simulation.step(steps)
+    # SentinelReporter must be appended LAST so DCD / state.xml / .out
+    # writes for the current cycle have already landed on disk before it
+    # raises. Stale sentinel from a previous preempted run in this gen
+    # dir would fire immediately, so clear it first.
+    if handle_preempt:
+        sentinel_p = Path(PREEMPT_SENTINEL_NAME)
+        if sentinel_p.exists():
+            sentinel_p.unlink()
+        simulation.reporters.append(SentinelReporter(write_interval))
+    try:
+        simulation.step(steps)
+    except Preempted as exc:
+        print(f'Preempt received: {exc}; exiting cleanly at last reporter '
+              f'cycle. The partial gen will resume via append on next launch.')
+        raise
     # The CheckpointReporter writes at every write_interval, so the most
     # recent state.xml on disk already aligns with the trajectory's last
     # frame. Writing one final state at a non-write_interval boundary
@@ -456,6 +506,12 @@ def omm_basic_sim_block_json(config):
 
     traj_list_path = Path(conf_dict['traj_list'])
     del conf_dict['traj_list']
-    new_traj_path = omm_generation(**conf_dict)
+    try:
+        new_traj_path = omm_generation(**conf_dict)
+    except Preempted:
+        # Skip the traj_list append: the gen is incomplete. The orchestrator
+        # will detect the partial DCD on the next boot and resume in append
+        # mode. Exit 0 so Slurm records the job as cancelled, not failed.
+        return
     with traj_list_path.open('a') as tl:
         tl.write(str(new_traj_path) + '\n')
