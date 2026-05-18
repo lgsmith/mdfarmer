@@ -43,7 +43,11 @@ try:
             try:
                 t = pyloos.Trajectory(traj_fn, m)
                 length = len(t)
-            except loos.FileReadError:
+            except loos.LOOSError:
+                # Catches FileReadError plus the broader "Error while
+                # reading first frame" raised when a DCD has a valid
+                # header but zero frame bytes (e.g. the 276-byte
+                # velocities.dcd left behind by the nm/ps units bug).
                 print('Assumming empty file; cannot read:', traj_fn)
                 length = 0
         return length

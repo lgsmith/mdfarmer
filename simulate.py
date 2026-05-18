@@ -85,10 +85,20 @@ class _ParallelDCDReporter:
                 simulation.integrator.getStepSize(),
                 self._reportInterval, self._reportInterval, self._append
             )
+        # DCDFile.writeModel dimension-checks its input via
+        # .value_in_unit(nanometers), which dies for velocity (nm/ps) or
+        # force (kJ/(mol·nm)) Quantities. DCD has no on-disk unit
+        # metadata, so we strip to the raw numeric array in the
+        # quantity's native units and re-tag as nanometers — the numbers
+        # in the file are unchanged; the file just *claims* nm. Readers
+        # must know it's velocities (nm/ps) or forces (kJ/mol/nm).
         if self._quantity == 'velocities':
-            vectors = state.getVelocities(asNumpy=True)
+            raw = state.getVelocities(asNumpy=True).value_in_unit(
+                unit.nanometer / unit.picosecond)
         else:
-            vectors = state.getForces(asNumpy=True)
+            raw = state.getForces(asNumpy=True).value_in_unit(
+                unit.kilojoule_per_mole / unit.nanometer)
+        vectors = raw * unit.nanometer
         self._dcd.writeModel(vectors, periodicBoxVectors=state.getPeriodicBoxVectors())
         _flush_dcd_file(self)
 
@@ -124,10 +134,20 @@ class _ParallelXTCReporter:
                 simulation.integrator.getStepSize(),
                 self._reportInterval, self._reportInterval, self._append
             )
+        # XTCFile.writeModel also calls .value_in_unit(nanometers) on
+        # its input and additionally checks that abs(values)*1000 fits
+        # in int32 (XTC's compressed-position range, ~2.1e6 nm post-
+        # scaling). Velocities (~few nm/ps) and bonded forces (up to
+        # ~1e5 kJ/mol/nm) both clear that bound, but XTC's lossy
+        # compression *will* truncate precision — use .dcd if you need
+        # full precision on saved velocities/forces.
         if self._quantity == 'velocities':
-            vectors = state.getVelocities(asNumpy=True)
+            raw = state.getVelocities(asNumpy=True).value_in_unit(
+                unit.nanometer / unit.picosecond)
         else:
-            vectors = state.getForces(asNumpy=True)
+            raw = state.getForces(asNumpy=True).value_in_unit(
+                unit.kilojoule_per_mole / unit.nanometer)
+        vectors = raw * unit.nanometer
         self._xtc.writeModel(vectors, periodicBoxVectors=state.getPeriodicBoxVectors())
 
 
@@ -394,24 +414,48 @@ def omm_generation(traj_dir_top_level: str,
         writeState=True)
 
     # Build parallel velocity/force reporters if requested. On a resume
-    # (append=True) of a gen that pre-dates the feature, the parallel file
-    # won't exist yet — skip it for this gen rather than writing a velocity
-    # traj that starts at a random frame N. The next fresh gen will create
-    # a clean from-frame-0 file.
+    # (append=True), only activate the parallel reporter if its file is
+    # frame-aligned with the position trajectory — same frame count.
+    # Skip cases:
+    #   - file doesn't exist (pre-velocity gen).
+    #   - file exists but has fewer frames than the position traj
+    #     (crashed mid-gen — e.g. the 0-frame `velocities.dcd` left by
+    #     the nm/ps-vs-nm units bug). Appending would write frame N of
+    #     velocity while position writes frame N+k, permanently offset
+    #     for the rest of the gen.
+    # Skipping preserves the user's invariant that velocity frame N
+    # corresponds to position frame N. Next fresh gen creates a clean
+    # from-frame-0 parallel file.
     extra_reporters = []
+
+    def _parallel_aligned(parallel_path):
+        if not parallel_path.is_file():
+            return False
+        if not traj_path.is_file():
+            return False
+        try:
+            return util.get_traj_len(str(parallel_path), top_fn) == \
+                util.get_traj_len(str(traj_path), top_fn)
+        except Exception as exc:
+            print(f'Could not measure frame count of {parallel_path}: '
+                  f'{exc}; treating as not aligned and skipping.')
+            return False
+
     if velocity_traj_suffix is not None:
         vel_path = (traj_dir / velocity_name).with_suffix(velocity_traj_suffix)
-        if append and not vel_path.is_file():
-            print(f'Resume of pre-velocity gen at {traj_dir}; '
-                  f'skipping velocity output for this gen.')
+        if append and not _parallel_aligned(vel_path):
+            print(f'Skipping velocity reporter at {vel_path}: file '
+                  f'absent or not frame-aligned with {traj_path}. The '
+                  'next fresh gen will start a clean velocity trajectory.')
         else:
             cls = _PARALLEL_REPORTER_CLS[velocity_traj_suffix]
             extra_reporters.append(cls(str(vel_path), write_interval, 'velocities', append=append))
     if force_traj_suffix is not None:
         force_path = (traj_dir / force_name).with_suffix(force_traj_suffix)
-        if append and not force_path.is_file():
-            print(f'Resume of pre-force gen at {traj_dir}; '
-                  f'skipping force output for this gen.')
+        if append and not _parallel_aligned(force_path):
+            print(f'Skipping force reporter at {force_path}: file '
+                  f'absent or not frame-aligned with {traj_path}. The '
+                  'next fresh gen will start a clean force trajectory.')
         else:
             cls = _PARALLEL_REPORTER_CLS[force_traj_suffix]
             extra_reporters.append(cls(str(force_path), write_interval, 'forces', append=append))
