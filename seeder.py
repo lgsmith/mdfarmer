@@ -133,7 +133,7 @@ class Clone:
         'scheduler_fstring', 'scheduler', 'traj_list', 'sep', 'dirname_pad',
         'scheduler_kws', 'restarts_per_gen', 'restart_attempts', 'run_script',
         'harvester', 'remaining_steps', 'run_script_name', 'total_steps',
-        'preemption_checker')
+        'preemption_checker', 'node_blocklist')
 
     # This should mostly be used by the init function, and by adaptive sampling scripts.
 
@@ -177,6 +177,12 @@ class Clone:
                  # preempted by the scheduler. If provided, preemption restarts
                  # don't count against restarts_per_gen.
                  preemption_checker=None,
+                 # Shared BadNodeRegistry. When a 0-step abort is detected
+                 # and the gen's scheduler log matches a node-local
+                 # failure pattern, scan_and_record harvests the node and
+                 # excludes it from subsequent submissions. May be None
+                 # (older callers and tests).
+                 node_blocklist=None,
                  # The full per-gen step count from the template. On a resume
                  # config['steps'] is the steps-remaining-this-gen, not the
                  # template total, so we have to track the total separately
@@ -232,6 +238,7 @@ class Clone:
         self.compare_keys = compare_keys
         self.harvester = harvester
         self.preemption_checker = preemption_checker
+        self.node_blocklist = node_blocklist
         self.run_script = run_script
         self.scheduler_script_p = None  # always redefined each run
 
@@ -266,6 +273,7 @@ class Clone:
                   job_name_fstring: str,
                   harvester=None,
                   preemption_checker=None,
+                  node_blocklist=None,
                   # (seed, clone, gen) -> jid for jobs currently in the
                   # scheduler queue, so we can re-associate after an
                   # orchestrator restart.
@@ -344,6 +352,7 @@ class Clone:
             sep=sep,
             harvester=harvester,
             preemption_checker=preemption_checker,
+            node_blocklist=node_blocklist,
             dry_run=dry_run,
         )
 
@@ -532,6 +541,15 @@ class Clone:
                         f'{traj_p} found, but zero steps. ',
                         f'Removing and attempting restart number {self.restart_attempts}.',
                     )
+                    # Last chance to scan the failing job's scheduler log
+                    # for a node-local cause before the next submission
+                    # overwrites slurm.out / lsf.out. If a fatal-on-node
+                    # pattern matched, the registry adds the node to
+                    # scheduler_kws['exclude_nodes'] so plow_harrow_plant
+                    # below renders a directive that steers off it.
+                    if self.node_blocklist is not None:
+                        self.node_blocklist.scan_and_record(
+                            self.current_gen_dir, self.get_tag())
                     traj_p.unlink()
                     no_failure = self.start_current(
                         overwrite=overwrite, count_as_restart=count_as_restart)

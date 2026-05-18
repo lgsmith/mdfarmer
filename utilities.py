@@ -185,12 +185,22 @@ def strip_ds_mdtraj(config_fn, harvester_config_fn, sep='-', image_molecules=Tru
 
 # These basic strings are useful in many cases on clusters using the scheduler named as the key.
 # NOTE the format target '{job_name}' has to appear for the default queue parser to find the job.
+# The 'NODE:' / 'GPU:' echoes are how BadNodeRegistry learns which host
+# produced a failure and which device was on it -- keep them if you
+# replace this fstring with your own and want bad-node blocking to work.
+# {exclude_nodes} expands to a scheduler directive line excluding any
+# nodes BadNodeRegistry has flagged (empty when none are blocked).
 basic_scheduler_fstrings = {
     "lsf": inspect.cleandoc("""#!/bin/bash
                 #BSUB -J {job_name}
                 #BSUB -o lsf.out
                 {gpu_line}
                 #BSUB -q {queue_name}
+                {exclude_nodes}
+
+                echo "JOB_NAME: {job_name}"
+                echo "NODE: $LSB_HOSTS"
+                echo "GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | paste -sd, -)"
 
                 python {run_script_name}
                 """),
@@ -200,6 +210,12 @@ basic_scheduler_fstrings = {
                 #SBATCH -o slurm.out
                 {gpu_line}
                 #SBATCH -p {queue_name}
+                {exclude_nodes}
+
+                echo "JOB_NAME: {job_name}"
+                echo "SLURM_JOB_ID: $SLURM_JOB_ID"
+                echo "NODE: $SLURMD_NODENAME"
+                echo "GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | paste -sd, -)"
 
                 python {run_script_name}
                 """)
@@ -217,6 +233,11 @@ basic_scheduler_fstrings_preempt = {
                 #BSUB -o lsf.out
                 {gpu_line}
                 #BSUB -q {queue_name}
+                {exclude_nodes}
+
+                echo "JOB_NAME: {job_name}"
+                echo "NODE: $LSB_HOSTS"
+                echo "GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | paste -sd, -)"
 
                 preempt_handler() {{ touch PREEMPT_SIGTERM; sleep 70; }}
                 trap preempt_handler SIGTERM
@@ -230,6 +251,12 @@ basic_scheduler_fstrings_preempt = {
                 #SBATCH -o slurm.out
                 {gpu_line}
                 #SBATCH -p {queue_name}
+                {exclude_nodes}
+
+                echo "JOB_NAME: {job_name}"
+                echo "SLURM_JOB_ID: $SLURM_JOB_ID"
+                echo "NODE: $SLURMD_NODENAME"
+                echo "GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | paste -sd, -)"
 
                 preempt_handler() {{ touch PREEMPT_SIGTERM; sleep 70; }}
                 trap preempt_handler SIGTERM
@@ -304,6 +331,210 @@ preemption_checkers = {
     'sbatch': slurm_was_preempted,
     'bsub': lsf_was_preempted,
 }
+
+
+# Bad-node detection: when a clone's gen aborts at 0 steps because the
+# *node* is broken (stale CUDA driver against a too-new PTX, libc/GLIBC
+# ABI mismatch, missing GPU), retrying the same gen routes a new sbatch
+# straight back to the same broken queue/partition and the scheduler
+# tends to hand it to the same node. The result is a cascade: every
+# clone the farmer tries to relaunch lands on the bad node and dies, and
+# the farmer eventually exhausts each clone's restart budget.
+#
+# BadNodeRegistry breaks that cycle. When a 0-step abort is detected,
+# the registry scans the gen's scheduler log for a known "this is the
+# node, not the sim" pattern, harvests the NODE: line, and appends the
+# node to a scheduler-directive line that's injected into the next
+# submission via {exclude_nodes} in scheduler_fstring. It also writes a
+# human-readable breadcrumb row to a persistence file (default
+# bad_nodes.txt) so (a) a restarted farmer doesn't re-learn the same
+# bad nodes and (b) the user has a paper trail showing which nodes
+# failed how, when, and where to read the offending log.
+
+default_bad_node_patterns = (
+    'CUDA_ERROR_UNSUPPORTED_PTX_VERSION',
+    'CUDA_ERROR_NO_DEVICE',
+    'CUDA_ERROR_INVALID_DEVICE',
+    'CUDA_ERROR_NOT_INITIALIZED',
+    'CUDA driver version is insufficient',
+    'No CUDA-capable device is detected',
+    'Failed to initialize NVML',
+    # GLIBC ABI mismatch ("version `GLIBC_2.34' not found"). Quoted
+    # half is enough -- the rest of the line varies.
+    "version `GLIBC_",
+)
+
+default_scheduler_log_names = {
+    'sbatch': 'slurm.out',
+    'slurm': 'slurm.out',
+    'bsub': 'lsf.out',
+    'lsf': 'lsf.out',
+}
+
+
+def _format_exclude_slurm(nodes):
+    if not nodes:
+        return ''
+    return f'#SBATCH --exclude={",".join(sorted(nodes))}'
+
+
+def _format_exclude_lsf(nodes):
+    if not nodes:
+        return ''
+    selectors = ' && '.join(f"hname!='{n}'" for n in sorted(nodes))
+    return f'#BSUB -R "select[{selectors}]"'
+
+
+default_exclude_node_formatters = {
+    'sbatch': _format_exclude_slurm,
+    'slurm': _format_exclude_slurm,
+    'bsub': _format_exclude_lsf,
+    'lsf': _format_exclude_lsf,
+}
+
+
+class BadNodeRegistry:
+    """Tracks nodes that produced node-local failures and excludes them
+    from subsequent submissions.
+
+    On boot: parses the persistence file (default bad_nodes.txt) and
+    rebuilds the in-memory exclude set so a farmer restart doesn't
+    re-learn the same bad nodes. Seeds scheduler_kws['exclude_nodes']
+    with the corresponding directive line.
+
+    Per detection: scan_and_record(gen_dir, clone_tag) reads the gen's
+    scheduler log (slurm.out / lsf.out), looks for a `bad_node_patterns`
+    hit, harvests `NODE:` (and `GPU:` if present), appends a breadcrumb
+    row, and refreshes scheduler_kws['exclude_nodes'].
+
+    Breadcrumb file is plain text, tab-separated. Comment-out (prefix
+    `#`) or delete rows to clear entries; the farmer rereads the file
+    on boot.
+    """
+
+    BREADCRUMB_HEADER = (
+        '# mdfarmer bad-nodes blocklist\n'
+        '# This file is appended to whenever a clone aborts at 0 steps\n'
+        "# on a node whose log matches a known fatal-on-this-node pattern.\n"
+        '# The farmer excludes these nodes on subsequent submissions via\n'
+        "# the '{exclude_nodes}' placeholder in scheduler_fstring.\n"
+        '#\n'
+        '# To clear an entry: comment out (prefix `#`) or delete the row\n'
+        '# and restart the farmer. Lines starting with `#` and blank lines\n'
+        '# are ignored on reload.\n'
+        '#\n'
+        "# If many nodes from one partition fail with the same pattern,\n"
+        "# that's a hint about how to reconfigure: e.g. PTX-version errors\n"
+        '# usually mean the partition has older driver/CUDA-toolkit nodes,\n'
+        "# so narrowing your --constraint (Slurm) or queue is more durable\n"
+        "# than relying on this exclude list to grow.\n"
+        '#\n'
+        '# Columns (tab-separated):\n'
+        '#   timestamp\tnode\tgpu\tpattern\tlog_path\tclone_tag\n'
+    )
+
+    def __init__(self, persist_path, scheduler, scheduler_kws,
+                 patterns=None, log_name=None, exclude_formatter=None):
+        self.persist_path = Path(persist_path)
+        self.scheduler = scheduler
+        # Held by reference; mutating exclude_nodes here updates the dict
+        # the Farmer hands to every Clone for str.format() at launch.
+        self.scheduler_kws = scheduler_kws
+        self.patterns = tuple(patterns) if patterns is not None \
+            else default_bad_node_patterns
+        self.log_name = log_name or default_scheduler_log_names.get(
+            scheduler, 'slurm.out')
+        self.exclude_formatter = (
+            exclude_formatter
+            or default_exclude_node_formatters.get(scheduler)
+            or (lambda nodes: '')
+        )
+        self.bad_nodes = self._load_persisted()
+        self._refresh_kws()
+
+    def _load_persisted(self):
+        nodes = set()
+        if not self.persist_path.is_file():
+            return nodes
+        for raw in self.persist_path.read_text().splitlines():
+            line = raw.strip()
+            if not line or line.startswith('#'):
+                continue
+            parts = line.split('\t')
+            # New format: timestamp\tnode\tgpu\tpattern\tlog_path\tclone_tag
+            # Tolerate older / hand-edited rows: pick the first field
+            # that looks like a hostname (no spaces, not an ISO date).
+            for cand in parts:
+                cand = cand.strip()
+                if not cand:
+                    continue
+                # ISO timestamps start with a 4-digit year + '-'.
+                if len(cand) >= 5 and cand[4] == '-' and cand[:4].isdigit():
+                    continue
+                nodes.add(cand)
+                break
+        return nodes
+
+    def _refresh_kws(self):
+        self.scheduler_kws['exclude_nodes'] = self.exclude_formatter(self.bad_nodes)
+
+    def _ensure_header(self):
+        if (not self.persist_path.is_file()
+                or self.persist_path.stat().st_size == 0):
+            self.persist_path.write_text(self.BREADCRUMB_HEADER)
+
+    def _append_row(self, node, gpu, pattern, log_path, clone_tag):
+        import datetime as _dt
+        ts = _dt.datetime.now(_dt.timezone.utc).isoformat(timespec='seconds')
+        row = f'{ts}\t{node}\t{gpu}\t{pattern}\t{log_path}\t{clone_tag}\n'
+        with self.persist_path.open('a') as f:
+            f.write(row)
+
+    @staticmethod
+    def _extract_value(text, key):
+        for line in text.splitlines():
+            if line.startswith(key):
+                rest = line[len(key):].strip()
+                return rest if rest else None
+        return None
+
+    # Scan the gen's scheduler log for a known fatal-on-this-node
+    # pattern. If matched, harvest the NODE: line (and GPU: if present),
+    # write a breadcrumb row, add the node to the in-memory exclude set,
+    # and refresh scheduler_kws['exclude_nodes']. Returns the node name
+    # if recorded, else None.
+    def scan_and_record(self, gen_dir, clone_tag):
+        log_p = Path(gen_dir) / self.log_name
+        if not log_p.is_file():
+            return None
+        try:
+            text = log_p.read_text(errors='replace')
+        except OSError as exc:
+            print(f'BadNodeRegistry: cannot read {log_p}: {exc}')
+            return None
+        matched = next((p for p in self.patterns if p in text), None)
+        if matched is None:
+            return None
+        node = self._extract_value(text, 'NODE:')
+        if node is None:
+            print(f'BadNodeRegistry: pattern {matched!r} matched in {log_p} '
+                  "but no 'NODE:' line found in scheduler log; cannot "
+                  'exclude. Add `echo "NODE: $SLURMD_NODENAME"` (or LSF '
+                  'equivalent) to your scheduler_fstring.')
+            return None
+        gpu = self._extract_value(text, 'GPU:') or 'unknown'
+        self._ensure_header()
+        self._append_row(node, gpu, matched, log_p.resolve(), clone_tag)
+        if node not in self.bad_nodes:
+            print(f'BadNodeRegistry: node {node!r} (gpu={gpu!r}) hit '
+                  f'fatal-on-node pattern {matched!r}; adding to exclude '
+                  f'list (logged to {self.persist_path.resolve()}).')
+            self.bad_nodes.add(node)
+            self._refresh_kws()
+        else:
+            print(f'BadNodeRegistry: node {node!r} (already excluded) hit '
+                  f'pattern {matched!r} again; logged in {self.persist_path}.')
+        return node
 
 
 # Resolve which OpenMM Platform to use and which platformProperties to apply.

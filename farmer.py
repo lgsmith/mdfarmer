@@ -13,7 +13,8 @@ class Farmer:
                  'job_name_fstring', 'job_number_re', 'finished_clones', 'harvester',
                  'quiet', 'sep', 'dirname_pad', 'seed_state_fns', 'scheduler',
                  'scheduler_report_cmd', 'scheduler_fstring', 'scheduler_kws',
-                 'scheduler_assoc_rep_cmd', 'system_fns', 'top_fns')
+                 'scheduler_assoc_rep_cmd', 'system_fns', 'top_fns',
+                 'node_blocklist')
 
     def update_jids(self):
         jids_string = sp.check_output(
@@ -77,6 +78,7 @@ class Farmer:
                 job_name_fstring=self.job_name_fstring,
                 harvester=self.harvester,
                 preemption_checker=util.preemption_checkers.get(self.scheduler),
+                node_blocklist=self.node_blocklist,
                 rep_dict=rep_dict,
                 dry_run=self.dry_run,
             )
@@ -119,6 +121,16 @@ class Farmer:
                  # into config_template so omm_generation installs a
                  # SentinelReporter. Validated at boot.
                  handle_preempt=False,
+                 # Path to the human-readable persistence file that
+                 # BadNodeRegistry appends to whenever a clone aborts on
+                 # a node whose log matches `bad_node_patterns`. Reloaded
+                 # at boot so a restarted farmer doesn't relearn the
+                 # same bad nodes.
+                 bad_node_persist='bad_nodes.txt',
+                 # Iterable of substrings whose presence in a gen's
+                 # scheduler log marks the failure as node-local. If
+                 # None, use utilities.default_bad_node_patterns.
+                 bad_node_patterns=None,
                  ):
         self.n_seeds = n_seeds
         self.n_clones = n_clones
@@ -136,6 +148,15 @@ class Farmer:
         self.scheduler = scheduler
         self.scheduler_kws = scheduler_kws
         self.scheduler_fstring = scheduler_fstring
+        # Stand up the bad-node registry *before* anything that might
+        # call str.format() on the scheduler_fstring, so the
+        # `exclude_nodes` key is present and any persisted bad-node
+        # exclusion is in effect from the first submission this farmer
+        # makes (including resumes after a crash that already learned
+        # which nodes were bad).
+        self.node_blocklist = util.BadNodeRegistry(
+            bad_node_persist, scheduler, self.scheduler_kws,
+            patterns=bad_node_patterns)
         if handle_preempt:
             if 'PREEMPT_SIGTERM' not in scheduler_fstring or 'trap' not in scheduler_fstring:
                 raise ValueError(
