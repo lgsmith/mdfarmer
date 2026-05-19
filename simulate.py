@@ -45,16 +45,17 @@ def _flush_dcd_file(reporter):
         )
 
 
-# Parallel-file reporters: write velocity or force vectors into the position
-# slot of a DCD or XTC file.  The semantic abuse is intentional — DCD and XTC
-# carry no velocity/force fields, so we repurpose the position slot.  Callers
-# are responsible for knowing what the file contains.
+# Tandem-file reporters: write velocity or force vectors into the position
+# slot of a DCD or XTC file that rides alongside the position trajectory,
+# frame-for-frame. The semantic abuse is intentional — DCD and XTC carry no
+# velocity/force fields, so we repurpose the position slot. Callers are
+# responsible for knowing what the file contains.
 #
 # describeNextReport returns the new dict format (OpenMM 8.x).  The
 # 'include' list controls which quantities getState() populates; we request
 # only what we need and never positions.
 
-class _ParallelDCDReporter:
+class _TandemDCDReporter:
     """Write velocities or forces into the position slot of a DCD file."""
 
     def __init__(self, file, reportInterval, quantity, append=False,
@@ -106,7 +107,7 @@ class _ParallelDCDReporter:
         self._out.close()
 
 
-class _ParallelXTCReporter:
+class _TandemXTCReporter:
     """Write velocities or forces into the position slot of an XTC file."""
 
     def __init__(self, file, reportInterval, quantity, append=False,
@@ -151,10 +152,10 @@ class _ParallelXTCReporter:
         self._xtc.writeModel(vectors, periodicBoxVectors=state.getPeriodicBoxVectors())
 
 
-# HDF5 parallel reporter: velocities go into the velocities field (native
+# HDF5 tandem reporter: velocities go into the velocities field (native
 # support); forces are shoehorned into the coordinates field because
 # HDF5TrajectoryFile.write has no forces kwarg.
-class _ParallelHDF5Reporter:
+class _TandemHDF5Reporter:
     """Write velocities or forces to an HDF5 trajectory file."""
 
     def __init__(self, file, reportInterval, quantity, append=False,
@@ -203,16 +204,16 @@ class _ParallelHDF5Reporter:
         self._traj_file.close()
 
 
-_PARALLEL_REPORTER_CLS = {
-    '.dcd': _ParallelDCDReporter,
-    '.xtc': _ParallelXTCReporter,
-    '.h5':  _ParallelHDF5Reporter,
+_TANDEM_REPORTER_CLS = {
+    '.dcd': _TandemDCDReporter,
+    '.xtc': _TandemXTCReporter,
+    '.h5':  _TandemHDF5Reporter,
     # .trr: mdtraj's TRRTrajectoryFile.write() only accepts xyz (positions);
     # there is no velocities or forces argument in the current mdtraj API.
-    # Until mdtraj exposes that, .trr is not supported for parallel files.
+    # Until mdtraj exposes that, .trr is not supported for tandem files.
 }
 
-_SUPPORTED_PARALLEL_SUFFIXES = set(_PARALLEL_REPORTER_CLS)
+_SUPPORTED_TANDEM_SUFFIXES = set(_TANDEM_REPORTER_CLS)
 
 
 # Sentinel file the bash SIGTERM trap touches when Slurm preempts the job.
@@ -323,15 +324,15 @@ def omm_generation(traj_dir_top_level: str,
             'mdtraj HDF5Reporter is the only reporter that can embed velocities in the '
             'main trajectory file.'
         )
-    if velocity_traj_suffix is not None and velocity_traj_suffix not in _SUPPORTED_PARALLEL_SUFFIXES:
+    if velocity_traj_suffix is not None and velocity_traj_suffix not in _SUPPORTED_TANDEM_SUFFIXES:
         raise ValueError(
             f'velocity_traj_suffix={velocity_traj_suffix!r} is not supported. '
-            f'Choose from: {sorted(_SUPPORTED_PARALLEL_SUFFIXES)}'
+            f'Choose from: {sorted(_SUPPORTED_TANDEM_SUFFIXES)}'
         )
-    if force_traj_suffix is not None and force_traj_suffix not in _SUPPORTED_PARALLEL_SUFFIXES:
+    if force_traj_suffix is not None and force_traj_suffix not in _SUPPORTED_TANDEM_SUFFIXES:
         raise ValueError(
             f'force_traj_suffix={force_traj_suffix!r} is not supported. '
-            f'Choose from: {sorted(_SUPPORTED_PARALLEL_SUFFIXES)}'
+            f'Choose from: {sorted(_SUPPORTED_TANDEM_SUFFIXES)}'
         )
 
     # make reporter by extension
@@ -413,8 +414,8 @@ def omm_generation(traj_dir_top_level: str,
         write_interval,
         writeState=True)
 
-    # Build parallel velocity/force reporters if requested. On a resume
-    # (append=True), only activate the parallel reporter if its file is
+    # Build tandem velocity/force reporters if requested. On a resume
+    # (append=True), only activate the tandem reporter if its file is
     # frame-aligned with the position trajectory — same frame count.
     # Skip cases:
     #   - file doesn't exist (pre-velocity gen).
@@ -425,39 +426,39 @@ def omm_generation(traj_dir_top_level: str,
     #     for the rest of the gen.
     # Skipping preserves the user's invariant that velocity frame N
     # corresponds to position frame N. Next fresh gen creates a clean
-    # from-frame-0 parallel file.
+    # from-frame-0 tandem file.
     extra_reporters = []
 
-    def _parallel_aligned(parallel_path):
-        if not parallel_path.is_file():
+    def _tandem_aligned(tandem_path):
+        if not tandem_path.is_file():
             return False
         if not traj_path.is_file():
             return False
         try:
-            return util.get_traj_len(str(parallel_path), top_fn) == \
+            return util.get_traj_len(str(tandem_path), top_fn) == \
                 util.get_traj_len(str(traj_path), top_fn)
         except Exception as exc:
-            print(f'Could not measure frame count of {parallel_path}: '
+            print(f'Could not measure frame count of {tandem_path}: '
                   f'{exc}; treating as not aligned and skipping.')
             return False
 
     if velocity_traj_suffix is not None:
         vel_path = (traj_dir / velocity_name).with_suffix(velocity_traj_suffix)
-        if append and not _parallel_aligned(vel_path):
+        if append and not _tandem_aligned(vel_path):
             print(f'Skipping velocity reporter at {vel_path}: file '
                   f'absent or not frame-aligned with {traj_path}. The '
                   'next fresh gen will start a clean velocity trajectory.')
         else:
-            cls = _PARALLEL_REPORTER_CLS[velocity_traj_suffix]
+            cls = _TANDEM_REPORTER_CLS[velocity_traj_suffix]
             extra_reporters.append(cls(str(vel_path), write_interval, 'velocities', append=append))
     if force_traj_suffix is not None:
         force_path = (traj_dir / force_name).with_suffix(force_traj_suffix)
-        if append and not _parallel_aligned(force_path):
+        if append and not _tandem_aligned(force_path):
             print(f'Skipping force reporter at {force_path}: file '
                   f'absent or not frame-aligned with {traj_path}. The '
                   'next fresh gen will start a clean force trajectory.')
         else:
-            cls = _PARALLEL_REPORTER_CLS[force_traj_suffix]
+            cls = _TANDEM_REPORTER_CLS[force_traj_suffix]
             extra_reporters.append(cls(str(force_path), write_interval, 'forces', append=append))
 
     system = mm.XmlSerializer.deserialize(Path(system_fn).read_text())
