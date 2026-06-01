@@ -157,11 +157,16 @@ class Farmer:
         self.node_blocklist = util.BadNodeRegistry(
             bad_node_persist, scheduler, self.scheduler_kws,
             patterns=bad_node_patterns)
-        if handle_preempt:
+        # Honor handle_preempt whether it arrives via this constructor arg or
+        # is set directly on config_template. Validating both paths stops the
+        # config_template route from silently arming the SentinelReporter
+        # without a matching SIGTERM trap (which would hard-kill on preempt).
+        if handle_preempt or self.config_template.get('handle_preempt'):
             if 'PREEMPT_SIGTERM' not in scheduler_fstring or 'trap' not in scheduler_fstring:
                 raise ValueError(
-                    'Farmer(handle_preempt=True) requires a scheduler_fstring '
-                    'with a SIGTERM trap that touches PREEMPT_SIGTERM. Use '
+                    'handle_preempt is set (via Farmer(handle_preempt=True) or '
+                    'config_template["handle_preempt"]) but scheduler_fstring '
+                    'lacks a SIGTERM trap that touches PREEMPT_SIGTERM. Use '
                     'basic_scheduler_fstrings_preempt[<scheduler>] or include '
                     'an equivalent trap+background+wait pattern in your custom '
                     'template.'

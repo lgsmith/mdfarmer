@@ -111,6 +111,50 @@ def _try_recover_gen(gen_path: Path, *,
                   f'target {target_nset}; cascading.')
             return None
         nset = actual
+        # Keep the parallel velocity/force DCDs frame-aligned with positions.
+        # This lives INSIDE the position-truncation branch on purpose: it only
+        # runs when the position DCD is ahead of state (an unclean kill), which
+        # never happens for a healthy in-flight gen (positions and state advance
+        # together, so that gen takes the target_nset == nset path and skips
+        # this entirely). So it inherits the position truncation's in-flight
+        # safety and won't touch a live clone's tandem files during graceful
+        # re-association. Trim any tandem that is ahead; if one is behind we
+        # can't fabricate the missing frame without a matching checkpoint, so
+        # cascade — this is a dead gen, so redoing it is safe.
+        for name_key, suffix_key, default_name in (
+                ('velocity_name', 'velocity_traj_suffix', 'velocities'),
+                ('force_name', 'force_traj_suffix', 'forces')):
+            tandem_suffix = prev_config.get(suffix_key)
+            if not tandem_suffix:
+                continue
+            tandem_p = (gen_path / prev_config.get(name_key, default_name)
+                        ).with_suffix(tandem_suffix)
+            if (not tandem_p.is_file()) or tandem_p.stat().st_size == 0:
+                continue
+            if tandem_suffix != '.dcd':
+                print(f'_try_recover_gen: cannot frame-align {tandem_p} '
+                      f'(only .dcd truncation is supported); cascading.')
+                return None
+            try:
+                tandem_nset = util.dcd_header_info(tandem_p)['nset']
+            except Exception as exc:
+                print(f'_try_recover_gen: bad tandem DCD header at {tandem_p}: '
+                      f'{exc}; cascading.')
+                return None
+            if tandem_nset == target_nset:
+                continue
+            if tandem_nset < target_nset:
+                print(f'_try_recover_gen: {tandem_p} has {tandem_nset} frames, '
+                      f'behind positions/state ({target_nset}); cannot realign '
+                      f'without a matching checkpoint, cascading.')
+                return None
+            print(f'_try_recover_gen: trimming {tandem_p} from {tandem_nset} '
+                  f'to {target_nset} frames to match positions.')
+            tandem_actual = util.truncate_dcd_to_nframes(tandem_p, target_nset)
+            if tandem_actual != target_nset:
+                print(f'_try_recover_gen: tandem truncate returned '
+                      f'{tandem_actual} != target {target_nset}; cascading.')
+                return None
 
     remaining = total_steps - nset * nsavc
     if remaining > 0:
