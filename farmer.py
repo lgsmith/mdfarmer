@@ -14,7 +14,7 @@ class Farmer:
                  'quiet', 'sep', 'dirname_pad', 'seed_state_fns', 'scheduler',
                  'scheduler_report_cmd', 'scheduler_fstring', 'scheduler_kws',
                  'scheduler_assoc_rep_cmd', 'system_fns', 'top_fns',
-                 'node_blocklist')
+                 'node_blocklist', 'run_script', 'recover_fn')
 
     def update_jids(self):
         jids_string = sp.check_output(
@@ -80,6 +80,8 @@ class Farmer:
                 preemption_checker=util.preemption_checkers.get(self.scheduler),
                 node_blocklist=self.node_blocklist,
                 rep_dict=rep_dict,
+                run_script=self.run_script,
+                recover_fn=self.recover_fn,
                 dry_run=self.dry_run,
             )
         except Exception as exc:
@@ -114,6 +116,14 @@ class Farmer:
                  overwrite=False,
                  harvester=None,
                  runner=sims.omm_generation,
+                 # Per-gen run.py body written into each gen dir. None -> the
+                 # OpenMM default (seeder.default_run_script). For GROMACS pass
+                 # gmx_simulate.default_gmx_run_script.
+                 run_script=None,
+                 # Disk-recovery classifier for Clone.from_disk. None -> the
+                 # OpenMM seeder._try_recover_gen. For GROMACS pass
+                 # gmx_simulate.gmx_try_recover_gen.
+                 recover_fn=None,
                  dry_run=False,
                  # If True, expect the scheduler_fstring to install a SIGTERM
                  # trap that touches a sentinel file (see
@@ -144,6 +154,8 @@ class Farmer:
         self.top_fns = [str(self.check_path(Path(p)).resolve())
                         for p in top_fns]
         self.runner = runner
+        self.run_script = run_script
+        self.recover_fn = recover_fn
         self.seeds_first = seeds_first
         self.scheduler = scheduler
         self.scheduler_kws = scheduler_kws
@@ -181,9 +193,11 @@ class Farmer:
         self.config_template['traj_dir_top_level'] = str(
             Path(self.config_template['traj_dir_top_level']).resolve()
         )
-        self.config_template['integrator_xml'] = str(
-            self.check_path(Path(self.config_template['integrator_xml'])).resolve()
-        )
+        # integrator_xml is OpenMM-only; GROMACS drivers omit it.
+        if self.config_template.get('integrator_xml'):
+            self.config_template['integrator_xml'] = str(
+                self.check_path(Path(self.config_template['integrator_xml'])).resolve()
+            )
 
         # buffering=0 on the DCD reporter's underlying file would make every
         # struct.pack inside DCDFile.writeModel its own syscall — much slower

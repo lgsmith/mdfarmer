@@ -318,6 +318,11 @@ class Clone:
                   harvester=None,
                   preemption_checker=None,
                   node_blocklist=None,
+                  # GROMACS support hooks. None -> OpenMM defaults:
+                  #   recover_fn -> _try_recover_gen (state.xml/DCD recovery)
+                  #   run_script -> Clone's default_run_script (omm runner)
+                  recover_fn=None,
+                  run_script=None,
                   # (seed, clone, gen) -> jid for jobs currently in the
                   # scheduler queue, so we can re-associate after an
                   # orchestrator restart.
@@ -335,9 +340,10 @@ class Clone:
         else:
             gen_paths = []
 
+        _recover = recover_fn if recover_fn is not None else _try_recover_gen
         recovered = None
         for gen_path in reversed(gen_paths):
-            recovered = _try_recover_gen(
+            recovered = _recover(
                 gen_path,
                 append_mode=append_mode,
                 restart_name=config_template['restart_name'],
@@ -382,6 +388,9 @@ class Clone:
 
         jid = rep_dict.get((seed_index, clone_index, gen_index))
 
+        # Only override Clone's default run_script when one was supplied, so
+        # OpenMM callers keep the default and GROMACS callers get their runner.
+        run_script_kw = {} if run_script is None else {'run_script': run_script}
         return cls(
             config,
             scheduler,
@@ -398,6 +407,7 @@ class Clone:
             preemption_checker=preemption_checker,
             node_blocklist=node_blocklist,
             dry_run=dry_run,
+            **run_script_kw,
         )
 
     # Compare a value across self config and other config in other Clone.
