@@ -311,6 +311,60 @@ basic_gpu_lines = {
     "slurm": "#SBATCH --gpus=1"
 }
 
+# MPS-packed variant: one job, one GPU, K replicas sharing the card through the
+# CUDA Multi-Process Service. Pair with gmx_pack.gmx_pack_sim_block_json, which
+# does the per-replica core pinning and the per-member outcome reporting.
+#
+# Two details that bite:
+#   * The pipe and log directories are keyed on $SLURM_JOB_ID. Two packed jobs
+#     landing on the same node otherwise share -- or clobber -- one daemon.
+#   * If the daemon fails to start the mdruns still run, just time-sliced at
+#     10-20% worse throughput. The runner checks and says so loudly; the script
+#     echoes its own failure too, rather than tolerating it silently.
+#
+# --signal=B:TERM@120 is what makes the checkpoint handshake fire at a WALLTIME
+# boundary as well as on preemption; B: sends it to the batch shell so the trap
+# runs instead of the signal going straight to mdrun.
+basic_scheduler_fstrings_mps = {
+    "slurm": inspect.cleandoc("""#!/bin/bash
+                #SBATCH -J {job_name}
+                #SBATCH -e slurm.out
+                #SBATCH -o slurm.out
+                {gpu_line}
+                #SBATCH -p {queue_name}
+                #SBATCH --cpus-per-task={cpus}
+                #SBATCH --signal=B:TERM@120
+                {exclude_nodes}
+
+                echo "JOB_NAME: {job_name}"
+                echo "SLURM_JOB_ID: $SLURM_JOB_ID"
+                echo "NODE: $SLURMD_NODENAME"
+                echo "GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | paste -sd, -)"
+
+                # Per-job MPS daemon. Keyed on the job id so two packed jobs on
+                # one node never share or clobber each other's daemon.
+                export CUDA_MPS_PIPE_DIRECTORY="/tmp/mps-$USER-$SLURM_JOB_ID/pipe"
+                export CUDA_MPS_LOG_DIRECTORY="/tmp/mps-$USER-$SLURM_JOB_ID/log"
+                mkdir -p "$CUDA_MPS_PIPE_DIRECTORY" "$CUDA_MPS_LOG_DIRECTORY"
+                if nvidia-cuda-mps-control -d; then
+                    echo "MPS: daemon started ($CUDA_MPS_PIPE_DIRECTORY)"
+                else
+                    echo "MPS: WARNING daemon FAILED to start; replicas will time-slice the GPU at 10-20% worse throughput."
+                fi
+
+                stop_mps() {{
+                    echo quit | nvidia-cuda-mps-control 2>/dev/null || true
+                    rm -rf "/tmp/mps-$USER-$SLURM_JOB_ID"
+                }}
+                preempt_handler() {{ touch PREEMPT_SIGTERM; sleep 70; }}
+                trap preempt_handler SIGTERM
+                trap stop_mps EXIT
+
+                python {run_script_name} &
+                wait
+                """)
+}
+
 # Basic report to print _only_ a list of job ids associated to this runner.
 # Should have 'title' fstring target somewhere to purify spurious jobids.
 # update_jids calls:

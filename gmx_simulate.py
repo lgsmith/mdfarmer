@@ -303,28 +303,107 @@ def read_gen_status(gen_dir, gen_status_name=GEN_STATUS_NAME):
         return None
 
 
-def _run_mdrun(cmd, cwd, handle_preempt, poll_seconds=PREEMPT_POLL_SECONDS):
+class MdrunFleet:
+    """Shared stop-signal for a group of mdruns running in one job.
+
+    When K replicas are packed onto one GPU under MPS, the preempt/walltime
+    handshake has to reach ALL of them and wait for ALL to checkpoint -- this is
+    the code path that protects trajectory contiguity, so a replica that misses
+    the signal loses work that a single-replica job would have kept. One watcher
+    polls the sentinel and fans SIGTERM out to every registered process, rather
+    than each replica polling independently and racing.
+    """
+
+    def __init__(self, sentinel_path, poll_seconds=PREEMPT_POLL_SECONDS):
+        import threading
+        self.sentinel = Path(sentinel_path)
+        self.poll_seconds = poll_seconds
+        self._procs = {}
+        self._lock = threading.Lock()
+        self._stopping = threading.Event()
+
+    def clear_sentinel(self):
+        if self.sentinel.exists():
+            self.sentinel.unlink()
+
+    def register(self, key, proc):
+        with self._lock:
+            self._procs[key] = proc
+            # A replica that starts after the signal already fired still has to
+            # be told, or it would run on alone until walltime kills it hard.
+            if self._stopping.is_set():
+                proc.send_signal(signal.SIGTERM)
+
+    def unregister(self, key):
+        with self._lock:
+            self._procs.pop(key, None)
+
+    @property
+    def stopping(self):
+        return self._stopping.is_set()
+
+    def poll_and_signal(self):
+        """True once the sentinel has been seen and everyone has been told."""
+        if self._stopping.is_set():
+            return True
+        if not self.sentinel.is_file():
+            return False
+        self._stopping.set()
+        with self._lock:
+            targets = list(self._procs.items())
+        print(f'[gmx] preempt sentinel seen; SIGTERM -> {len(targets)} mdrun(s) '
+              '(each writes a final checkpoint and stops).', flush=True)
+        for key, proc in targets:
+            try:
+                proc.send_signal(signal.SIGTERM)
+            except ProcessLookupError:
+                pass                      # already exited on its own
+        return True
+
+
+def _run_mdrun(cmd, cwd, handle_preempt, poll_seconds=PREEMPT_POLL_SECONDS,
+               fleet=None, fleet_key=None):
     """Run mdrun; if handle_preempt, watch for the preempt sentinel and forward
-    SIGTERM to mdrun (which writes a checkpoint) before raising Preempted."""
+    SIGTERM to mdrun (which writes a checkpoint) before raising Preempted.
+
+    With a `fleet`, the sentinel is watched by whoever owns the fleet and this
+    call only registers its process and reports whether the stop was signalled.
+    """
     cwd = Path(cwd)
     sentinel = cwd / PREEMPT_SENTINEL_NAME
-    # Clear a stale sentinel from a previous preempted attempt in this gen dir.
-    if handle_preempt and sentinel.exists():
+    if fleet is None and handle_preempt and sentinel.exists():
+        # Clear a stale sentinel from a previous preempted attempt in this gen
+        # dir. With a fleet the owner does this once, before any member starts.
         sentinel.unlink()
     print('[gmx mdrun]', ' '.join(map(str, cmd)), flush=True)
     proc = sp.Popen([str(c) for c in cmd], cwd=str(cwd), text=True)
-    while True:
-        try:
-            rc = proc.wait(timeout=poll_seconds if handle_preempt else None)
-        except sp.TimeoutExpired:
-            if handle_preempt and sentinel.is_file():
-                print('[gmx] preempt sentinel seen; SIGTERM -> mdrun '
-                      '(it will write a final checkpoint and stop).', flush=True)
-                proc.send_signal(signal.SIGTERM)
-                proc.wait()  # mdrun stops at next NS step and checkpoints
-                raise Preempted(f'preempt sentinel at {sentinel}')
-            continue
-        break
+    if fleet is not None:
+        fleet.register(fleet_key, proc)
+    try:
+        while True:
+            try:
+                watching = handle_preempt or fleet is not None
+                rc = proc.wait(timeout=poll_seconds if watching else None)
+            except sp.TimeoutExpired:
+                if fleet is not None:
+                    # The fleet owner signals; just keep waiting for our exit.
+                    continue
+                if handle_preempt and sentinel.is_file():
+                    print('[gmx] preempt sentinel seen; SIGTERM -> mdrun '
+                          '(it will write a final checkpoint and stop).',
+                          flush=True)
+                    proc.send_signal(signal.SIGTERM)
+                    proc.wait()  # mdrun stops at next NS step and checkpoints
+                    raise Preempted(f'preempt sentinel at {sentinel}')
+                continue
+            break
+    finally:
+        if fleet is not None:
+            fleet.unregister(fleet_key)
+    if fleet is not None and fleet.stopping:
+        # mdrun exits 0 after a clean SIGTERM stop, so the exit code alone
+        # cannot distinguish "preempted" from "finished".
+        raise Preempted(f'preempt sentinel at {fleet.sentinel}')
     if rc != 0:
         raise RuntimeError(f'gmx mdrun exited {rc}')
 
@@ -376,6 +455,13 @@ def gmx_generation(traj_dir_top_level: str,
                    tpr_name: str = TPR_NAME,
                    seed_cpt_name: str = SEED_CPT_NAME,
                    gen_status_name: str = GEN_STATUS_NAME,
+                   # Shared stop-signal when several generations run in one
+                   # job (MPS packing); None for a solo generation.
+                   fleet=None,
+                   fleet_key=None,
+                   # Held while the tpr is built. grompp is cheap but K of them
+                   # at once just contend for cores at job startup.
+                   grompp_lock=None,
                    **_unused):
     steps_per_gen = int(steps_per_gen if steps_per_gen is not None else steps)
     if steps_per_gen % write_interval:
@@ -410,40 +496,16 @@ def gmx_generation(traj_dir_top_level: str,
 
     # ------------------------------- build the tpr --------------------------
     if not tpr.is_file():
-        if gen_index == 0 or new_velocities:
-            mdp_fn = mdp_fn or system_fn
-            if mdp_fn is None:
-                raise ValueError(
-                    'gmx_generation needs an .mdp via mdp_fn (or system_fn) to '
-                    'build generation 0.')
-            if structure_fn is None:
-                raise ValueError(
-                    'gmx_generation needs structure_fn (the .gro for grompp -c).')
-            gen_mdp = gen_dir / 'gen.mdp'
-            write_gen_mdp(str(Path(mdp_fn).resolve()), str(gen_mdp),
-                          nsteps=target_step,
-                          nstxout_compressed=write_interval,
-                          gen_vel=True, continuation=False,
-                          gen_seed=gen_seed_base + clone_index,
-                          gen_temp=temperature)
-            grompp = [gmx_bin, 'grompp', '-f', gen_mdp,
-                      '-c', str(Path(structure_fn).resolve()),
-                      '-p', str(Path(top_fn).resolve()),
-                      '-o', tpr, '-po', gen_dir / 'mdout.mdp',
-                      '-maxwarn', grompp_maxwarn]
-            if ndx_fn:
-                grompp += ['-n', str(Path(ndx_fn).resolve())]
-            # grompp runs from the topology's directory so a .top with relative
-            # force-field includes resolves regardless of the gen-dir cwd.
-            _run(grompp, str(Path(top_fn).resolve().parent))
-        else:
-            prev_tpr = _previous_gen_tpr(
-                Path(traj_dir_top_level), seed_index, clone_index, gen_index,
-                dirname_pad, sep, tpr_name)
-            # Extend the step budget rather than rebuilding from the .mdp: this
-            # is what keeps the continuation exact.
-            _run([gmx_bin, 'convert-tpr', '-s', str(prev_tpr),
-                  '-nsteps', str(target_step), '-o', str(tpr)], gen_dir)
+        _build_gen_tpr(
+            tpr=tpr, gen_dir=gen_dir, gen_index=gen_index,
+            new_velocities=new_velocities, target_step=target_step,
+            write_interval=write_interval, mdp_fn=mdp_fn, system_fn=system_fn,
+            structure_fn=structure_fn, top_fn=top_fn, ndx_fn=ndx_fn,
+            temperature=temperature, gen_seed_base=gen_seed_base,
+            clone_index=clone_index, seed_index=seed_index,
+            traj_dir_top_level=traj_dir_top_level, dirname_pad=dirname_pad,
+            sep=sep, tpr_name=tpr_name, gmx_bin=gmx_bin,
+            grompp_maxwarn=grompp_maxwarn, grompp_lock=grompp_lock)
 
     # ------------------------------- run ------------------------------------
     # -cpi must name a checkpoint this run can legitimately continue from: our
@@ -488,7 +550,8 @@ def gmx_generation(traj_dir_top_level: str,
                  '-noappend', *mdrun_args]
         if resume_from is not None:
             mdrun += ['-cpi', str(resume_from)]
-        _run_mdrun(mdrun, gen_dir, handle_preempt)
+        _run_mdrun(mdrun, gen_dir, handle_preempt,
+                   fleet=fleet, fleet_key=fleet_key)
         reached = checkpoint_step(own_cpt, gmx_bin=gmx_bin)
 
     # ------------------------------- assess ---------------------------------
@@ -508,6 +571,59 @@ def gmx_generation(traj_dir_top_level: str,
                      traj_fn=traj)
     print('Done!', flush=True)
     return traj.resolve()
+
+
+def _build_gen_tpr(*, tpr, gen_dir, gen_index, new_velocities, target_step,
+                   write_interval, mdp_fn, system_fn, structure_fn, top_fn,
+                   ndx_fn, temperature, gen_seed_base, clone_index, seed_index,
+                   traj_dir_top_level, dirname_pad, sep, tpr_name, gmx_bin,
+                   grompp_maxwarn, grompp_lock=None):
+    """Build this generation's tpr, holding `grompp_lock` if one was supplied.
+
+    Generation 0 is grompp'd from the .mdp with fresh per-clone velocities.
+    Every later generation is ``convert-tpr``'d from its predecessor, extending
+    the cumulative step budget -- that inheritance is what makes the
+    continuation exact, since the parameters (and, via ``-cpi``, the coupling
+    state) are carried rather than rebuilt.
+    """
+    import contextlib
+    guard = grompp_lock if grompp_lock is not None else contextlib.nullcontext()
+    with guard:
+        if tpr.is_file():
+            return tpr                    # another replica may have won the race
+        if gen_index == 0 or new_velocities:
+            mdp_fn = mdp_fn or system_fn
+            if mdp_fn is None:
+                raise ValueError(
+                    'gmx_generation needs an .mdp via mdp_fn (or system_fn) to '
+                    'build generation 0.')
+            if structure_fn is None:
+                raise ValueError(
+                    'gmx_generation needs structure_fn (the .gro for grompp -c).')
+            gen_mdp = gen_dir / 'gen.mdp'
+            write_gen_mdp(str(Path(mdp_fn).resolve()), str(gen_mdp),
+                          nsteps=target_step,
+                          nstxout_compressed=write_interval,
+                          gen_vel=True, continuation=False,
+                          gen_seed=gen_seed_base + clone_index,
+                          gen_temp=temperature)
+            grompp = [gmx_bin, 'grompp', '-f', gen_mdp,
+                      '-c', str(Path(structure_fn).resolve()),
+                      '-p', str(Path(top_fn).resolve()),
+                      '-o', tpr, '-po', gen_dir / 'mdout.mdp',
+                      '-maxwarn', grompp_maxwarn]
+            if ndx_fn:
+                grompp += ['-n', str(Path(ndx_fn).resolve())]
+            # grompp runs from the topology's directory so a .top with relative
+            # force-field includes resolves regardless of the gen-dir cwd.
+            _run(grompp, str(Path(top_fn).resolve().parent))
+        else:
+            prev_tpr = _previous_gen_tpr(
+                Path(traj_dir_top_level), seed_index, clone_index, gen_index,
+                dirname_pad, sep, tpr_name)
+            _run([gmx_bin, 'convert-tpr', '-s', str(prev_tpr),
+                  '-nsteps', str(target_step), '-o', str(tpr)], gen_dir)
+    return tpr
 
 
 def _previous_gen_tpr(top_level, seed_index, clone_index, gen_index,

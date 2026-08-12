@@ -577,11 +577,21 @@ class Clone:
                   self.restart_attempts, 'times. Aborting this clone.')
             return False
 
-    def start_current(self, overwrite=False, count_as_restart=True):
+    def start_current(self, overwrite=False, count_as_restart=True,
+                      submit=True):
+        """Prepare this generation's launch, and (unless `submit` is False)
+        submit it.
+
+        `submit=False` is what lets a ClonePack do every member's preparation --
+        gen directory, seed copy, config.json, run script -- and then send a
+        single sbatch for the whole pack.
+        """
         should_launch = self.plow_harrow_plant(
             overwrite=overwrite, count_as_restart=count_as_restart)
         print(self.get_tag(), 'should_launch',
               should_launch, 'dry_run', self.dry_run)
+        if not submit:
+            return should_launch
         if should_launch and not self.dry_run:
             print('launching', self.get_tag())
             # SIMULATION RUNS HERE. OUTPUT SCANNED FOR JOB NUMBER.
@@ -612,7 +622,7 @@ class Clone:
             print('Started:', self.get_tag())
         return should_launch
 
-    def start_next(self, overwrite=False):
+    def start_next(self, overwrite=False, submit=True):
         # Set seed to be current restart file, but full path so it will be found in next gen dir.
         new_seed = self.current_gen_dir/self.config['restart_name']
         self.set_seed(new_seed.resolve())
@@ -631,7 +641,8 @@ class Clone:
         # because we want to start next, increment the gen before building
         self.config['gen_index'] += 1
         self.current_gen += 1
-        attempted_launch = self.start_current(overwrite=overwrite)
+        attempted_launch = self.start_current(overwrite=overwrite,
+                                              submit=submit)
         return attempted_launch
 
     # How many steps this generation still owes. Engine-specific when a
@@ -659,7 +670,8 @@ class Clone:
             self.config['write_interval'])
 
     # Returns false if launch not attempted because of too many restart attempts
-    def check_start_gen(self, scheduler_report: set, overwrite=False):
+    def check_start_gen(self, scheduler_report: set, overwrite=False,
+                        submit=True):
         if self.job_number in scheduler_report:
             print('Job', self.job_number, 'still running',
                   self.job_name_fstring.format(**self.config))
@@ -696,7 +708,7 @@ class Clone:
                     # simulation campaign from advancing.
                     print(f'harvester failed for {self.get_tag()}: '
                           f'{type(exc).__name__}: {exc}; continuing.')
-            return self.start_next(overwrite=overwrite)
+            return self.start_next(overwrite=overwrite, submit=submit)
 
         if self.remaining_steps >= self.total_steps:
             # Nothing ran. Last chance to scan the failing job's scheduler log
@@ -721,11 +733,148 @@ class Clone:
             self.config['steps'] = self.total_steps
             self.config['append'] = False
             return self.start_current(
-                overwrite=overwrite, count_as_restart=count_as_restart)
+                overwrite=overwrite, count_as_restart=count_as_restart,
+                submit=submit)
 
         # Partially run: continue it.
         self.config['steps'] = self.remaining_steps
         self.config['append'] = True
         self.check_copy_set_restart_seed()
         return self.start_current(
-            overwrite=overwrite, count_as_restart=count_as_restart)
+            overwrite=overwrite, count_as_restart=count_as_restart,
+            submit=submit)
+
+
+class ClonePack:
+    """K Clones that share one GPU, one sbatch job, and one generation step.
+
+    The cluster's Slurm exposes only a `gpu` gres -- no `mps`, no `shard` -- so
+    it cannot co-schedule two independent jobs onto one card. Packing therefore
+    has to happen inside a single job, which is a level above `Clone`: each
+    member does everything `check_start_gen` does *except* submit, and then the
+    pack submits once for all of them.
+
+    `Clone` is deliberately untouched by this. The pack drives members through
+    the same code path a solo clone uses (`check_start_gen(..., submit=False)`),
+    so a packed generation and a solo generation prepare identically -- only the
+    submission is shared.
+
+    Members must come from ONE condition and system, with identical `steps`:
+    the job holds the card until its slowest member finishes, so mismatched
+    per-step costs waste GPU time, and packing across conditions would let one
+    bad job damage two datasets at once.
+    """
+
+    def __init__(self, clones, pack_dir, scheduler, scheduler_fstring,
+                 scheduler_kws, run_script, cpus_per_task,
+                 job_name_fstring=None, job_number_re='[1-9][0-9]*',
+                 job_number=None, dry_run=False,
+                 pack_manifest_name='pack.json',
+                 run_script_name='run.py'):
+        if not clones:
+            raise ValueError('a ClonePack needs at least one Clone')
+        steps = {c.total_steps for c in clones}
+        if len(steps) != 1:
+            raise ValueError(
+                f'pack members must all run the same number of steps per '
+                f'generation (got {sorted(steps)}); a shorter member would '
+                'leave the card idle waiting for the longer one, and variable '
+                'generation lengths complicate the contiguity bookkeeping.')
+        self.clones = list(clones)
+        self.pack_dir = Path(pack_dir)
+        self.pack_dir.mkdir(parents=True, exist_ok=True)
+        self.scheduler = scheduler
+        self.scheduler_fstring = inspect.cleandoc(scheduler_fstring)
+        self.scheduler_kws = dict(scheduler_kws)
+        self.scheduler_kws.setdefault('run_script_name', run_script_name)
+        self.scheduler_kws['cpus'] = cpus_per_task
+        self.run_script = run_script
+        self.run_script_name = run_script_name
+        self.cpus_per_task = int(cpus_per_task)
+        self.pack_manifest_name = pack_manifest_name
+        self.job_number = job_number
+        self.job_number_re = re.compile(job_number_re)
+        self.job_name_fstring = job_name_fstring or '{title}-pack-{seed_index}-{clone_index}'
+        self.dry_run = dry_run
+
+    @property
+    def current_gen(self):
+        # The pack advances together, so the laggard defines where it is.
+        return min(c.current_gen for c in self.clones)
+
+    def get_tag(self):
+        return 'pack[' + ' | '.join(c.get_tag() for c in self.clones) + ']'
+
+    def __hash__(self):
+        return hash(tuple(hash(c) for c in self.clones))
+
+    def __eq__(self, other):
+        return isinstance(other, ClonePack) and hash(self) == hash(other)
+
+    def _job_name(self):
+        head = dict(self.clones[0].config)
+        return self.job_name_fstring.format(**head)
+
+    def check_start_gen(self, scheduler_report: set, overwrite=False):
+        """Advance every member, then submit one job for the pack."""
+        if self.job_number in scheduler_report:
+            print('Pack job', self.job_number, 'still running', self._job_name())
+            return True
+
+        prepared, member_configs = [], []
+        for clone in self.clones:
+            try:
+                ok = clone.check_start_gen(scheduler_report,
+                                           overwrite=overwrite, submit=False)
+            except Exception as exc:
+                print(f'ERROR preparing pack member {clone.get_tag()}: '
+                      f'{type(exc).__name__}: {exc}')
+                ok = False
+            prepared.append(ok)
+            if ok:
+                member_configs.append(clone.current_gen_dir / 'config.json')
+        if not any(prepared):
+            print(f'{self.get_tag()}: no member could be prepared; failing pack.')
+            return False
+        if not all(prepared):
+            # Relaunch the pack with the members that are still healthy rather
+            # than shrinking it permanently: a shrunk pack leaves the card
+            # underpacked for the rest of the campaign.
+            print(f'{self.get_tag()}: {prepared.count(False)} of '
+                  f'{len(prepared)} members could not be prepared; launching '
+                  'the rest.')
+
+        from . import gmx_pack
+        gmx_pack.write_pack_manifest(
+            self.pack_dir, member_configs, cpus_per_task=self.cpus_per_task,
+            reps_per_card=len(member_configs),
+            pack_manifest_name=self.pack_manifest_name)
+        (self.pack_dir / self.run_script_name).write_text(self.run_script)
+        script_p = (self.pack_dir / self.scheduler).with_suffix('.sh')
+        script_p.write_text(self.scheduler_fstring.format(
+            job_name=self._job_name(), **self.scheduler_kws))
+
+        if self.dry_run:
+            print(f'{self.get_tag()}: dry run, wrote {script_p} and manifest.')
+            return True
+
+        with script_p.open() as f:
+            result = sp.run(self.scheduler, stdin=f, cwd=self.pack_dir,
+                            text=True, capture_output=True)
+        if result.returncode != 0:
+            print(f'{self.scheduler} call for {self.get_tag()} returned '
+                  f'exit code {result.returncode}')
+            print('  stdout:', result.stdout)
+            print('  stderr:', result.stderr)
+            return False
+        match = self.job_number_re.search(result.stdout)
+        if match is None:
+            print(f'could not parse a job number from {result.stdout!r}')
+            return False
+        self.job_number = int(match.group(0))
+        # Every member answers to the pack's job id, so the Farmer's
+        # still-running check works per member as well as per pack.
+        for clone in self.clones:
+            clone.job_number = self.job_number
+        print('Started pack:', self.get_tag(), 'as job', self.job_number)
+        return True
