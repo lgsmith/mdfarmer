@@ -31,46 +31,71 @@ def read_openmm_top(top_fn):
     return topology
 
 
+# Frame counting. mdtraj.open(...) returns a format-specific file handle
+# (DCD/XTC) whose __len__ reports the frame count without loading coordinates,
+# and -- importantly -- without needing a topology at all. LOOS is used only as
+# a fallback, because loos.createSystem() cannot read the one topology format a
+# GROMACS run actually has:
+#
+#     >>> loos.createSystem('topol.top')
+#     RuntimeError: Error- unknown system file type 'top'
+#
+# That RuntimeError is not a loos.LOOSError, so it escaped the except clause
+# below, propagated out of calx_remaining_steps, and killed the Farmer process
+# on its first tick of any GROMACS run in an environment where LOOS imports --
+# which is every environment where the reimaging tools are installed.
+try:
+    import mdtraj as _mdtraj
+except ImportError:
+    _mdtraj = None
+
 try:
     import loos
     from loos import pyloos
-
-    def get_traj_len(traj_fn, top_fn):
-        if Path(traj_fn).stat().st_size == 0:
-            length = 0
-        else:
-            m = loos.createSystem(top_fn)
-            try:
-                t = pyloos.Trajectory(traj_fn, m)
-                length = len(t)
-            except loos.LOOSError:
-                # Catches FileReadError plus the broader "Error while
-                # reading first frame" raised when a DCD has a valid
-                # header but zero frame bytes (e.g. the 276-byte
-                # velocities.dcd left behind by the nm/ps units bug).
-                print('Assumming empty file; cannot read:', traj_fn)
-                length = 0
-        return length
-
-
 except ImportError:
-    print('LOOS not in import path; falling back to MDTraj.')
-    import mdtraj
+    loos = None
+    pyloos = None
 
-    # mdtraj.open(...) returns a format-specific file handle (DCD/XTC) whose
-    # __len__ reports frame count without loading coordinates. Avoids the
-    # mdtraj.load(...) round-trip that materialized the whole traj just to
-    # measure it -- which was prohibitive for mature datasets.
-    def get_traj_len(traj_fn, top_fn):
-        if Path(traj_fn).stat().st_size == 0:
-            return 0
+if _mdtraj is None and loos is None:
+    print('Neither mdtraj nor LOOS is importable; frame counting will fail.')
+
+
+def _traj_len_mdtraj(traj_fn):
+    with _mdtraj.open(str(traj_fn)) as fh:
+        return len(fh)
+
+
+def _traj_len_loos(traj_fn, top_fn):
+    model = loos.createSystem(str(top_fn))
+    return len(pyloos.Trajectory(str(traj_fn), model))
+
+
+def get_traj_len(traj_fn, top_fn):
+    """Number of frames in a trajectory, or 0 if it is empty or unreadable.
+
+    `top_fn` is only consulted by the LOOS fallback; the mdtraj path does not
+    need it, which is what makes this work for GROMACS runs whose `top_fn` is a
+    `.top`.
+    """
+    traj_p = Path(traj_fn)
+    if not traj_p.is_file() or traj_p.stat().st_size == 0:
+        return 0
+    if _mdtraj is not None:
         try:
-            with mdtraj.open(traj_fn) as fh:
-                return len(fh)
-        except (OSError, ValueError) as exc:
-            print(f'mdtraj.open could not read {traj_fn}: {exc}; '
-                  'treating as empty.')
-            return 0
+            return _traj_len_mdtraj(traj_p)
+        except Exception as exc:
+            print(f'mdtraj could not read {traj_fn}: '
+                  f'{type(exc).__name__}: {exc}; trying LOOS.')
+    if loos is not None:
+        try:
+            return _traj_len_loos(traj_p, top_fn)
+        except Exception as exc:
+            # Deliberately broad: createSystem raises RuntimeError for an
+            # unsupported topology, LOOSError for an unreadable frame, and the
+            # orchestrator must survive both.
+            print(f'LOOS could not read {traj_fn} with topology {top_fn}: '
+                  f'{type(exc).__name__}: {exc}; treating as empty.')
+    return 0
 
 
 """
@@ -208,8 +233,14 @@ basic_scheduler_fstrings = {
 
                 python {run_script_name}
                 """),
-    "slurm": inspect.cleandoc("""
-                #SBATCH -j {job_name}
+    # -J (not -j) is sbatch's job-name flag; -j is not an sbatch option at all,
+    # so the old template was rejected outright. The shebang matters too: with
+    # no interpreter line the job runs under the submitting user's login shell.
+    # {exclude_nodes} expands to '' when nothing is blocked, and a bare blank
+    # line is fine -- Slurm stops scanning #SBATCH directives at the first
+    # non-comment, non-blank line, so keep all directives above the echoes.
+    "slurm": inspect.cleandoc("""#!/bin/bash
+                #SBATCH -J {job_name}
                 #SBATCH -e slurm.out
                 #SBATCH -o slurm.out
                 {gpu_line}
@@ -249,12 +280,17 @@ basic_scheduler_fstrings_preempt = {
                 python {run_script_name} &
                 wait
                 """),
-    "slurm": inspect.cleandoc("""
-                #SBATCH -j {job_name}
+    # --signal=B:TERM@120 is what makes this fire on a WALLTIME boundary as well
+    # as on preemption: without it Slurm only signals at the very end of the
+    # allocation, leaving no time to checkpoint. B: targets the batch shell, so
+    # the trap below runs rather than the signal going straight to mdrun.
+    "slurm": inspect.cleandoc("""#!/bin/bash
+                #SBATCH -J {job_name}
                 #SBATCH -e slurm.out
                 #SBATCH -o slurm.out
                 {gpu_line}
                 #SBATCH -p {queue_name}
+                #SBATCH --signal=B:TERM@120
                 {exclude_nodes}
 
                 echo "JOB_NAME: {job_name}"

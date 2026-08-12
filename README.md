@@ -148,6 +148,66 @@ There are two modes of analysis with this type of dataset. If you have fewer clo
 
 We're hoping to add some scripts for both modes of analysis--mostly these will be simple functions that just use the configurations you've given for the farmer and or the structure of the data-set tree to provide you with lists of trajectories that might be useful, such as a nested list of file-paths that follows the overall structure of the tree. If you're writing functions like this yourself, note that python's `glob` and `iterdir` functionalities provide sub-paths in no particular order. The reason the directory names are padded is so that the built-in `sorted` will 'just work' with a semantic sort on the file names, but you do have to bother to use sorted if you're writing your own iterator and you want the order to be 1. the same and 2. for the generations to be sequential each time you read the files. Note that the top level file titled `traj_list.txt` records the trajectory paths in the order they are produced, which could be good for some things like a function that surveys how much data has been collected thus far, but is probably not what you want for most analysis.
 
+### Reimaging (making molecules whole again)
+
+GROMACS writes whatever coordinates the integrator is holding, and it wraps
+atoms into the box as it goes. Molecules that straddle a boundary come out
+**split**, and there is no avoiding it — it is fundamental to how the engine
+stores coordinates. On a real trp-cage system deliberately positioned across a
+box face, the raw `.xtc` had 214 bonds longer than 2.5 Å, the worst of them
+4.7 nm — a whole box length. Anything you compute per molecule on that
+trajectory (R_g, RMSD, contacts, a picture) is wrong.
+
+`mdfarmer.reimage` fixes this, with two backends chosen by the unit cell:
+
+```python
+from mdfarmer import reimage
+
+# picks the backend from the box actually recorded in the trajectory
+reimage.reimage_trajectory('prod.xtc', structure_fn='start.gro',
+                           top_fn='topol.top', tpr_fn='prod.tpr')
+# -> prod-whole.xtc   (the raw prod.xtc is never touched)
+```
+
+* **`'loos'` — orthorhombic ("box") cells only.** LOOS's periodic box is three
+  numbers, and its readers keep only the diagonal of a triclinic box *without
+  raising* — hand it a rhombic dodecahedron and it reports a rectangular cell
+  and every minimum-image result downstream is quietly wrong. So this backend
+  refuses a non-orthorhombic cell rather than producing plausible garbage.
+* **`'trjconv'` — any cell, and the only option for triclinic.** Shells out to
+  `gmx trjconv -pbc mol -ur compact`, which needs the run's `.tpr` because that
+  is where molecule definitions live.
+
+Two things worth knowing:
+
+**Molecule membership never comes from the structure file.** A `.gro` carries no
+bonds, and a bondless LOOS model makes `splitByMolecule()` return *one group
+containing the whole system* — reimaging then degenerates into a single global
+translation that looks like it worked. Bonds alone are not enough either: a
+TIP4P-ice virtual site is bonded to nothing, so connected components over bonds
+strand every `MW` in its own "molecule". Molecule blocks are therefore read from
+the GROMACS `.top` through `openmm.app.GromacsTopFile`, whose chains reproduce
+the `[ molecules ]` section exactly.
+
+**Reimaging is checked, not trusted.** There are many ways imaging-by-atom goes
+wrong quietly, so the LOOS backend verifies its own output against a physical
+invariant — bond lengths, computed *without* the minimum-image convention,
+against LOOS's `long-bond-finder` cutoff of 2.5 Å — and raises if any bond is
+still overlong. You can run the same checks yourself:
+
+```python
+n_bad, violations = reimage.check_bond_lengths('prod-whole.xtc', top_fn='topol.top')
+margin = reimage.check_anchor_distances('prod-whole.xtc', ranges)
+```
+
+`check_anchor_distances` reports the one thing that limits the LOOS backend:
+`mergeImage()` minimum-images every atom against its molecule's *first* atom, so
+it is only correct while no atom is more than half a box edge from that anchor.
+Folded trp-cage in a 4.67 nm box already uses **89%** of that margin — an
+extended conformation will exceed it, at which point the LOOS backend is outside
+its safe regime and you want `backend='trjconv'`, which walks the bond graph
+instead. The check reports the margin as a fraction so you can watch it.
+
 ## AI assistance
 
 Parts of this codebase have been developed with assistance from Anthropic's Claude (Opus 4.x family). Individual commits are not tagged with `Co-Authored-By` trailers; this section is the project-level attribution.

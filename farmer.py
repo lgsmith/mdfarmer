@@ -1,8 +1,10 @@
 import subprocess as sp
+import traceback
 from . import utilities as util
 from pathlib import Path
 from . import seeder
 from . import simulate as sims
+from . import gmx_simulate as gmx
 import time
 
 
@@ -14,16 +16,38 @@ class Farmer:
                  'quiet', 'sep', 'dirname_pad', 'seed_state_fns', 'scheduler',
                  'scheduler_report_cmd', 'scheduler_fstring', 'scheduler_kws',
                  'scheduler_assoc_rep_cmd', 'system_fns', 'top_fns',
-                 'node_blocklist', 'run_script', 'recover_fn')
+                 'node_blocklist', 'run_script', 'recover_fn', 'progress_fn')
 
+    # Refresh the set of job ids the scheduler says are ours and alive.
+    #
+    # Returns False when the query could not be trusted, in which case
+    # current_jids is left ALONE. That distinction is the whole point: the
+    # report command is a pipeline ending in awk, so a squeue that times out or
+    # errors still exits 0 through the pipe and prints nothing. Treating that
+    # empty output as "no jobs are running" made the Farmer relaunch every live
+    # clone, putting two mdruns in one generation directory. pipefail makes the
+    # pipeline inherit squeue's failure instead.
     def update_jids(self):
-        jids_string = sp.check_output(
-            self.scheduler_report_cmd,
-            shell=True, text=True,
-            executable='/bin/bash').strip()
+        try:
+            jids_string = sp.check_output(
+                f'set -o pipefail; {self.scheduler_report_cmd}',
+                shell=True, text=True,
+                executable='/bin/bash').strip()
+        except sp.CalledProcessError as exc:
+            print(f'WARNING: scheduler query failed (exit {exc.returncode}); '
+                  f'keeping the previous {len(self.current_jids)} job ids and '
+                  f'skipping this tick rather than relaunching live jobs.')
+            return False
         print(f'jids_string:\n{jids_string}')
-        self.current_jids = set(map(int, jids_string.split()))
+        try:
+            jids = set(map(int, jids_string.split()))
+        except ValueError:
+            print(f'WARNING: could not parse job ids from scheduler output '
+                  f'{jids_string!r}; keeping the previous set.')
+            return False
+        self.current_jids = jids
         self.jids_file.write_text(jids_string)
+        return True
 
     def check_path(self, p: Path):
         if p.is_file():
@@ -82,6 +106,7 @@ class Farmer:
                 rep_dict=rep_dict,
                 run_script=self.run_script,
                 recover_fn=self.recover_fn,
+                progress_fn=self.progress_fn,
                 dry_run=self.dry_run,
             )
         except Exception as exc:
@@ -124,6 +149,10 @@ class Farmer:
                  # OpenMM seeder._try_recover_gen. For GROMACS pass
                  # gmx_simulate.gmx_try_recover_gen.
                  recover_fn=None,
+                 # How a Clone measures a generation's progress. None -> infer
+                 # from the trajectory's frame count (correct for the OpenMM
+                 # reporters). GROMACS needs gmx_simulate.gmx_gen_progress.
+                 progress_fn=None,
                  dry_run=False,
                  # If True, expect the scheduler_fstring to install a SIGTERM
                  # trap that touches a sentinel file (see
@@ -153,9 +182,43 @@ class Farmer:
                            for p in system_fns]
         self.top_fns = [str(self.check_path(Path(p)).resolve())
                         for p in top_fns]
+        # Engine selection. `runner` used to be stored and never read -- the
+        # engine was actually chosen by the run_script TEXT written into each
+        # gen dir, so passing runner=gmx_generation and forgetting run_script
+        # silently ran OpenMM. Now runner picks the matching defaults, and a
+        # mismatched hand-supplied set is refused rather than half-applied.
         self.runner = runner
         self.run_script = run_script
         self.recover_fn = recover_fn
+        self.progress_fn = progress_fn
+        if runner is gmx.gmx_generation:
+            if self.run_script is None:
+                self.run_script = gmx.default_gmx_run_script
+            if self.recover_fn is None:
+                self.recover_fn = gmx.gmx_try_recover_gen
+            if self.progress_fn is None:
+                self.progress_fn = gmx.gmx_gen_progress
+            mismatched = [
+                name for name, got, want in (
+                    ('run_script', self.run_script, gmx.default_gmx_run_script),
+                    ('recover_fn', self.recover_fn, gmx.gmx_try_recover_gen),
+                    ('progress_fn', self.progress_fn, gmx.gmx_gen_progress))
+                if got is not want]
+            if mismatched:
+                print(f'NOTE: runner=gmx_generation with custom {mismatched}; '
+                      'make sure they implement the GROMACS contract.')
+        elif runner is sims.omm_generation:
+            for name, value in (('run_script', self.run_script),
+                                ('recover_fn', self.recover_fn),
+                                ('progress_fn', self.progress_fn)):
+                if value is not None and value in (
+                        gmx.default_gmx_run_script, gmx.gmx_try_recover_gen,
+                        gmx.gmx_gen_progress):
+                    raise ValueError(
+                        f'runner is the OpenMM omm_generation but {name} is the '
+                        'GROMACS one. Pass runner=gmx_generation for a GROMACS '
+                        'campaign; mixing them runs one engine with the '
+                        "other's recovery logic.")
         self.seeds_first = seeds_first
         self.scheduler = scheduler
         self.scheduler_kws = scheduler_kws
@@ -268,7 +331,13 @@ class Farmer:
                 continue
             self.current_jids.add(jid)
             try:
-                six, cix, gix = map(int, ls[1].split(self.sep)[1:])
+                # The last THREE fields, not everything after the first: the
+                # title sits in front and may itself contain the separator
+                # (a title like 'trpcage-native-277' with sep='-' produced five
+                # fields, the unpack raised, and the running job was never bound
+                # to its Clone -- so the Farmer launched a second job into the
+                # live generation directory).
+                six, cix, gix = map(int, ls[1].split(self.sep)[-3:])
                 rep_dict[(six, cix, gix)] = jid
             except (ValueError, IndexError):
                 # Job name doesn't fit our seed-clone-gen suffix scheme;
@@ -297,10 +366,28 @@ class Farmer:
                     clone_queue.append(clone)
             self.priority_ordered_clones.append(clone_queue)
 
+    # check_start_gen touches the filesystem, the scheduler and (for GROMACS)
+    # the gmx binary, any of which can raise. Before this, a single raised
+    # exception anywhere in the tending loop killed the whole multi-week
+    # orchestrator process and left every running job unminded.
+    def _safe_check_start_gen(self, clone):
+        try:
+            return clone.check_start_gen(
+                self.current_jids, overwrite=self.overwrite)
+        except Exception as exc:
+            print(f'ERROR advancing clone {clone.get_tag()}: '
+                  f'{type(exc).__name__}: {exc}')
+            traceback.print_exc()
+            return False
+
     def launch(self, sleep=None, update_jids=True):
         still_running = []  # note, this will be flat
-        if update_jids:
-            self.update_jids()
+        if update_jids and not self.update_jids():
+            # Scheduler unreachable. Every clone we know about is presumed to
+            # still be doing whatever it was doing; try again next tick rather
+            # than making launch decisions on evidence we do not have.
+            return [True] * max(1, sum(len(cl) for cl in
+                                       self.priority_ordered_clones))
         for clone_list in self.priority_ordered_clones:
             # Record one False for a fully emptied clone-list
             if not clone_list:
@@ -326,9 +413,11 @@ class Farmer:
                     # If clone is in active set, it may have just finished a generation.
                     elif clone in self.active_clone_set:
                         print('clone is in active clone list')
-                        # Try to start another.
-                        did_start = clone.check_start_gen(
-                            self.current_jids, overwrite=self.overwrite)
+                        # Try to start another. One clone's bad disk state,
+                        # unreadable checkpoint or failed submission must not
+                        # take down an orchestrator that is minding hundreds of
+                        # others for weeks -- fail just this clone.
+                        did_start = self._safe_check_start_gen(clone)
                         if did_start:
                             still_running.append(True)
                         else:
@@ -342,7 +431,7 @@ class Farmer:
                         print(
                             'there are some more active clones, let us launch', clone.get_tag())
                         #  So we try to launch another.
-                        if clone.check_start_gen(self.current_jids, overwrite=self.overwrite):
+                        if self._safe_check_start_gen(clone):
                             print('started clone, adding to active_clone_set')
                             self.active_clone_set.add(clone)
                             still_running.append(True)
@@ -363,6 +452,16 @@ class Farmer:
     # if you'd just like a 'minder' process to start all your sims and keep them
     # running until they've gotten through all the generations.
     def start_tending_fields(self, update_interval=120):
+        if not self.priority_ordered_clones or not any(
+                self.priority_ordered_clones):
+            # Every clone failed to build. _setup_one_clone deliberately
+            # isolates per-clone setup failures, but "all of them failed" must
+            # not read as "the campaign is done" -- that returned success having
+            # launched nothing at all.
+            raise RuntimeError(
+                'No clones could be set up; nothing to tend. Check the '
+                'per-clone setup errors printed above (missing structure, '
+                'topology, .mdp, or an unreadable checkpoint).')
         still_running = self.launch(sleep=None, update_jids=False)
         brake_file_p = Path('stop')
         # this needs to be while all(list of T/F for completed seeds/clones)
@@ -378,13 +477,29 @@ class Farmer:
                     f'Brake file detected: {brake_file_p.resolve()} Stopping submission loop.')
                 return False
             time.sleep(update_interval)
-            still_running = self.launch(sleep=None)
+            # The loop itself must outlive anything transient -- a scheduler
+            # hiccup, an NFS stall, a harvester blowing up. Losing the tender
+            # mid-campaign leaves every running job unminded and every finished
+            # generation unadvanced, which is the expensive failure here.
+            try:
+                still_running = self.launch(sleep=None)
+            except Exception as exc:
+                print(f'ERROR in tending loop: {type(exc).__name__}: {exc}')
+                traceback.print_exc()
+                print('Continuing; will retry next tick.', flush=True)
+                still_running = [True]
+                continue
             if not self.quiet:
                 print('The following (seed clone gen) are complete:', ', '.join((
                     map(lambda c: c.get_tag(), self.finished_clones))))
             print('STILL RUNNING:', *still_running, flush=True)
-        # If we get here, that means the minder thinks all clones have finished.
-        return True
+        # If we get here, the minder thinks every clone has stopped. That is
+        # only good news if they stopped by finishing.
+        if self.failed_clone_set:
+            print(f'WARNING: {len(self.failed_clone_set)} clone(s) failed and '
+                  f'{len(self.finished_clones)} finished: '
+                  + ', '.join(c.get_tag() for c in self.failed_clone_set))
+        return not self.failed_clone_set
 
 
 # class Adaptive(Farmer):

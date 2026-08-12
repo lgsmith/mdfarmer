@@ -15,6 +15,16 @@ runner('config.json')
 """
 
 
+# Sort key that orders gen directories numerically. Anything that isn't
+# '<prefix><sep><digits>' sorts to the end, keyed by name so the order is still
+# deterministic.
+def _gen_sort_key(path, sep):
+    tail = path.name.rsplit(sep, 1)[-1]
+    if tail.isdigit():
+        return (0, int(tail), '')
+    return (1, 0, path.name)
+
+
 # Examine one gen directory and decide whether it can seed the next launch.
 #
 # Returns (gen_index, seed_fn, steps_to_run, append) on success:
@@ -77,13 +87,30 @@ def _try_recover_gen(gen_path: Path, *,
         # No traj yet for this gen. Start it now from this state.
         return gen_index, seed_fn, total_steps, False
 
-    try:
-        info = util.dcd_header_info(traj_p)
-    except Exception as exc:
-        print(f'_try_recover_gen: bad DCD header at {traj_p}: {exc}; '
-              f'skipping gen.')
-        return None
-    nset, nsavc = info['nset'], info['nsavc']
+    # Frame accounting differs by format. Only DCD exposes a header we can read
+    # (and rewrite) directly; for XTC -- which is the config template's DEFAULT
+    # traj_suffix -- we count frames and cannot truncate, so a trajectory that
+    # has run ahead of its checkpoint has to be redone rather than trimmed.
+    # Demanding a DCD header unconditionally made every .xtc generation look
+    # unrecoverable, cascading each clone all the way back to gen 0 and
+    # overwriting trajectories that were perfectly good.
+    is_dcd = traj_suffix == '.dcd'
+    if is_dcd:
+        try:
+            info = util.dcd_header_info(traj_p)
+        except Exception as exc:
+            print(f'_try_recover_gen: bad DCD header at {traj_p}: {exc}; '
+                  f'skipping gen.')
+            return None
+        nset, nsavc = info['nset'], info['nsavc']
+    else:
+        try:
+            nset = util.get_traj_len(str(traj_p), top_fn)
+        except Exception as exc:
+            print(f'_try_recover_gen: cannot count frames in {traj_p}: '
+                  f'{type(exc).__name__}: {exc}; skipping gen.')
+            return None
+        nsavc = write_interval
     if nset == 0:
         return gen_index, seed_fn, total_steps, False
 
@@ -101,6 +128,15 @@ def _try_recover_gen(gen_path: Path, *,
         # FlushingDCDReporter existed. state.xml's integrator state is
         # intact; advance and let the next gen seed from it.
         return gen_index + 1, seed_fn, total_steps, False
+    if target_nset < nset and not is_dcd:
+        # Trajectory ahead of the checkpoint, and this format cannot be trimmed
+        # in place. Advancing anyway would leave frames past the checkpoint that
+        # the next generation re-simulates from an earlier point -- a backward
+        # jump in the concatenated trajectory. Redo the generation instead.
+        print(f'_try_recover_gen: {traj_p} has {nset} frames but state.xml is '
+              f'at frame {target_nset}, and {traj_suffix} cannot be truncated; '
+              f'cascading so this gen is redone rather than left discontiguous.')
+        return None
     if target_nset < nset:
         # Kill between DCDReporter and CheckpointReporter writes.
         print(f'_try_recover_gen: trimming {traj_p} from {nset} to '
@@ -177,7 +213,7 @@ class Clone:
         'scheduler_fstring', 'scheduler', 'traj_list', 'sep', 'dirname_pad',
         'scheduler_kws', 'restarts_per_gen', 'restart_attempts', 'run_script',
         'harvester', 'remaining_steps', 'run_script_name', 'total_steps',
-        'preemption_checker', 'node_blocklist')
+        'preemption_checker', 'node_blocklist', 'progress_fn')
 
     # This should mostly be used by the init function, and by adaptive sampling scripts.
 
@@ -233,6 +269,13 @@ class Clone:
                  # or start_next will reset gens to the shortened count. If
                  # None, fall back to config['steps'] for backwards compat.
                  steps_per_gen=None,
+                 # Callable(gen_dir, **context) -> steps still owed by that
+                 # generation. None uses the frame-count inference, which is
+                 # right for the OpenMM reporters. GROMACS passes
+                 # gmx_simulate.gmx_gen_progress, which reads the step the
+                 # runner recorded -- frame counting is off by one write
+                 # interval there, because gmx writes a frame at step 0.
+                 progress_fn=None,
                  dry_run=False
                  ):
         # REQUIRED ARGS below here
@@ -283,6 +326,7 @@ class Clone:
         self.harvester = harvester
         self.preemption_checker = preemption_checker
         self.node_blocklist = node_blocklist
+        self.progress_fn = progress_fn
         self.run_script = run_script
         self.scheduler_script_p = None  # always redefined each run
 
@@ -323,6 +367,7 @@ class Clone:
                   #   run_script -> Clone's default_run_script (omm runner)
                   recover_fn=None,
                   run_script=None,
+                  progress_fn=None,
                   # (seed, clone, gen) -> jid for jobs currently in the
                   # scheduler queue, so we can re-associate after an
                   # orchestrator restart.
@@ -336,7 +381,14 @@ class Clone:
         clone_dir = util.dir_seeds_clones(
             tdir, seed_index, clone_index, dirname_pad, sep=sep, mkdir=False)
         if clone_dir.is_dir():
-            gen_paths = sorted(clone_dir.iterdir())
+            # Sorted by the gen NUMBER, not the directory name: a lexicographic
+            # sort agrees with numeric order only while every index has the same
+            # width, so at dirname_pad=3 'gen-999' sorts after 'gen-1000' and
+            # recovery walks back from the wrong generation. Names that don't
+            # parse (stray files, harvest output) sort last and are skipped by
+            # the recover function's own config.json check.
+            gen_paths = sorted(clone_dir.iterdir(),
+                               key=lambda p: _gen_sort_key(p, sep))
         else:
             gen_paths = []
 
@@ -388,6 +440,11 @@ class Clone:
 
         jid = rep_dict.get((seed_index, clone_index, gen_index))
 
+        # steps_per_gen is the untouched full generation length; the GROMACS
+        # runner needs it to compute an absolute cumulative step target even
+        # when config['steps'] has been narrowed to a remainder.
+        config['steps_per_gen'] = steps_per_gen
+
         # Only override Clone's default run_script when one was supplied, so
         # OpenMM callers keep the default and GROMACS callers get their runner.
         run_script_kw = {} if run_script is None else {'run_script': run_script}
@@ -406,6 +463,7 @@ class Clone:
             harvester=harvester,
             preemption_checker=preemption_checker,
             node_blocklist=node_blocklist,
+            progress_fn=progress_fn,
             dry_run=dry_run,
             **run_script_kw,
         )
@@ -486,13 +544,18 @@ class Clone:
         # If we've made a fresh directory this should copy the
         # previous seed into the new directory.
         self.check_copy_set_restart_seed()
+        # config.json is ALWAYS rewritten from the in-memory config, which is the
+        # authority on what this launch should do. Keeping a stale file when
+        # overwrite=False (the Farmer default) meant a resume computed the right
+        # `steps`, `append` and `seed_fn`, wrote none of them, and the job read
+        # the first attempt's config instead -- so a partially-run generation
+        # relaunched as if from scratch. Written via a temp file so a reader (or
+        # a job starting concurrently) never sees a half-written config.
         config_p = self.current_gen_dir / 'config.json'
-        if overwrite or not config_p.is_file():
-            with config_p.open('w') as f:
-                json.dump(self.config, f, indent=4)
-        else:
-            print("There is already a config at:", str(config_p.resolve()),
-                  'Proceeding with old config; did not ask for overwrite.')
+        tmp_p = config_p.with_name(config_p.name + '.tmp')
+        with tmp_p.open('w') as f:
+            json.dump(self.config, f, indent=4)
+        tmp_p.replace(config_p)
 
         job_name = self.job_name_fstring.format(**self.config)
         scheduler_script = self.scheduler_fstring.format(job_name=job_name,
@@ -560,77 +623,109 @@ class Clone:
         self.remaining_steps = self.total_steps
         # then with respect to the number of steps to write to the config.json
         self.config['steps'] = self.total_steps
+        # A new generation is never a resume. append was set True the first time
+        # THIS generation was continued mid-flight, and leaving it set leaked
+        # into the next generation, which then launched as if it were resuming a
+        # partial run it had never started.
+        self.config['append'] = False
         # because we want to start next, increment the gen before building
         self.config['gen_index'] += 1
         self.current_gen += 1
         attempted_launch = self.start_current(overwrite=overwrite)
         return attempted_launch
 
+    # How many steps this generation still owes. Engine-specific when a
+    # progress_fn was supplied (GROMACS reads the step the runner recorded);
+    # otherwise inferred from the trajectory's frame count, which is what the
+    # OpenMM reporters make true.
+    def gen_remaining_steps(self):
+        if self.progress_fn is not None:
+            return self.progress_fn(
+                self.current_gen_dir,
+                total_steps=self.total_steps,
+                gen_index=self.config['gen_index'],
+                restart_name=self.config['restart_name'],
+                traj_name=self.config['traj_name'],
+                traj_suffix=self.config['traj_suffix'],
+                write_interval=self.config['write_interval'],
+                top_fn=self.config['top_fn'],
+            )
+        traj_p = (self.current_gen_dir / self.config['traj_name']
+                  ).with_suffix(self.config['traj_suffix'])
+        if not traj_p.is_file():
+            return self.total_steps
+        return util.calx_remaining_steps(
+            str(traj_p), self.config['top_fn'], self.total_steps,
+            self.config['write_interval'])
+
     # Returns false if launch not attempted because of too many restart attempts
     def check_start_gen(self, scheduler_report: set, overwrite=False):
         if self.job_number in scheduler_report:
             print('Job', self.job_number, 'still running',
                   self.job_name_fstring.format(**self.config))
-            no_failure = True
-        else:
-            # If the scheduler reports this job as preempted, the upcoming
-            # restart shouldn't burn a restart_attempt. Genuine failures
-            # (segfault, OOM, GPU error) still count.
-            if self.was_preempted():
-                count_as_restart = False
-            else:
-                count_as_restart = True
+            return True
+
+        # If the scheduler reports this job as preempted, the upcoming restart
+        # shouldn't burn a restart_attempt. Genuine failures (segfault, OOM, GPU
+        # error) still count.
+        count_as_restart = not self.was_preempted()
+
+        previous_remaining = self.remaining_steps
+        self.remaining_steps = self.gen_remaining_steps()
+        # A launch that moved the generation forward is not a "restart" in the
+        # sense the budget is meant to police -- it is the normal way a
+        # generation longer than one walltime allocation gets finished. Charging
+        # it meant an ultralong generation exhausted restarts_per_gen and had
+        # its clone abandoned while it was working perfectly.
+        if self.remaining_steps < previous_remaining:
+            count_as_restart = False
+
+        if self.remaining_steps <= 0:
+            # Generation finished.
+            self.restart_attempts = 0
+            self.config['steps'] = self.total_steps
+            print('Preparing to move to next generation!')
+            # do any automated traj postprocessing encoded by harvester
+            if self.harvester:
+                print('running harvester!')
+                try:
+                    self.harvester.reap(
+                        self.current_gen_dir, dry_run=self.dry_run)
+                except Exception as exc:
+                    # A harvest is post-processing; losing it must not stop the
+                    # simulation campaign from advancing.
+                    print(f'harvester failed for {self.get_tag()}: '
+                          f'{type(exc).__name__}: {exc}; continuing.')
+            return self.start_next(overwrite=overwrite)
+
+        if self.remaining_steps >= self.total_steps:
+            # Nothing ran. Last chance to scan the failing job's scheduler log
+            # for a node-local cause before the next submission overwrites
+            # slurm.out / lsf.out. If a fatal-on-node pattern matched, the
+            # registry adds the node to scheduler_kws['exclude_nodes'] so
+            # plow_harrow_plant renders a directive that steers off it.
+            if self.node_blocklist is not None:
+                self.node_blocklist.scan_and_record(
+                    self.current_gen_dir, self.get_tag())
+            # A trajectory of an unstarted sim can be a zero-frame file, which
+            # breaks many appenders; clear it so the next launch starts clean.
             traj_p = (self.current_gen_dir / self.config['traj_name']
                       ).with_suffix(self.config['traj_suffix'])
             if traj_p.is_file():
-                self.remaining_steps = util.calx_remaining_steps(
-                    str(traj_p),
-                    self.config['top_fn'],
-                    self.total_steps,
-                    self.config['write_interval']
-                )
-                # Traj of an unstarted sim can be an empty file, which breaks many appenders.
-                if self.remaining_steps == self.total_steps:
-                    print(
-                        f'{traj_p} found, but zero steps. ',
-                        f'Removing and attempting restart number {self.restart_attempts}.',
-                    )
-                    # Last chance to scan the failing job's scheduler log
-                    # for a node-local cause before the next submission
-                    # overwrites slurm.out / lsf.out. If a fatal-on-node
-                    # pattern matched, the registry adds the node to
-                    # scheduler_kws['exclude_nodes'] so plow_harrow_plant
-                    # below renders a directive that steers off it.
-                    if self.node_blocklist is not None:
-                        self.node_blocklist.scan_and_record(
-                            self.current_gen_dir, self.get_tag())
-                    traj_p.unlink()
-                    no_failure = self.start_current(
-                        overwrite=overwrite, count_as_restart=count_as_restart)
-                # if this, the trajectory has steps remaining before it is a full gen.
-                # Run those.
-                elif self.remaining_steps > 0:
-                    self.config['steps'] = self.remaining_steps
-                    # set the reporters to append
-                    self.config['append'] = True
-                    self.check_copy_set_restart_seed()
-                    no_failure = self.start_current(
-                        overwrite=overwrite, count_as_restart=count_as_restart)
-                else:  # trajectory was created, and finished running.
-                    self.restart_attempts = 0
-                    self.config['steps'] = self.total_steps
-                    print('Preparing to move to next generation!')
-                    # do any automated traj postprocessing encoded by harvester
-                    if self.harvester:
-                        print('running harvester!')
-                        self.harvester.reap(
-                            self.current_gen_dir, dry_run=self.dry_run)
-                    no_failure = self.start_next(overwrite=overwrite)
-            else:  # no trajectory file, start from here just as if we'd found an empty file.
+                print(f'{traj_p} found, but zero steps. Removing and '
+                      f'attempting restart number {self.restart_attempts}.')
+                traj_p.unlink()
+            else:
                 print(f'{traj_p} not found, attempting start number '
                       f'{self.restart_attempts} for this gen.')
-                no_failure = self.start_current(
-                    overwrite=overwrite, count_as_restart=count_as_restart)
-        # else:  # this triggers if no JN bound to clone ==> we should start one
-            # no_failure = self.start_current(overwrite=overwrite)
-        return no_failure
+            self.config['steps'] = self.total_steps
+            self.config['append'] = False
+            return self.start_current(
+                overwrite=overwrite, count_as_restart=count_as_restart)
+
+        # Partially run: continue it.
+        self.config['steps'] = self.remaining_steps
+        self.config['append'] = True
+        self.check_copy_set_restart_seed()
+        return self.start_current(
+            overwrite=overwrite, count_as_restart=count_as_restart)
