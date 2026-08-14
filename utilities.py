@@ -70,12 +70,23 @@ def _traj_len_loos(traj_fn, top_fn):
     return len(pyloos.Trajectory(str(traj_fn), model))
 
 
-def get_traj_len(traj_fn, top_fn):
+# Solute-only topology the harvester leaves beside a dry trajectory. Named here
+# rather than imported from harvester, which imports this module.
+DRY_TOPOLOGY_NAME = 'dry-top.pdb'
+
+
+def get_traj_len(traj_fn, top_fn, dry_topology_name=DRY_TOPOLOGY_NAME):
     """Number of frames in a trajectory, or 0 if it is empty or unreadable.
 
     `top_fn` is only consulted by the LOOS fallback; the mdtraj path does not
     need it, which is what makes this work for GROMACS runs whose `top_fn` is a
     `.top`.
+
+    The fallback tries the harvester's solute-only topology as well, because
+    after a harvest the trajectory name is a symlink to a *stripped* copy: LOOS
+    built from the wet `top_fn` would hit an atom-count mismatch, get swallowed
+    by the broad except below, and report 0 frames -- from which the tender
+    concludes the generation never ran.
     """
     traj_p = Path(traj_fn)
     if not traj_p.is_file() or traj_p.stat().st_size == 0:
@@ -87,130 +98,53 @@ def get_traj_len(traj_fn, top_fn):
             print(f'mdtraj could not read {traj_fn}: '
                   f'{type(exc).__name__}: {exc}; trying LOOS.')
     if loos is not None:
-        try:
-            return _traj_len_loos(traj_p, top_fn)
-        except Exception as exc:
-            # Deliberately broad: createSystem raises RuntimeError for an
-            # unsupported topology, LOOSError for an unreadable frame, and the
-            # orchestrator must survive both.
-            print(f'LOOS could not read {traj_fn} with topology {top_fn}: '
-                  f'{type(exc).__name__}: {exc}; treating as empty.')
+        candidates = [top_fn] if top_fn is not None else []
+        dry_top_p = traj_p.parent / dry_topology_name
+        if dry_top_p.is_file():
+            candidates.append(dry_top_p)
+        for candidate in candidates:
+            try:
+                return _traj_len_loos(traj_p, candidate)
+            except Exception as exc:
+                # Deliberately broad: createSystem raises RuntimeError for an
+                # unsupported topology, LOOSError for an unreadable frame, and
+                # the orchestrator must survive both.
+                print(f'LOOS could not read {traj_fn} with topology '
+                      f'{candidate}: {type(exc).__name__}: {exc}.')
+        print(f'No usable topology for {traj_fn}; treating as empty.')
     return 0
 
 
 """
-To run this one, hconfig needs to contain the following keys:
- - `'harvester_subset'`: a LOOS selection string that produces the desired system subsetting.
- - `'downsample_frq'`: An int---the number of frames to skip over before writing another solvated frame.
+The harvest itself lives in `harvester.harvest_generation`; these two names are
+kept because they are what existing submit scripts call. Both now pin a backend
+and hand off, so an old script gets the frame-count guard, the sentinel and the
+seam handling without being rewritten.
+
+hconfig keys:
+ - `'harvester_subset'`: selection string for the solute (LOOS syntax by
+   default; set `'harvester_subset_syntax': 'mdtraj'` for the other dialect).
+ - `'downsample_frq'`: keep every Nth frame in the solvated stream.
+ - `'harvester_structure'`: structure file to build the model from. REQUIRED for
+   GROMACS runs, whose `top_fn` is a force-field topology that neither LOOS nor
+   mdtraj can build a model from. Defaults to `config['top_fn']`.
 """
 
 
 def strip_and_downsample(config_fn, harvester_config_fn):
-    import loos
-    from loos import pyloos as pl
-    config_fp = Path(config_fn)
-    config = json.loads(config_fp.read_text())
-    hconfig_fp = Path(harvester_config_fn)
-    hconfig = json.loads(hconfig_fp.read_text())
-    sep = config['sep']
-    model = loos.createSystem(config['top_fn'])
-    subset_selection = hconfig['harvester_subset']
-    subset = loos.selectAtoms(model, subset_selection)
-
-    traj_name = config['traj_name']
-    traj_suffix = config['traj_suffix']
-    traj_fn = f'{traj_name}{traj_suffix}'
-    traj = pl.Trajectory(traj_fn, model)
-    downsample_frq = hconfig['downsample_frq']
-    dry_outfn = f'dry{sep}{traj_fn}'
-    dry_outp = Path(dry_outfn)
-
-    down_outfn = f'downsample{sep}{traj_fn}'
-    down_outp = Path(down_outfn)
-    if traj_suffix == ".xtc":
-        dry_outtraj = loos.XTCWriter(dry_outfn)
-        downsampe_outtraj = loos.XTCWriter(down_outfn)
-    elif traj_suffix == '.dcd':
-        dry_outtraj = loos.DCDWriter(dry_outfn)
-        downsampe_outtraj = loos.DCDWriter(down_outfn)
-    else:
-        raise NotImplementedError(
-            f'{traj_suffix}: not implemented for basic strip and downsample')
-    print('Preparing to loop over trj in strip and downsample.')
-    while next(traj, False):
-        dry_outtraj.writeFrame(subset)
-        if traj.index() % downsample_frq == 0:
-            downsampe_outtraj.writeFrame(model)
-    # dump to PDB for topology
-    subset.pruneBonds()  # Need to do this to ensure connects are correct.
-    pdb = loos.PDB.fromAtomicGroup(subset)
-    Path('dry-top.pdb').write_text(str(pdb))
-
-    # if we've subset and also dried the trajectories, remove the original.
-    # Should raise a file not found error if the call to stat()
-    # is applied to a file that was never created
-    if dry_outp.stat().st_size > 0 and down_outp.stat().st_size > 0:
-        traj_p = Path(traj_fn)
-        traj_p.unlink()
-        # leave a symlink to dry traj so that frame counting efforts don't go awry
-        traj_p.symlink_to(dry_outp)
-    else:
-        print('either', dry_outp, 'or', down_outp,
-              'are size zero, refusing to unlink')
+    """Backwards-compatible entry point pinning the LOOS backend."""
+    from . import harvester
+    return harvester.harvest_generation(
+        config_fn, harvester_config_fn, backend=harvester.BACKEND_LOOS)
 
 
-def strip_ds_mdtraj(config_fn, harvester_config_fn, sep='-', image_molecules=True):
-    import mdtraj as md
-    config_fp = Path(config_fn)
-    config = json.loads(config_fp.read_text())
-    hconfig_fp = Path(harvester_config_fn)
-    hconfig = json.loads(hconfig_fp.read_text())
-    model_name = str(config['top_fn'])
-    # subset = loos.selectAtoms(model, subset_selection)
+def strip_ds_mdtraj(config_fn, harvester_config_fn):
+    """Backwards-compatible entry point pinning the mdtraj backend."""
+    from . import harvester
+    return harvester.harvest_generation(
+        config_fn, harvester_config_fn, backend=harvester.BACKEND_MDTRAJ)
 
-    traj_name = config['traj_name']
-    traj_suffix = config['traj_suffix']
-    traj_fn = f'{traj_name}{traj_suffix}'
-    traj = md.load(traj_fn, top=model_name)
-    if image_molecules:
-        traj.make_molecules_whole(inplace=True)
-        traj.image_molecules(inplace=True)
-    top = traj.top
-    subset_selection = hconfig['harvester_subset']
-    if subset_selection:
-        subset_iis = top.select(subset_selection)
-        dry_traj = traj.atom_slice(subset_iis)
-    else:
-        dry_traj = traj.remove_solvent()
-    
-    dry_outfn = f'dry{sep}{traj_fn}'
-    dry_outp = Path(dry_outfn)
-    dry_traj.save(dry_outfn)
-    dry_topp = dry_outp.with_suffix('.pdb')
-    # dump to PDB for topology
-    dry_traj[-1].save(str(dry_topp))
-    del dry_traj
 
-    # make and save downsampled traj
-    downsample_frq = hconfig['downsample_frq']
-    downsample_traj = traj[::downsample_frq]
-
-    down_outfn = f'downsample{sep}{traj_fn}'
-    down_outp = Path(down_outfn)
-    downsample_traj.save(down_outfn)
-
-    # if we've subset and also dried the trajectories, remove the original.
-    # Should raise a file not found error if the call to stat()
-    # is applied to a file that was never created
-    if dry_outp.stat().st_size > 0 and down_outp.stat().st_size > 0:
-        traj_p = Path(traj_fn)
-        traj_p.unlink()
-        # leave a symlink to dry traj so that frame counting efforts don't go awry
-        traj_p.symlink_to(dry_outp)
-    else:
-        print('either', dry_outp, 'or', down_outp,
-              'are size zero, refusing to unlink')
-        
 
 # These basic strings are useful in many cases on clusters using the scheduler named as the key.
 # NOTE the format target '{job_name}' has to appear for the default queue parser to find the job.
@@ -885,10 +819,24 @@ default_straight_sampling_init_config = dict(
 
 
 #  make two trajs--one stripped of solvent, the _other_ downsampled by some integer factor but not dried.
+# `harvest_generation` picks its backend from the box on the trajectory, so the
+# same script is right for a rectangular cell (LOOS, streaming) and a triclinic
+# one (mdtraj, chunked). It is idempotent: a requeued harvest job that already
+# ran is a no-op, not a second pass over its own output.
 default_harvest_shellscript = inspect.cleandoc("""#!/bin/bash
                 #BSUB -J harvest
                 #BSUB -o harvest.out
                 #BSUB -q {queue_name}
 
-                python -c 'from mdfarmer.utilities import strip_ds_mdtraj; strip_ds_mdtraj("config.json", "hconfig.json")'
+                python -c 'from mdfarmer import harvest_generation; harvest_generation("config.json", "hconfig.json")'
+                """)
+
+default_harvest_shellscript_slurm = inspect.cleandoc("""#!/bin/bash
+                #SBATCH -J harvest
+                #SBATCH -o harvest.out
+                #SBATCH -p {queue_name}
+                #SBATCH --time={harvest_time}
+                #SBATCH --cpus-per-task=1
+
+                python -c 'from mdfarmer import harvest_generation; harvest_generation("config.json", "hconfig.json")'
                 """)

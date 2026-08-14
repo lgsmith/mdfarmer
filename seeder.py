@@ -2,6 +2,7 @@ from __future__ import annotations
 import copy
 import inspect
 from . import utilities as util
+from . import harvester as harvest
 from pathlib import Path
 import subprocess as sp
 import shutil  # for copy--will be obviated by python 3.14
@@ -324,6 +325,27 @@ class Clone:
         self.job_number_re = re.compile(job_number_re)
         self.compare_keys = compare_keys
         self.harvester = harvester
+        # The harvest reads the full generation length out of config.json, and
+        # config['steps'] is not it -- on a resume that has been narrowed to the
+        # steps still owed. Pin the untouched value here so every construction
+        # path records it, not just from_disk.
+        if config.get('steps_per_gen') is None:
+            config['steps_per_gen'] = self.total_steps
+        elif config['steps_per_gen'] != self.total_steps:
+            raise ValueError(
+                f"config['steps_per_gen']={config['steps_per_gen']} disagrees "
+                f'with steps_per_gen={self.total_steps}; the harvest would '
+                'place this clone\'s frames at the wrong global index.')
+        # Config time is the only free moment to catch a generation length that
+        # is not a whole number of write intervals, or a frame count that is not
+        # a whole number of downsample periods. Both break the spacing of the
+        # harvested streams at every seam, and neither ever fails loudly.
+        if harvester is not None:
+            downsample_frq = (getattr(harvester, 'run_config', None)
+                              or {}).get('downsample_frq')
+            if downsample_frq:
+                harvest.check_commensurability(
+                    self.total_steps, config['write_interval'], downsample_frq)
         self.preemption_checker = preemption_checker
         self.node_blocklist = node_blocklist
         self.progress_fn = progress_fn

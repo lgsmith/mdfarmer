@@ -208,6 +208,101 @@ extended conformation will exceed it, at which point the LOOS backend is outside
 its safe regime and you want `backend='trjconv'`, which walks the bond graph
 instead. The check reports the margin as a fraction so you can watch it.
 
+### Harvesting (reducing a finished generation, safely)
+
+When a generation completes, the `Harvester` submits a job that turns its raw
+trajectory into the two streams you actually keep — a **dry** stream (every
+frame, solute only) and a **downsampled** stream (every Nth frame, solvent
+kept) — and then replaces the original with a symlink to the dry one. That last
+step is irreversible, so the harvest is built to be interrupted:
+
+```python
+harvester = mdf.Harvester(
+    harvester_template=mdf.default_harvest_shellscript_slurm.format(
+        queue_name='ccb', harvest_time='02:00:00'),
+    scheduler='sbatch',
+    run_config=dict(
+        harvester_subset='resid <= 20',      # LOOS syntax by default
+        downsample_frq=10,
+        # REQUIRED for GROMACS: `top_fn` is a force-field topology, and neither
+        # LOOS nor mdtraj can build a model from a `.top`. Point this at the
+        # structure the run actually started from.
+        harvester_structure='reference/restarts/native_cluster000.gro',
+        steps_per_gen=STEPS_PER_GEN,
+    ),
+)
+```
+
+Set `harvester_subset_syntax='mdtraj'` if you would rather write the selection
+in mdtraj's language. Either way the selection is resolved to atom indices once
+and both backends slice by index, so which backend runs cannot change which
+atoms come out.
+
+**The backend is chosen by looking at the box.** A rectangular cell goes to
+LOOS, which streams frame by frame; anything triclinic goes to mdtraj's
+`iterload`. This cannot be a `try`/`except` around the LOOS call, because LOOS
+does not raise on a triclinic cell — it keeps the diagonal and carries on (see
+the reimaging section) — so the handler would never fire on the case it exists
+for. The off-diagonals are read off frame 0 and the choice is made before either
+engine is touched. Neither path holds the trajectory in memory: a 1 µs
+generation at 10 ps sampling is ~29 GB of coordinates.
+
+**Frames are counted, not sized.** The old guard was `st_size > 0` on both
+outputs, which a harvest killed mid-write passes — and then the original is
+deleted. Now the source is counted first, the output counts are *computed* from
+the frame plan, and the written files are re-counted off disk. Any mismatch
+raises and leaves the original alone.
+
+**It is idempotent.** A `.harvested` sentinel carrying the counts is written
+last; a re-run short-circuits on it. A generation whose original is already a
+symlink but which has no sentinel is a harvest that died in that window — its
+outputs are checked against the plan and the sentinel is written, rather than
+the write loop running again with its own output as input. Under a requeueing
+scheduler this is not optional.
+
+**Two spacing rules, checked when a `Farmer` is built** — not when the harvest
+runs, hours into a campaign:
+
+```
+steps_per_gen % write_interval == 0
+(steps_per_gen / write_interval) % downsample_frq == 0
+```
+
+The first puts each generation's last frame exactly on the checkpoint the next
+one restarts from; miss it and every seam silently drops the trajectory between
+the two. The second keeps the downsampled stream evenly spaced across the
+concatenation.
+
+**The seam frame is dropped exactly once.** GROMACS writes a frame at the step
+it restarts from, so generation N's last frame and generation N+1's first are
+the same time point. Concatenating without handling that puts a duplicate at
+every seam — which never fails loudly, it just biases lag times and kinetics.
+Frame 0 of every generation after the first is dropped, and the downsample phase
+is driven by a *global* frame index so it does not reset at each boundary. The
+OpenMM reporters do not write that frame; the convention is detected from the
+frame count rather than assumed.
+
+**The time axis is carried through.** Worth knowing if you have older harvested
+data: LOOS's `XTCWriter` numbers frames from its own counters (`dt_ = 1.0`,
+`step_ = 0`, `steps_per_frame_ = 1`), so it used to stamp every harvested frame
+1 ps apart and label it with its frame index instead of its MD step — and since
+the harvest deletes the original, that destroyed the real time axis rather than
+merely mislabelling it. mdtraj kept `time` but filled `step` with the frame
+index. Both backends now read the source's step and time and write them
+explicitly, verified against the source's last frame.
+
+Two things to check on a campaign after the fact:
+
+```python
+mdf.unharvested_gen_dirs('trajectories')     # gens that ran but have no sentinel
+mdf.verify_dry_chain(sorted_gen_dirs)        # frame count, spacing, duplicates
+```
+
+The harvest does **not** reimage — it preserves the per-frame box (LOOS subsets
+share the parent's `SharedPeriodicBox`, so the dry stream carries a live cell,
+not a frozen one), which is what lets you run `mdfarmer.reimage` on the dry
+stream afterwards.
+
 ## AI assistance
 
 Parts of this codebase have been developed with assistance from Anthropic's Claude (Opus 4.x family). Individual commits are not tagged with `Co-Authored-By` trailers; this section is the project-level attribution.
