@@ -59,7 +59,41 @@ PACK_STATUS_NAME = 'pack_status.json'
 # mdrun flags that must be derived per replica, never inherited from the shared
 # template. Each maps to the number of VALUES that follow it.
 PER_REPLICA_MDRUN_FLAGS = {'-ntomp': 1, '-pin': 1, '-pinoffset': 1,
-                           '-pinstride': 1, '-ntmpi': 1}
+                           '-pinstride': 1, '-ntmpi': 1, '-nt': 1}
+
+# Thread-MPI ranks per replica. Stripping -ntmpi without emitting a replacement
+# lets mdrun choose its own decomposition from every core it can SEE rather than
+# the ones this replica was given: measured, a 2-replica pack with -ntomp 8 on a
+# 32-core box came up "On 4 MPI ranks, each using 8 OpenMP threads" -- 32 threads
+# for one replica of a pack allocated 16 cores between them, and the pinning
+# offsets then describe nothing. One GPU per member means one rank is right.
+#
+# It can only be EMITTED on a thread-MPI build, though. A real-MPI build takes
+# its rank count from mpirun and rejects the flag outright ("Setting the number
+# of thread-MPI ranks is only supported with thread-MPI"), which would turn this
+# fix into a fatal error on every site that runs a gmx_mpi. Such a build already
+# gets one rank per replica anyway, because the pack launches mdrun directly
+# rather than under mpirun -- so the flag is both unusable and unnecessary
+# there. `gmx_supports_ntmpi` decides which case this is, once per job.
+#
+# '-nt' is stripped for a related reason: it fixes TOTAL threads, so it cannot
+# vary per replica and goes fatal the moment two members differ in size.
+NTMPI = 1
+
+# Line `gmx -version` prints for the MPI flavour, and the value a thread-MPI
+# build reports there.
+GMX_MPI_VERSION_KEY = 'MPI library:'
+GMX_THREAD_MPI_VALUE = 'thread_mpi'
+
+# Parameters gmx_pack injects into every gmx_generation call at runtime. A
+# driver that builds its config template with
+# merge_args_defaults_dict(gmx_generation, ...) -- the pattern this repo's own
+# README recommends, because it makes config.json a complete record of the call
+# -- writes these into the file as well. Splatting the file's copy alongside the
+# injected one is "got multiple values for keyword argument", and it kills every
+# replica on the first packed job. The solo entry point injects nothing, which
+# is why the asymmetry survived review: the packed path had never been run.
+RUNTIME_ONLY_KEYS = ('fleet', 'fleet_key', 'grompp_lock')
 
 # Seconds between preempt-sentinel polls while the pack runs.
 POLL_SECONDS = 5
@@ -78,7 +112,7 @@ runner('pack.json')
 
 
 def replica_mdrun_args(base_args, replica_index, n_replicas, cpus_per_task,
-                       pin_stride=PIN_STRIDE,
+                       pin_stride=PIN_STRIDE, ntmpi=NTMPI,
                        per_replica_flags=PER_REPLICA_MDRUN_FLAGS):
     """This replica's mdrun flags: shared template minus pinning, plus its own.
 
@@ -112,9 +146,36 @@ def replica_mdrun_args(base_args, replica_index, n_replicas, cpus_per_task,
             continue
         stripped.append(token)
         i += 1
-    return stripped + ['-ntomp', str(ntomp), '-pin', 'on',
-                       '-pinoffset', str(replica_index * ntomp),
-                       '-pinstride', str(pin_stride)]
+    # ntmpi=None means "this build cannot take the flag"; see NTMPI above.
+    rank_args = [] if ntmpi is None else ['-ntmpi', str(ntmpi)]
+    return stripped + rank_args + [
+        '-ntomp', str(ntomp), '-pin', 'on',
+        '-pinoffset', str(replica_index * ntomp),
+        '-pinstride', str(pin_stride)]
+
+
+def gmx_supports_ntmpi(gmx_bin=gmx.GMX_BIN,
+                       mpi_version_key=GMX_MPI_VERSION_KEY,
+                       thread_mpi_value=GMX_THREAD_MPI_VALUE, timeout=60):
+    """True when this GROMACS is a thread-MPI build, so -ntmpi is legal.
+
+    `gmx -version` reports either ``MPI library: thread_mpi`` or ``MPI library:
+    MPI (...)``. Only the first accepts -ntmpi; the second makes it fatal. On a
+    binary that cannot be probed at all, returns False -- not emitting the flag
+    costs a correct-by-construction rank count on thread-MPI, while emitting it
+    wrongly kills the job.
+    """
+    try:
+        result = sp.run([gmx_bin, '-version'], capture_output=True, text=True,
+                        timeout=timeout)
+    except (FileNotFoundError, sp.TimeoutExpired, OSError) as exc:
+        print(f'[pack] could not probe {gmx_bin} for its MPI flavour ({exc}); '
+              'not emitting -ntmpi.', flush=True)
+        return False
+    for line in (result.stdout + result.stderr).splitlines():
+        if line.strip().startswith(mpi_version_key):
+            return thread_mpi_value in line.lower()
+    return False
 
 
 def mps_is_running(mps_control_bin=MPS_CONTROL_BIN, timeout=10):
@@ -185,7 +246,10 @@ def gmx_pack_sim_block_json(manifest_fn=PACK_MANIFEST_NAME,
                             poll_seconds=POLL_SECONDS,
                             reps_per_card=REPS_PER_CARD,
                             pin_stride=PIN_STRIDE,
-                            pack_status_name=PACK_STATUS_NAME):
+                            pack_status_name=PACK_STATUS_NAME,
+                            ntmpi=NTMPI,
+                            runtime_only_keys=RUNTIME_ONLY_KEYS,
+                            gmx_bin=None):
     """Entry point for a packed job's run.py: advance every member concurrently.
 
     Threads rather than processes: the work is all subprocess waiting, and one
@@ -197,6 +261,17 @@ def gmx_pack_sim_block_json(manifest_fn=PACK_MANIFEST_NAME,
     n_replicas = len(members)
     cpus_per_task = _resolve_cpus_per_task(manifest)
     pack_dir = manifest_p.parent
+
+    # Probe the binary once, not once per replica: -ntmpi is fatal on a
+    # real-MPI build and necessary on a thread-MPI one.
+    if gmx_bin is None:
+        gmx_bin = json.loads(Path(members[0]).read_text()).get(
+            'gmx_bin', gmx.GMX_BIN)
+    if ntmpi is not None and not gmx_supports_ntmpi(gmx_bin):
+        print(f'[pack] {gmx_bin} is a real-MPI build; omitting -ntmpi (it gets '
+              'one rank per replica from being launched without mpirun).',
+              flush=True)
+        ntmpi = None
 
     print(f'[pack] {n_replicas} replicas, {cpus_per_task} cpus '
           f'({cpus_per_task // n_replicas} threads each)', flush=True)
@@ -213,12 +288,23 @@ def gmx_pack_sim_block_json(manifest_fn=PACK_MANIFEST_NAME,
         try:
             conf = json.loads(Path(config_fn).read_text())
             traj_list = Path(conf.pop('traj_list'))
-            conf.pop('fleet', None)
+            # Drop the file's copies of exactly the keys we are about to
+            # inject. Deriving the drop list from the injected dict rather than
+            # naming it twice is what stops a future runtime parameter from
+            # quietly reintroducing the collision.
+            runtime_kwargs = dict(fleet=fleet, fleet_key=index,
+                                  grompp_lock=grompp_lock)
+            if set(runtime_kwargs) != set(runtime_only_keys):
+                raise RuntimeError(
+                    f'runtime kwargs {sorted(runtime_kwargs)} no longer match '
+                    f'RUNTIME_ONLY_KEYS {sorted(runtime_only_keys)}; update the '
+                    'constant so config.json copies keep getting dropped.')
+            for key in runtime_kwargs:
+                conf.pop(key, None)
             conf['mdrun_args'] = replica_mdrun_args(
                 conf.get('mdrun_args'), index, n_replicas, cpus_per_task,
-                pin_stride=pin_stride)
-            traj = gmx.gmx_generation(fleet=fleet, fleet_key=index,
-                                      grompp_lock=grompp_lock, **conf)
+                pin_stride=pin_stride, ntmpi=ntmpi)
+            traj = gmx.gmx_generation(**runtime_kwargs, **conf)
         except gmx.Preempted as exc:
             outcome.update(status='preempted', detail=str(exc))
         except gmx.GenIncomplete as exc:

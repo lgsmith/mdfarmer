@@ -275,6 +275,19 @@ basic_scheduler_fstrings_mps = {
                 echo "NODE: $SLURMD_NODENAME"
                 echo "GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | paste -sd, -)"
 
+                # Refuse to be the second job in this pack directory. Job-name
+                # re-association can still miss -- a job that finishes its
+                # generation's steps before the tender's next tick comes back
+                # under a different gen_index -- and for a pack both jobs would
+                # share one pack.json, one checkpoint and one part-number
+                # sequence. That is the one failure -cpi cannot undo, so it gets
+                # a lock as well as a name. Held on fd 9 for the job's lifetime.
+                exec 9>pack.lock
+                if ! flock -n 9; then
+                    echo "PACK LOCK: another job already holds $(pwd)/pack.lock; exiting rather than putting a second mdrun on this checkpoint."
+                    exit 0
+                fi
+
                 # Per-job MPS daemon. Keyed on the job id so two packed jobs on
                 # one node never share or clobber each other's daemon.
                 export CUDA_MPS_PIPE_DIRECTORY="/tmp/mps-$USER-$SLURM_JOB_ID/pipe"
@@ -729,11 +742,31 @@ def calx_remaining_steps(traj_fn, top_fn, total_steps, write_interval):
 
 # This won't be nicely jsonizable unless all default and provided vals are.
 def merge_args_defaults_dict(function, **kwargs):
+    """A config dict recording the full call: every parameter and its value.
+
+    Two things are deliberately not in the result, because both used to arrive
+    in config.json and neither survives json.dumps:
+
+    * ``**kwargs``-style catch-alls (``gmx_generation`` has ``**_unused``).
+      A VAR_KEYWORD parameter has no default -- it collects leftovers -- so it
+      came through as the sentinel `inspect._empty`, which is a *class*.
+    * parameters with no default that the caller did not supply. Those are
+      required arguments, and leaving `inspect._empty` in the dict turned a
+      missing-argument mistake into "Object of type type is not JSON
+      serializable" several steps later. They are named in the error instead.
+    """
     sig = inspect.signature(function)
-    # create a dictionary of the parameters and their defaults.
-    config = {p: sig.parameters[p].default for p in sig.parameters}
-    # overwrite the defaults wherever an option was specified
+    variadic = (inspect.Parameter.VAR_KEYWORD, inspect.Parameter.VAR_POSITIONAL)
+    config = {name: param.default
+              for name, param in sig.parameters.items()
+              if param.kind not in variadic}
     config.update(kwargs)
+    missing = sorted(name for name, value in config.items()
+                     if value is inspect.Parameter.empty)
+    if missing:
+        raise TypeError(
+            f'{function.__name__} has no default for {missing}, and none was '
+            f'supplied. Pass them here so config.json records the whole call.')
     return config
 
 

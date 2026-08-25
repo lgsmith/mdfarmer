@@ -92,6 +92,7 @@ class Farmer:
                 initial_seed_fn=self.seed_state_fns[seed_index],
                 top_fn=self.top_fns[seed_index],
                 system_fn=self.system_fns[seed_index],
+                structure_fn=self.seed_state_fns[seed_index],
                 config_template=self.config_template,
                 scheduler=self.scheduler,
                 scheduler_fstring=self.scheduler_fstring,

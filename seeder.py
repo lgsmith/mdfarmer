@@ -369,6 +369,13 @@ class Clone:
                   # Resolved, validated top and system paths for this seed.
                   top_fn: str,
                   system_fn: str,
+                  # The .gro/.pdb this seed's generation 0 is grompp'd from.
+                  # Shared-template-only meant a GROMACS Farmer with n_seeds > 1
+                  # built EVERY seed's gen 0 from seed 0's structure, while the
+                  # directory names and the copied seed file all said otherwise.
+                  # Nothing raised; the trajectories simply were not the systems
+                  # they claimed to be. None leaves the template's value alone.
+                  structure_fn: str = None,
                   # The Farmer's full config_template. Read-only here; we
                   # deepcopy before mutating.
                   config_template: dict,
@@ -452,6 +459,8 @@ class Clone:
             config['new_velocities'] = True
         config['system_fn'] = system_fn
         config['top_fn'] = top_fn
+        if structure_fn is not None:
+            config['structure_fn'] = structure_fn
         # Keep the StateDataReporter progress display consistent with the
         # actual run length so % complete isn't misleading on a resume.
         if isinstance(config.get('state_data_kwargs'), dict):
@@ -783,8 +792,15 @@ class ClonePack:
 
     Members must come from ONE condition and system, with identical `steps`:
     the job holds the card until its slowest member finishes, so mismatched
-    per-step costs waste GPU time, and packing across conditions would let one
-    bad job damage two datasets at once.
+    per-step costs waste GPU time.
+
+    That rule is about STRAGGLER COST, not data safety -- worth saying plainly,
+    because the next reader will otherwise take it as a safety invariant and
+    not know what they are allowed to trade away. Failure is already per-member
+    (`gmx_pack` collects K outcomes and the tender fails exactly one clone) and
+    recovery is already per-member (`mdrun -cpi` off that member's own
+    checkpoint), so a bad job costs a lost block that gets redone, not a damaged
+    dataset. Packing across conditions is therefore a throughput decision.
     """
 
     def __init__(self, clones, pack_dir, scheduler, scheduler_fstring,
@@ -792,7 +808,10 @@ class ClonePack:
                  job_name_fstring=None, job_number_re='[1-9][0-9]*',
                  job_number=None, dry_run=False,
                  pack_manifest_name='pack.json',
-                 run_script_name='run.py'):
+                 run_script_name='run.py',
+                 sep=None,
+                 job_name_elements=('{title}', '{seed_index}',
+                                    '{clone_index}', '{gen_index}')):
         if not clones:
             raise ValueError('a ClonePack needs at least one Clone')
         steps = {c.total_steps for c in clones}
@@ -814,9 +833,28 @@ class ClonePack:
         self.run_script_name = run_script_name
         self.cpus_per_task = int(cpus_per_task)
         self.pack_manifest_name = pack_manifest_name
-        self.job_number = job_number
         self.job_number_re = re.compile(job_number_re)
-        self.job_name_fstring = job_name_fstring or '{title}-pack-{seed_index}-{clone_index}'
+        # A pack's job name has to parse under the SAME scheme the Farmer uses
+        # to re-associate running jobs at boot: int() over
+        # name.split(sep)[-3:] for (seed, clone, gen). The old default,
+        # '{title}-pack-{seed_index}-{clone_index}', had no gen_index and
+        # hardcoded '-' whatever `sep` was, so it never parsed -- the rebuilt
+        # pack came back with job_number=None and the very first tick submitted
+        # a SECOND job into the pack directory of a job that was still running.
+        # Two mdruns sharing one -cpi/-cpo checkpoint and one part-number
+        # sequence is the single failure a checkpoint cannot recover from.
+        self.sep = clones[0].sep if sep is None else sep
+        self.job_name_fstring = (job_name_fstring
+                                 or self.sep.join(job_name_elements))
+        # Member 0's config is what renders that name, so member 0's
+        # re-associated job number IS the pack's. Adopting it here rather than
+        # leaving it to each driver is what actually closes the window.
+        if job_number is None:
+            job_number = next((c.job_number for c in self.clones
+                               if c.job_number is not None), None)
+        self.job_number = job_number
+        for clone in self.clones:
+            clone.job_number = job_number
         self.dry_run = dry_run
 
     @property
