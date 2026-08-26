@@ -50,7 +50,11 @@ except ImportError:
     pyloos = None
 
 if _mdtraj is None and loos is None:
-    print('Neither mdtraj nor LOOS is importable; frame counting will fail.')
+    # A broken install, not a runtime condition: with no way to count frames
+    # every trajectory measures as empty, which the orchestrator reads as a
+    # generation that never ran and deletes.
+    raise ImportError('mdfarmer needs mdtraj or LOOS to count frames, and '
+                      'neither is importable.')
 
 
 def _traj_len_mdtraj(traj_fn):

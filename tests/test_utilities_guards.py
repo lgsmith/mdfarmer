@@ -6,6 +6,7 @@ thing that is actually wrong.
 """
 import contextlib
 import io
+import subprocess as sp
 import sys
 
 import harness
@@ -13,6 +14,9 @@ from harness import Suite
 
 from mdfarmer import harvester
 from mdfarmer import utilities as util
+
+# The module file itself, loaded standalone by the missing-backend check.
+UTILITIES = str(harness.REPO_ROOT / 'utilities.py')
 
 
 def raises(fn, *args, **kwargs):
@@ -129,6 +133,31 @@ def check_config_from_signature(suite):
                 f'-> {type(exc).__name__}: {exc}')
 
 
+def check_frame_counting_backend(suite):
+    """With neither mdtraj nor LOOS, every trajectory measures as empty and the
+    orchestrator deletes it, so importing at all has to fail."""
+    suite.section('an install with no way to count frames')
+    script = '\n'.join((
+        'import importlib.util, sys',
+        # None in sys.modules is what makes an import raise ImportError.
+        "sys.modules['mdtraj'] = None",
+        "sys.modules['loos'] = None",
+        f"spec = importlib.util.spec_from_file_location('u', {UTILITIES!r})",
+        'module = importlib.util.module_from_spec(spec)',
+        'try:',
+        '    spec.loader.exec_module(module)',
+        'except ImportError as exc:',
+        "    print('REFUSED:', exc)",
+        '    sys.exit(0)',
+        'sys.exit(1)',
+    ))
+    result = sp.run([sys.executable, '-c', script], capture_output=True,
+                    text=True)
+    suite.check('importing utilities fails rather than warning',
+                result.returncode == 0,
+                f'-> {(result.stdout + result.stderr).strip()[-90:]}')
+
+
 def main():
     suite = Suite('utilities_guards')
     work = harness.workdir('utilities_guards')
@@ -136,6 +165,7 @@ def main():
     check_state_xml_step_count(suite, work)
     check_harvest_entry_points(suite)
     check_config_from_signature(suite)
+    check_frame_counting_backend(suite)
     return suite.report()
 
 
