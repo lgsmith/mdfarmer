@@ -131,6 +131,40 @@ class Farmer:
         self.jids_file.write_text(' '.join(map(str, sorted(self.current_jids))))
         return rep_dict
 
+    # The template a pack submits: the one given, else the MPS default for
+    # this scheduler family.
+    def pack_template(self):
+        family = util.scheduler_families.get(self.scheduler, self.scheduler)
+        return (self.pack_scheduler_fstring
+                or util.basic_scheduler_fstrings_mps[family])
+
+    # A preempted job is killed outright unless its submit script traps SIGTERM
+    # and touches PREEMPT_SIGTERM, which is what the simulation watches for so
+    # it can shut down on a whole frame. Check the template that will really be
+    # submitted: packing submits the pack template and never the solo one, and
+    # a packed member watches the sentinel whether or not handle_preempt is set.
+    def check_preempt_template(self):
+        packing = bool(self.pack_size or self.pack_grouping)
+        if not packing and not self.config_template.get('handle_preempt'):
+            return
+        fstring = self.pack_template() if packing else self.scheduler_fstring
+        if 'PREEMPT_SIGTERM' in fstring and 'trap' in fstring:
+            return
+        if packing:
+            print('WARNING: the pack template has no SIGTERM trap that '
+                  'touches PREEMPT_SIGTERM, so a preempted pack loses the '
+                  'block every member is running. Use '
+                  'basic_scheduler_fstrings_mps[<scheduler>] or add an '
+                  'equivalent trap+background+wait pattern.')
+            return
+        raise ValueError(
+            'handle_preempt is set (via Farmer(handle_preempt=True) or '
+            'config_template["handle_preempt"]) but scheduler_fstring '
+            'lacks a SIGTERM trap that touches PREEMPT_SIGTERM. Use '
+            'basic_scheduler_fstrings_preempt[<scheduler>] or include '
+            'an equivalent trap+background+wait pattern in your custom '
+            'template.')
+
     # Fill in the run_script, recover_fn and progress_fn that go with runner.
     # A hand-supplied set that disagrees with it is refused rather than half
     # applied, since the engine that runs is the one named in the run script.
@@ -337,20 +371,11 @@ class Farmer:
             bad_node_persist, scheduler, self.scheduler_kws,
             patterns=bad_node_patterns)
         # Honor handle_preempt whether it arrives via this constructor arg or
-        # is set directly on config_template. Validating both paths stops the
-        # config_template route from silently arming the SentinelReporter
-        # without a matching SIGTERM trap (which would hard-kill on preempt).
+        # is set directly on config_template, so the config_template route
+        # cannot arm the SentinelReporter behind the Farmer's back.
         if handle_preempt or self.config_template.get('handle_preempt'):
-            if 'PREEMPT_SIGTERM' not in scheduler_fstring or 'trap' not in scheduler_fstring:
-                raise ValueError(
-                    'handle_preempt is set (via Farmer(handle_preempt=True) or '
-                    'config_template["handle_preempt"]) but scheduler_fstring '
-                    'lacks a SIGTERM trap that touches PREEMPT_SIGTERM. Use '
-                    'basic_scheduler_fstrings_preempt[<scheduler>] or include '
-                    'an equivalent trap+background+wait pattern in your custom '
-                    'template.'
-                )
             self.config_template['handle_preempt'] = True
+        self.check_preempt_template()
         self.scheduler_report_cmd = scheduler_report_cmd
         self.scheduler_assoc_rep_cmd = scheduler_assoc_rep_cmd
         self.job_number_re = job_number_re
@@ -496,9 +521,7 @@ class Farmer:
         loop is unchanged. active_clone_set is rebuilt because
         _setup_one_clone populated it with the individual Clones.
         """
-        family = util.scheduler_families.get(self.scheduler, self.scheduler)
-        fstring = (self.pack_scheduler_fstring
-                   or util.basic_scheduler_fstrings_mps[family])
+        fstring = self.pack_template()
         run_script = self.pack_run_script or gmx_pack.default_gmx_pack_run_script
         cpus = self.pack_cpus_per_task or self.scheduler_kws.get('cpus')
         if not cpus:

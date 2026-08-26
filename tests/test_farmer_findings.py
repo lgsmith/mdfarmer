@@ -36,7 +36,8 @@ def make_template(work, steps_per_gen=STEPS_PER_GEN,
 
 
 def make_farmer(work, template=None, n_seeds=N_SEEDS, n_clones=N_CLONES,
-                n_gens=N_GENS, cpus=CPUS, cls=None, **kwargs):
+                n_gens=N_GENS, cpus=CPUS, cls=None, scheduler_fstring=None,
+                **kwargs):
     return (fm.Farmer if cls is None else cls)(
         n_seeds=n_seeds, n_clones=n_clones, n_gens=n_gens,
         config_template=make_template(work) if template is None else template,
@@ -44,7 +45,8 @@ def make_farmer(work, template=None, n_seeds=N_SEEDS, n_clones=N_CLONES,
         system_fns=[str(work / 'base.mdp')] * n_seeds,
         top_fns=[str(work / 'topol.top')] * n_seeds,
         scheduler='sbatch',
-        scheduler_fstring=util.basic_scheduler_fstrings['slurm'],
+        scheduler_fstring=(util.basic_scheduler_fstrings['slurm']
+                           if scheduler_fstring is None else scheduler_fstring),
         scheduler_kws=dict(gpu_line='', queue_name='gpu', exclude_nodes='',
                            cpus=cpus, run_script_name='run.py'),
         scheduler_report_cmd='true', scheduler_assoc_rep_cmd='true',
@@ -109,6 +111,38 @@ def main(n_clones=N_CLONES):
     work = harness.workdir('farmer_findings')
     for name in ('a.gro', 'topol.top', 'base.mdp'):
         (work / name).write_text('placeholder\n')
+
+    suite.section('the preempt trap is checked in the submitted template')
+    try:
+        captured(lambda: make_farmer(work, handle_preempt=True))
+        suite.check('a solo template with no trap is refused', False,
+                    '-> no exception')
+    except ValueError as exc:
+        suite.check('a solo template with no trap is refused',
+                    'PREEMPT_SIGTERM' in str(exc), f'-> {str(exc)[:60]}')
+    farmer, _ = captured(lambda: make_farmer(
+        work, handle_preempt=True,
+        scheduler_fstring=util.basic_scheduler_fstrings_preempt['slurm']))
+    suite.check('a solo template with a trap boots and arms the reporter',
+                farmer.config_template['handle_preempt'] is True)
+    trapless = '\n'.join(
+        line for line in util.basic_scheduler_fstrings_mps['slurm'].splitlines()
+        if 'PREEMPT_SIGTERM' not in line and 'trap ' not in line)
+    farmer, log = captured(lambda: make_farmer(
+        work, pack_size=2, pack_scheduler_fstring=trapless))
+    suite.check('a pack template with no trap warns rather than refusing',
+                'WARNING' in log and 'pack template' in log)
+    farmer, log = captured(lambda: make_farmer(work, pack_size=2))
+    suite.check('the stock pack template passes the same check',
+                'pack template' not in log)
+    label = 'packing checks the pack template, not the unsubmitted one'
+    try:
+        farmer, log = captured(lambda: make_farmer(
+            work, handle_preempt=True, pack_size=2,
+            scheduler_fstring=util.basic_scheduler_fstrings['slurm']))
+        suite.check(label, 'pack template' not in log)
+    except ValueError as exc:
+        suite.check(label, False, f'-> refused over the solo one: {exc}'[:60])
 
     suite.section('a generation that is not a whole number of write intervals')
     ragged = make_template(work, steps_per_gen=STEPS_PER_GEN + 1)
