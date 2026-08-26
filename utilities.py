@@ -324,16 +324,26 @@ basic_scheduler_fstrings_mps = {
                 """)
 }
 
+# A job of this campaign is named title, seed, clone and gen joined by the
+# separator, and the awk below matches the name field against exactly that, end
+# to end. Anything looser lets a campaign titled '{title}-long' answer to this
+# one: its jobs are named '{title}-long-0-0-5', so they pass any test on the
+# title as a prefix, and their ids then bind to this campaign's (0, 0, 5).
+# The '-' is the default sep; edit these if the Farmer is given another one.
+# Curly braces must be escaped with curly braces when using awk via str.format.
+
 # Basic report to print _only_ a list of job ids associated to this runner.
 # Should have 'title' fstring target somewhere to purify spurious jobids.
 # update_jids calls:
 #   self.scheduler_report_fstring.format(title=self.config_template['title'])
 basic_scheduler_reports = {
-    "lsf": "bjobs -o JOBID -noheader -J '{title}-*'",
+    # -o 'JOBID JOB_NAME' rather than -o JOBID, since the name is what awk tests.
+    "lsf": "bjobs -o 'JOBID JOB_NAME' -noheader -J '{title}-*'"
+           " | awk '$2 ~ /^{title}-[0-9]+-[0-9]+-[0-9]+$/ {{print $1}}'",
     # -h -o '%i %j' prints JobID and untruncated JobName, two whitespace-separated columns.
     # The default -O Name truncates to 8 chars, which silently breaks title matching.
-    # Curly braces must be escaped with curly braces when using awk via str.format.
-    "slurm": "squeue --me -h -o '%i %j' | awk '/{title}/ {{print $1}}'"
+    "slurm": "squeue --me -h -o '%i %j'"
+             " | awk '$2 ~ /^{title}-[0-9]+-[0-9]+-[0-9]+$/ {{print $1}}'"
 }
 
 # Basic report to print the name, and then the jobid, for each job with job title
@@ -343,10 +353,12 @@ basic_scheduler_reports = {
 # __init__ from Orchestrator calls:
 #   self.scheduler_assoc_fstring.format(title=self.config_template['title'])
 basic_scheduler_assoc_reports = {
-    "lsf": "bjobs -o 'JOBID JOB_NAME' -noheader -J '{title}-*'",
+    "lsf": "bjobs -o 'JOBID JOB_NAME' -noheader -J '{title}-*'"
+           " | awk '$2 ~ /^{title}-[0-9]+-[0-9]+-[0-9]+$/'",
     # awk (not grep) so a clean queue exits 0 instead of grep's exit-1-on-no-match,
     # which would crash the boot-time sp.check_output in Farmer.__init__.
-    "slurm": "squeue --me -h -o '%i %j' | awk '/{title}/'"
+    "slurm": "squeue --me -h -o '%i %j'"
+             " | awk '$2 ~ /^{title}-[0-9]+-[0-9]+-[0-9]+$/'"
 }
 
 
