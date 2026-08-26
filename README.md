@@ -57,7 +57,7 @@ harvester = mdf.Harvester(  # The default harvester makes a dry trajectory at fu
 farmer = mdf.Farmer(
     n_seeds=1,
     n_clones=100,
-    active_clone_threshold=50  # how many clones will we try to schedule simultaneously.
+    active_clone_threshold=50  # how many clones will we try to schedule simultaneously. With pack_size set this counts packs, so pack_size times as many clones run at once.
     n_gens=9,
     config_template=cfg_template,
     seed_structure_fns=['start-state.xml'],
@@ -167,6 +167,10 @@ farmer = mdf.Farmer(
     seed_config_overrides=[dict(mdrun_args=[...]), dict(mdrun_args=[...])],
 )
 ```
+
+Once packing is on, the tender schedules packs rather than clones, so
+`active_clone_threshold` counts packs: with `pack_size=2` and a threshold of
+50, 100 clones run at once. The boot log prints the figure it arrived at.
 
 Each replica gets a private, contiguous block of cores (`-ntomp`, `-pinoffset`,
 `-pinstride`), and `-ntmpi 1` on the thread-MPI builds that accept it — a

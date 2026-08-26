@@ -268,7 +268,9 @@ class Farmer:
                  # generations that ran out of restarts alike.
                  submit_failure_limit=SUBMIT_FAILURE_LIMIT,
                  # MPS packing. pack_size members share one job and one GPU;
-                 # None lets every clone submit on its own. pack_grouping,
+                 # None lets every clone submit on its own. With packing on,
+                 # active_clone_threshold counts packs, so pack_size times as
+                 # many clones run at once. pack_grouping,
                  # callable(clones) -> list of lists, chooses who goes with
                  # whom. pack_member_cores, a list or callable(group) -> list,
                  # gives each member its own number of cores.
@@ -553,6 +555,15 @@ class Farmer:
         self.priority_ordered_clones = [[pack] for pack in packs]
         self.active_clone_set = {pack for pack in packs
                                  if pack.job_number is not None}
+        # The tending loop now counts packs, so the number of clones running at
+        # once is the threshold times the members in a pack.
+        if packs:
+            biggest = max(len(pack.clones) for pack in packs)
+            print(f'NOTE: {len(packs)} packs of up to {biggest} clones. '
+                  f'active_clone_threshold={self.active_clone_threshold} '
+                  'counts packs, not clones, so up to '
+                  f'{self.active_clone_threshold * biggest} clones will run at '
+                  'once.')
         return packs
 
     # check_start_gen touches the filesystem, the scheduler and the gmx

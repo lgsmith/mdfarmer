@@ -144,6 +144,14 @@ def main(n_clones=N_CLONES):
     except ValueError as exc:
         suite.check(label, False, f'-> refused over the solo one: {exc}'[:60])
 
+    suite.section('packing changes what active_clone_threshold counts')
+    pack_size = 2
+    threshold = 3
+    farmer, log = captured(lambda: make_farmer(
+        work, pack_size=pack_size, active_clone_threshold=threshold))
+    suite.check('boot says how many clones the threshold now allows',
+                f'{threshold * pack_size} clones will run at once' in log)
+
     suite.section('a generation that is not a whole number of write intervals')
     ragged = make_template(work, steps_per_gen=STEPS_PER_GEN + 1)
     try:
