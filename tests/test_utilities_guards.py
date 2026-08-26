@@ -100,12 +100,42 @@ def check_harvest_entry_points(suite):
                 == harvester.BACKEND_LOOS)
 
 
+def check_config_from_signature(suite):
+    def a_runner(traj_name='traj', write_interval=100, steps=None, **_unused):
+        return traj_name, write_interval, steps
+
+    suite.section('the config dict recording a call')
+    config = util.merge_args_defaults_dict(a_runner, write_interval=250)
+    suite.check('defaults and overrides are both recorded',
+                config == dict(traj_name='traj', write_interval=250,
+                               steps=None), f'-> {config}')
+
+    # traj_list is the run block's, not the runner's, and rides in the config.
+    with_list = util.merge_args_defaults_dict(a_runner, traj_list='tl.txt')
+    suite.check('a key the run block reads is carried, not refused',
+                with_list.get('traj_list') == 'tl.txt', f'-> {with_list}')
+
+    exc = raises(util.merge_args_defaults_dict, a_runner, write_intervall=250)
+    suite.check('a misspelled keyword is refused, not written to the config',
+                isinstance(exc, TypeError) and 'write_intervall' in str(exc),
+                f'-> {type(exc).__name__}: {exc}')
+
+    def needs_a_seed(seed_fn, steps=10):
+        return seed_fn, steps
+
+    exc = raises(util.merge_args_defaults_dict, needs_a_seed)
+    suite.check('a required argument nobody supplied is still refused',
+                isinstance(exc, TypeError) and 'seed_fn' in str(exc),
+                f'-> {type(exc).__name__}: {exc}')
+
+
 def main():
     suite = Suite('utilities_guards')
     work = harness.workdir('utilities_guards')
     check_topology_reader(suite)
     check_state_xml_step_count(suite, work)
     check_harvest_entry_points(suite)
+    check_config_from_signature(suite)
     return suite.report()
 
 

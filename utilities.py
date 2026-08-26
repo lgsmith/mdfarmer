@@ -828,8 +828,16 @@ def calx_remaining_steps(traj_fn, top_fn, total_steps, write_interval):
     return remaining
 
 
+# Keys a config carries for the run block rather than for the runner itself.
+# gmx_basic_sim_block_json and omm_basic_sim_block_json take traj_list out of
+# the config before calling the runner, so it is no runner's parameter and still
+# belongs in config.json.
+CONFIG_ONLY_KEYS = ('traj_list',)
+
+
 # This won't be nicely jsonizable unless all default and provided vals are.
-def merge_args_defaults_dict(function, **kwargs):
+def merge_args_defaults_dict(function, config_only_keys=CONFIG_ONLY_KEYS,
+                             **kwargs):
     """A config dict recording the full call: every parameter and its value.
 
     Two things stay out of the result, since both would carry the sentinel
@@ -839,12 +847,24 @@ def merge_args_defaults_dict(function, **kwargs):
       which have no default because they collect leftovers;
     * parameters with no default that the caller did not supply. Those are
       required arguments, and are named in a TypeError instead.
+
+    A keyword that is neither a parameter of the function nor one of
+    config_only_keys is a typo: it is refused, not written into the config,
+    where gmx_generation's **_unused would swallow it at run time and leave
+    config.json describing a call that never happened.
     """
     sig = inspect.signature(function)
     variadic = (inspect.Parameter.VAR_KEYWORD, inspect.Parameter.VAR_POSITIONAL)
     config = {name: param.default
               for name, param in sig.parameters.items()
               if param.kind not in variadic}
+    unknown = sorted(set(kwargs) - set(sig.parameters) - set(config_only_keys))
+    if unknown:
+        raise TypeError(
+            f'{function.__name__} has no parameter {unknown}; check for a '
+            f'typo. Only arguments {function.__name__} takes, plus '
+            f'{list(config_only_keys)}, belong here, so config.json records '
+            f'the call that really happens.')
     config.update(kwargs)
     missing = sorted(name for name, value in config.items()
                      if value is inspect.Parameter.empty)
