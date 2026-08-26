@@ -8,6 +8,11 @@ from . import gmx_simulate as gmx
 from . import gmx_pack
 import time
 
+# Consecutive failed advances a clone is allowed before it is given up on. A
+# failed submission or a scheduler hiccup is usually transient; abandoning a
+# clone ends its part of the campaign until a human notices.
+SUBMIT_FAILURE_LIMIT = 3
+
 
 class Farmer:
     __slots__ = ('priority_ordered_clones', 'n_seeds', 'n_clones', 'n_gens', 'runner', 'jids_file',
@@ -21,7 +26,8 @@ class Farmer:
                  'restarts_per_gen', 'pack_size', 'pack_grouping',
                  'pack_cpus_per_task', 'pack_scheduler_fstring',
                  'pack_run_script', 'pack_member_cores',
-                 'seed_config_overrides')
+                 'seed_config_overrides', 'submit_failure_limit',
+                 'submit_failures')
 
     # Refresh the set of job ids the scheduler says are ours and alive.
     # Returns False when the answer could not be trusted, leaving current_jids
@@ -97,18 +103,67 @@ class Farmer:
             except (ValueError, IndexError):
                 continue
             self.current_jids.add(jid)
+            name = fields[1] if len(fields) > 1 else ''
             try:
                 # The last three fields only. The title comes first and may
                 # contain the separator itself, which would otherwise leave a
                 # running job unbound and get a second one launched over it.
-                six, cix, gix = map(int, fields[1].split(self.sep)[-3:])
-            except (ValueError, IndexError):
-                # Not one of our job names. It stays in current_jids so we do
-                # not relaunch over it, but no Clone is bound to it.
+                six, cix, gix = map(int, name.split(self.sep)[-3:])
+            except ValueError:
+                # No clone is bound to this job, so nothing stops the clone it
+                # belongs to launching a second one into the same generation
+                # directory. Say so; it is the last chance to notice.
+                print(f'WARNING: queued job {jid} is named {name!r}, which '
+                      f'does not end in {self.sep}seed{self.sep}clone'
+                      f'{self.sep}gen indices. No clone will be bound to it, '
+                      'and one may launch a second job on top of it.')
                 continue
-            rep_dict[(six, cix, gix)] = jid
+            key = (six, cix, gix)
+            # Two live jobs in one generation directory share a checkpoint and
+            # a set of part numbers, which no checkpoint can undo. The tender
+            # cannot cancel either one, so all it can do is say so.
+            if key in rep_dict:
+                print(f'WARNING: jobs {rep_dict[key]} and {jid} are both '
+                      f'queued for seed/clone/gen {key}. Two jobs in one '
+                      'generation directory will corrupt it -- cancel one by '
+                      'hand.')
+            rep_dict[key] = jid
         self.jids_file.write_text(' '.join(map(str, sorted(self.current_jids))))
         return rep_dict
+
+    # The template a pack submits: the one given, else the MPS default for
+    # this scheduler family.
+    def pack_template(self):
+        family = util.scheduler_families.get(self.scheduler, self.scheduler)
+        return (self.pack_scheduler_fstring
+                or util.basic_scheduler_fstrings_mps[family])
+
+    # A preempted job is killed outright unless its submit script traps SIGTERM
+    # and touches PREEMPT_SIGTERM, which is what the simulation watches for so
+    # it can shut down on a whole frame. Check the template that will really be
+    # submitted: packing submits the pack template and never the solo one, and
+    # a packed member watches the sentinel whether or not handle_preempt is set.
+    def check_preempt_template(self):
+        packing = bool(self.pack_size or self.pack_grouping)
+        if not packing and not self.config_template.get('handle_preempt'):
+            return
+        fstring = self.pack_template() if packing else self.scheduler_fstring
+        if 'PREEMPT_SIGTERM' in fstring and 'trap' in fstring:
+            return
+        if packing:
+            print('WARNING: the pack template has no SIGTERM trap that '
+                  'touches PREEMPT_SIGTERM, so a preempted pack loses the '
+                  'block every member is running. Use '
+                  'basic_scheduler_fstrings_mps[<scheduler>] or add an '
+                  'equivalent trap+background+wait pattern.')
+            return
+        raise ValueError(
+            'handle_preempt is set (via Farmer(handle_preempt=True) or '
+            'config_template["handle_preempt"]) but scheduler_fstring '
+            'lacks a SIGTERM trap that touches PREEMPT_SIGTERM. Use '
+            'basic_scheduler_fstrings_preempt[<scheduler>] or include '
+            'an equivalent trap+background+wait pattern in your custom '
+            'template.')
 
     # Fill in the run_script, recover_fn and progress_fn that go with runner.
     # A hand-supplied set that disagrees with it is refused rather than half
@@ -208,8 +263,14 @@ class Farmer:
                  # clone is abandoned. A generation spanning many walltime
                  # blocks wants more headroom than one that is a single job.
                  restarts_per_gen=3,
+                 # Ticks in a row a clone may fail to advance before the tender
+                 # gives up on it. Counts submissions the scheduler refused and
+                 # generations that ran out of restarts alike.
+                 submit_failure_limit=SUBMIT_FAILURE_LIMIT,
                  # MPS packing. pack_size members share one job and one GPU;
-                 # None lets every clone submit on its own. pack_grouping,
+                 # None lets every clone submit on its own. With packing on,
+                 # active_clone_threshold counts packs, so pack_size times as
+                 # many clones run at once. pack_grouping,
                  # callable(clones) -> list of lists, chooses who goes with
                  # whom. pack_member_cores, a list or callable(group) -> list,
                  # gives each member its own number of cores.
@@ -265,6 +326,9 @@ class Farmer:
         self.n_seeds = n_seeds
         self.n_clones = n_clones
         self.restarts_per_gen = restarts_per_gen
+        self.submit_failure_limit = submit_failure_limit
+        # clone -> failed advances in a row, cleared by any advance that works.
+        self.submit_failures = {}
         self.pack_size = pack_size
         self.pack_grouping = pack_grouping
         self.pack_cpus_per_task = pack_cpus_per_task
@@ -309,20 +373,11 @@ class Farmer:
             bad_node_persist, scheduler, self.scheduler_kws,
             patterns=bad_node_patterns)
         # Honor handle_preempt whether it arrives via this constructor arg or
-        # is set directly on config_template. Validating both paths stops the
-        # config_template route from silently arming the SentinelReporter
-        # without a matching SIGTERM trap (which would hard-kill on preempt).
+        # is set directly on config_template, so the config_template route
+        # cannot arm the SentinelReporter behind the Farmer's back.
         if handle_preempt or self.config_template.get('handle_preempt'):
-            if 'PREEMPT_SIGTERM' not in scheduler_fstring or 'trap' not in scheduler_fstring:
-                raise ValueError(
-                    'handle_preempt is set (via Farmer(handle_preempt=True) or '
-                    'config_template["handle_preempt"]) but scheduler_fstring '
-                    'lacks a SIGTERM trap that touches PREEMPT_SIGTERM. Use '
-                    'basic_scheduler_fstrings_preempt[<scheduler>] or include '
-                    'an equivalent trap+background+wait pattern in your custom '
-                    'template.'
-                )
             self.config_template['handle_preempt'] = True
+        self.check_preempt_template()
         self.scheduler_report_cmd = scheduler_report_cmd
         self.scheduler_assoc_rep_cmd = scheduler_assoc_rep_cmd
         self.job_number_re = job_number_re
@@ -338,6 +393,20 @@ class Farmer:
                 self.check_path(Path(self.config_template['integrator_xml'])).resolve()
             )
 
+        # A generation's last partial chunk writes neither a frame nor a
+        # checkpoint, so the steps in it can never be counted as done: the
+        # clone would spend its whole restart budget on that last sliver and
+        # then be failed. Both keys are optional, since not every engine's
+        # template carries them.
+        steps = self.config_template.get('steps')
+        write_interval = self.config_template.get('write_interval')
+        if steps and write_interval and steps % write_interval:
+            raise ValueError(
+                f'config_template steps={steps} is not a whole number of '
+                f'write_interval={write_interval} steps. The remaining '
+                f'{steps % write_interval} would write no frame and no '
+                'checkpoint, so the generation would never finish.')
+
         # buffering=0 on the DCD reporter's underlying file would make every
         # struct.pack inside DCDFile.writeModel its own syscall — much slower
         # than buffered writes plus an explicit flush per frame (which is what
@@ -351,15 +420,8 @@ class Farmer:
                   'flushes the kernel buffer after every frame; remove the '
                   'buffering=0 entry.')
 
-        seed_structure_fps = [Path(s).resolve()
-                              for s in seed_structure_fns]
-        self.seed_state_fns = []
-        for p in seed_structure_fps:
-            if p.is_file():
-                self.seed_state_fns.append(str(p))
-            else:
-                print(p)
-                raise FileNotFoundError
+        self.seed_state_fns = [str(self.check_path(Path(s).resolve()))
+                               for s in seed_structure_fns]
 
         self.sep = sep
         self.config_template['sep'] = self.sep
@@ -373,40 +435,51 @@ class Farmer:
         self.job_name_fstring = self.sep.join(job_name_elements)
         self.current_jids = set()
         self.finished_clones = set()
+        if active_clone_threshold < 1:
+            raise ValueError(
+                f'active_clone_threshold={active_clone_threshold} leaves every '
+                'clone waiting for a slot that never opens. It must be at '
+                'least 1.')
         self.active_clone_threshold = active_clone_threshold
         self.active_clone_set = set()
         self.failed_clone_set = set()
-        try:
-            traj_list = self.config_template['traj_list']
-            self.config_template['traj_list'] = str(Path(traj_list).resolve())
-        except KeyError:
-            if traj_list:
-                self.config_template['traj_list'] = traj_list
-            else:  # needs to be a fullpath to traj_list to append to, as string
-                self.config_template['traj_list'] = str(Path('traj_list.txt')
-                                                        .resolve())
+        # Every generation appends to this from its own gen directory, so it
+        # has to be one absolute path however it was given.
+        self.config_template['traj_list'] = str(Path(
+            self.config_template.get('traj_list') or traj_list
+            or 'traj_list.txt').resolve())
 
         rep_dict = self.reassociate_running_jobs()
 
         tdir = Path(self.config_template['traj_dir_top_level'])
         self.priority_ordered_clones = []
         if self.seeds_first:
-            outer_range = range(self.n_clones)
-            inner_range = range(self.n_seeds)
-            indexed = lambda outer, inner: (inner, outer)  # (seed, clone)
+            # One queue per clone index, holding every seed of it.
+            queue_keys = [[(seed_index, clone_index)
+                           for seed_index in range(self.n_seeds)]
+                          for clone_index in range(self.n_clones)]
         else:
-            outer_range = range(self.n_seeds)
-            inner_range = range(self.n_clones)
-            indexed = lambda outer, inner: (outer, inner)  # (seed, clone)
-        for outer in outer_range:
+            # One queue per seed, holding every clone of it.
+            queue_keys = [[(seed_index, clone_index)
+                           for clone_index in range(self.n_clones)]
+                          for seed_index in range(self.n_seeds)]
+        for keys in queue_keys:
             clone_queue = []
-            for inner in inner_range:
-                seed_index, clone_index = indexed(outer, inner)
+            for seed_index, clone_index in keys:
                 clone = self._setup_one_clone(
                     tdir, seed_index, clone_index, rep_dict)
                 if clone is not None:
                     clone_queue.append(clone)
             self.priority_ordered_clones.append(clone_queue)
+        # Per-clone setup failures are printed one by one and are easy to miss
+        # in a long boot log. Count them while the queues still hold clones,
+        # since packing replaces them with packs.
+        asked_for = self.n_seeds * self.n_clones
+        built = sum(len(queue) for queue in self.priority_ordered_clones)
+        if built < asked_for:
+            print(f'WARNING: {asked_for - built} of {asked_for} clones could '
+                  'not be set up; this campaign will be that much smaller '
+                  'than asked for.')
         if self.pack_size or self.pack_grouping:
             self.build_packs(tdir)
 
@@ -450,9 +523,7 @@ class Farmer:
         loop is unchanged. active_clone_set is rebuilt because
         _setup_one_clone populated it with the individual Clones.
         """
-        family = util.scheduler_families.get(self.scheduler, self.scheduler)
-        fstring = (self.pack_scheduler_fstring
-                   or util.basic_scheduler_fstrings_mps[family])
+        fstring = self.pack_template()
         run_script = self.pack_run_script or gmx_pack.default_gmx_pack_run_script
         cpus = self.pack_cpus_per_task or self.scheduler_kws.get('cpus')
         if not cpus:
@@ -484,6 +555,15 @@ class Farmer:
         self.priority_ordered_clones = [[pack] for pack in packs]
         self.active_clone_set = {pack for pack in packs
                                  if pack.job_number is not None}
+        # The tending loop now counts packs, so the number of clones running at
+        # once is the threshold times the members in a pack.
+        if packs:
+            biggest = max(len(pack.clones) for pack in packs)
+            print(f'NOTE: {len(packs)} packs of up to {biggest} clones. '
+                  f'active_clone_threshold={self.active_clone_threshold} '
+                  'counts packs, not clones, so up to '
+                  f'{self.active_clone_threshold * biggest} clones will run at '
+                  'once.')
         return packs
 
     # check_start_gen touches the filesystem, the scheduler and the gmx
@@ -499,7 +579,20 @@ class Farmer:
             traceback.print_exc()
             return False
 
-    def launch(self, sleep=None, update_jids=True):
+    # Record one failed advance. True means the clone keeps its place in the
+    # queue for another tick: a refused submission, a stalled filesystem or a
+    # generation that used up its restarts are all worth retrying before the
+    # rest of this clone's campaign is written off.
+    def note_failure(self, clone):
+        count = self.submit_failures.get(clone, 0) + 1
+        self.submit_failures[clone] = count
+        if count < self.submit_failure_limit:
+            print(f'{clone.get_tag()} failed to advance: attempt {count} of '
+                  f'{self.submit_failure_limit}, retrying next tick.')
+            return True
+        return False
+
+    def launch(self, update_jids=True):
         still_running = []  # note, this will be flat
         if update_jids and not self.update_jids():
             # Scheduler unreachable. Every clone we know about is presumed to
@@ -507,62 +600,68 @@ class Farmer:
             # than making launch decisions on evidence we do not have.
             return [True] * max(1, sum(len(cl) for cl in
                                        self.priority_ordered_clones))
-        for clone_list in self.priority_ordered_clones:
+        for queue_index, clone_list in enumerate(self.priority_ordered_clones):
             # Record one False for a fully emptied clone-list
             if not clone_list:
                 print('not clonelist-triggered')
                 still_running.append(False)
-            else:
-                clone_indexes_to_remove = []
-                for i, clone in enumerate(clone_list):
-                    print('starting into clone loop for clone index',
-                          i, clone.get_tag())
-                    if sleep:
-                        time.sleep(sleep)
-                    # This probably shouldn't happen, but it's worth checking for
-                    if clone in self.finished_clones or \
-                            clone in self.failed_clone_set:
-                        print('clone is finished clones or failed clones')
-                        still_running.append(False)
-                        clone_indexes_to_remove.append(i)
-                    elif self.check_mark_clone_finished(clone):
-                        print('clone was just marked finished')
-                        still_running.append(False)
-                        clone_indexes_to_remove.append(i)
-                    # If clone is in active set, it may have just finished a generation.
-                    elif clone in self.active_clone_set:
-                        print('clone is in active clone list')
-                        # Try to start another. A bad checkpoint or a failed
-                        # submission fails this clone, not the whole campaign.
-                        did_start = self._safe_check_start_gen(clone)
-                        if did_start:
-                            still_running.append(True)
-                        else:
-                            self.mark_clone_failed(clone)
-                            still_running.append(False)
-                            clone_indexes_to_remove.append(i)
-
-                    # This condition arises when there are few enough active clones
-                    # that we could launch more.
-                    elif len(self.active_clone_set) < self.active_clone_threshold:
-                        print(
-                            'there are some more active clones, let us launch', clone.get_tag())
-                        #  So we try to launch another.
-                        if self._safe_check_start_gen(clone):
-                            print('started clone, adding to active_clone_set')
-                            self.active_clone_set.add(clone)
-                            still_running.append(True)
-                        else:
-                            self.mark_clone_failed(clone)
-                            still_running.append(False)
-                            clone_indexes_to_remove.append(i)
+                continue
+            # The clones this queue keeps for the next tick. Everything else
+            # has either finished or failed, and is dropped.
+            survivors = []
+            for clone in clone_list:
+                print('starting into clone loop for', clone.get_tag())
+                # This probably shouldn't happen, but it's worth checking for
+                if clone in self.finished_clones or \
+                        clone in self.failed_clone_set:
+                    print('clone is finished clones or failed clones')
+                    still_running.append(False)
+                elif self.check_mark_clone_finished(clone):
+                    print('clone was just marked finished')
+                    still_running.append(False)
+                # If clone is in active set, it may have just finished a generation.
+                elif clone in self.active_clone_set:
+                    print('clone is in active clone list')
+                    # Try to start another. A bad checkpoint or a failed
+                    # submission fails this clone, not the whole campaign.
+                    if self._safe_check_start_gen(clone):
+                        self.submit_failures.pop(clone, None)
+                        survivors.append(clone)
+                        still_running.append(True)
+                    elif self.note_failure(clone):
+                        survivors.append(clone)
+                        still_running.append(True)
                     else:
-                        print('WARNING:', clone.get_tag(),
-                              'is not accounted for by launch logic.')
-                # Because we are changing the length of the list, this must be done in reverse order
-                clone_indexes_to_remove.reverse()
-                for i in clone_indexes_to_remove:
-                    del clone_list[i]
+                        self.mark_clone_failed(clone)
+                        still_running.append(False)
+
+                # This condition arises when there are few enough active clones
+                # that we could launch more.
+                elif len(self.active_clone_set) < self.active_clone_threshold:
+                    print(
+                        'there are some more active clones, let us launch', clone.get_tag())
+                    #  So we try to launch another.
+                    if self._safe_check_start_gen(clone):
+                        print('started clone, adding to active_clone_set')
+                        self.submit_failures.pop(clone, None)
+                        self.active_clone_set.add(clone)
+                        survivors.append(clone)
+                        still_running.append(True)
+                    elif self.note_failure(clone):
+                        survivors.append(clone)
+                        still_running.append(True)
+                    else:
+                        self.mark_clone_failed(clone)
+                        still_running.append(False)
+                # Every slot is taken, so this clone waits its turn. Nothing is
+                # wrong, and it is still part of the campaign.
+                else:
+                    if not self.quiet:
+                        print(clone.get_tag(),
+                              'is waiting for a free slot.')
+                    survivors.append(clone)
+                    still_running.append(True)
+            self.priority_ordered_clones[queue_index] = survivors
         return still_running
 
     # whether you're starting or restarting, this is probably what you want
@@ -578,7 +677,7 @@ class Farmer:
                 'No clones could be set up; nothing to tend. Check the '
                 'per-clone setup errors printed above (missing structure, '
                 'topology, .mdp, or an unreadable checkpoint).')
-        still_running = self.launch(sleep=None, update_jids=False)
+        still_running = self.launch(update_jids=False)
         brake_file_p = Path('stop')
         # this needs to be while all(list of T/F for completed seeds/clones)
         print('still_running:', *still_running, flush=True)
@@ -597,7 +696,7 @@ class Farmer:
             # a stalled filesystem, a harvest blowing up. Losing the tender
             # leaves every running job unminded, which is what costs.
             try:
-                still_running = self.launch(sleep=None)
+                still_running = self.launch()
             except Exception as exc:
                 print(f'ERROR in tending loop: {type(exc).__name__}: {exc}')
                 traceback.print_exc()
