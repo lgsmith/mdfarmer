@@ -441,23 +441,44 @@ class Clone:
         else:
             gen_paths = []
 
+        # A generation whose job is still running is never recovered. Recovery
+        # trims and renames files that job still holds open, and it is the
+        # normal case at boot: that is what rep_dict is for. Bind to the live
+        # job instead and let check_start_gen see it is alive.
+        live_gens = sorted(gen for six, cix, gen in rep_dict
+                           if (six, cix) == (seed_index, clone_index))
         _recover = recover_fn if recover_fn is not None else _try_recover_gen
         recovered = None
-        for gen_path in reversed(gen_paths):
-            recovered = _recover(
-                gen_path,
-                append_mode=append_mode,
-                restart_name=config_template['restart_name'],
-                traj_name=config_template['traj_name'],
-                traj_suffix=config_template['traj_suffix'],
-                write_interval=config_template['write_interval'],
-                total_steps=steps_per_gen,
-                top_fn=top_fn,
-            )
-            if recovered is not None:
-                break
+        if not live_gens:
+            for gen_path in reversed(gen_paths):
+                recovered = _recover(
+                    gen_path,
+                    append_mode=append_mode,
+                    restart_name=config_template['restart_name'],
+                    traj_name=config_template['traj_name'],
+                    traj_suffix=config_template['traj_suffix'],
+                    write_interval=config_template['write_interval'],
+                    total_steps=steps_per_gen,
+                    top_fn=top_fn,
+                )
+                if recovered is not None:
+                    break
 
-        if recovered is not None:
+        if live_gens:
+            gen_index = live_gens[-1]
+            live_dir = util.dir_seeds_clones_gens(
+                tdir, seed_index, clone_index, gen_index, dirname_pad,
+                sep=sep, mkdir=False)
+            restart_p = live_dir / config_template['restart_name']
+            seed_fn = (str(restart_p.resolve())
+                       if restart_p.is_file() and restart_p.stat().st_size
+                       else initial_seed_fn)
+            steps_this_launch = steps_per_gen
+            append_now = True
+            is_internal_restart = True
+            print(f'seed {seed_index} clone {clone_index} gen {gen_index} is '
+                  'still running; leaving its files alone.')
+        elif recovered is not None:
             gen_index, seed_fn, steps_this_launch, append_now = recovered
             is_internal_restart = True
         else:
