@@ -757,29 +757,32 @@ def dcd_frame_size(with_unitcell: bool, n_atoms: int) -> int:
 
 
 def truncate_dcd_to_nframes(p: Path, target_nframes: int) -> int:
-    """Reduce a DCD's frame count to target_nframes by rewriting the
-    header nset field and truncating trailing bytes. No-op if already
-    at target. Refuses to grow. Idempotent on partial completion.
+    """Cut a DCD down to at most target_nframes, or however many whole
+    frames its bytes actually hold if that is fewer. Rewrites nset and
+    truncates trailing bytes so the header and the file length always
+    agree afterward. Never grows the file. Idempotent.
+
+    Returns the frame count actually achieved, which the caller must
+    compare against target_nframes: they can disagree when the header's
+    nset over- or under-states what is really on disk.
     """
     info = dcd_header_info(p)
-    cur_nset = info['nset']
-    if target_nframes > cur_nset:
-        raise ValueError(f'truncate_dcd_to_nframes refuses to grow '
-                         f'{p}: current nset={cur_nset}, target='
-                         f'{target_nframes}')
-    if target_nframes == cur_nset:
-        return cur_nset
     frame_size = dcd_frame_size(info['with_unitcell'], info['n_atoms'])
-    new_size = info['header_size'] + target_nframes * frame_size
-    # Rewrite nset first, then truncate. If interrupted between, the
-    # file's nset is below its byte length; the next call computes the
-    # same target and is a no-op (trailing bytes stay as harmless
-    # padding that mdtraj/LOOS ignore since they honor nset).
+    header_size = info['header_size']
+    # nset is not trusted. OpenMM bumps it before writing the frame it
+    # counts, so a kill mid-write leaves it ahead of the data. The byte
+    # length is what actually happened.
+    whole_frames = max(0, (p.stat().st_size - header_size) // frame_size)
+    achievable = min(target_nframes, whole_frames)
+    if achievable != target_nframes:
+        print(f'{p}: asked to trim to {target_nframes} frames but only '
+              f'{whole_frames} whole frames are actually on disk; '
+              f'trimming to {achievable} instead.')
     with open(p, 'r+b') as f:
         f.seek(8)
-        f.write(struct.pack('<i', target_nframes))
-    os.truncate(str(p), new_size)
-    return target_nframes
+        f.write(struct.pack('<i', achievable))
+    os.truncate(str(p), header_size + achievable * frame_size)
+    return achievable
 
 
 def calx_remaining_steps(traj_fn, top_fn, total_steps, write_interval):
