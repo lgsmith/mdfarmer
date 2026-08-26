@@ -65,7 +65,7 @@ class Farmer:
     # return True if finished, False if not.
     def check_mark_clone_finished(self, clone):
         next_up_gen = clone.current_gen
-        enough_gens = next_up_gen > self.n_gens
+        enough_gens = next_up_gen >= self.n_gens
         if enough_gens:
             print('Finished:', clone.get_tag())
             self.finished_clones.add(clone)
@@ -165,6 +165,7 @@ class Farmer:
                 preemption_checker=util.preemption_checkers.get(self.scheduler),
                 node_blocklist=self.node_blocklist,
                 restarts_per_gen=self.restarts_per_gen,
+                last_gen_index=self.n_gens - 1,
                 rep_dict=rep_dict,
                 run_script=self.run_script,
                 recover_fn=self.recover_fn,

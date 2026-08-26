@@ -241,7 +241,7 @@ class Clone:
         'scheduler_kws', 'restarts_per_gen', 'restart_attempts', 'run_script',
         'harvester', 'remaining_steps', 'run_script_name', 'total_steps',
         'preemption_checker', 'node_blocklist', 'progress_fn',
-        'scheduler_log_dir')
+        'scheduler_log_dir', 'last_gen_index')
 
     # This should mostly be used by the init function, and by adaptive sampling scripts.
 
@@ -301,6 +301,10 @@ class Clone:
                  # still owes. None counts frames, which is right for OpenMM.
                  # GROMACS passes gmx_simulate.gmx_gen_progress instead.
                  progress_fn=None,
+                 # 0-based index of this clone's final generation. None means
+                 # no limit, for callers outside a Farmer. check_start_gen
+                 # will not start a generation past it.
+                 last_gen_index=None,
                  dry_run=False
                  ):
         # REQUIRED ARGS below here
@@ -376,6 +380,7 @@ class Clone:
         self.preemption_checker = preemption_checker
         self.node_blocklist = node_blocklist
         self.progress_fn = progress_fn
+        self.last_gen_index = last_gen_index
         self.run_script = run_script
         # Where this clone's scheduler log lands. None means its own generation
         # directory; a ClonePack points every member at the pack directory,
@@ -425,6 +430,9 @@ class Clone:
                   preemption_checker=None,
                   node_blocklist=None,
                   restarts_per_gen=3,
+                  # 0-based index of this clone's final generation, passed
+                  # straight through to Clone.__init__. None means no limit.
+                  last_gen_index=None,
                   # GROMACS support hooks. None -> OpenMM defaults:
                   #   recover_fn -> _try_recover_gen (state.xml/DCD recovery)
                   #   run_script -> Clone's default_run_script (omm runner)
@@ -555,6 +563,7 @@ class Clone:
             preemption_checker=preemption_checker,
             node_blocklist=node_blocklist,
             progress_fn=progress_fn,
+            last_gen_index=last_gen_index,
             dry_run=dry_run,
             **run_script_kw,
         )
@@ -728,6 +737,14 @@ class Clone:
                                               submit=submit)
         return attempted_launch
 
+    # True once this clone has finished its last configured generation and
+    # will never start another. False when last_gen_index is None, since
+    # there is then no limit to have reached.
+    @property
+    def is_done(self):
+        return (self.last_gen_index is not None
+                and self.current_gen > self.last_gen_index)
+
     # How many steps this generation still owes. progress_fn answers if one
     # was given; otherwise it is counted from the trajectory's frames.
     def gen_remaining_steps(self):
@@ -789,6 +806,12 @@ class Clone:
                     # simulation campaign from advancing.
                     print(f'harvester failed for {self.get_tag()}: '
                           f'{type(exc).__name__}: {exc}; continuing.')
+            if (self.last_gen_index is not None
+                    and self.config['gen_index'] >= self.last_gen_index):
+                # This was the last generation asked for; count it done
+                # instead of starting one more.
+                self.current_gen += 1
+                return True
             return self.start_next(overwrite=overwrite, submit=submit)
 
         if self.remaining_steps >= self.total_steps:
