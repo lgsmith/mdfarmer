@@ -438,41 +438,41 @@ def reimage_with_loos(traj_fn, structure_fn, out_fn, top_fn=None,
 
 def _verify_reimaged(out_p, top_fn=None, include_dir=None, ranges=None,
                      structure_fn=None, max_bond=MAX_BOND):
-    """Check a just-reimaged trajectory's bond lengths, since it may have failed
-    quietly. A bond longer than max_bond means the output is wrong."""
+    """Check a just-reimaged trajectory, since LOOS can fail quietly.
+
+    Two independent checks. A bond longer than max_bond says a molecule is still
+    split. The anchor margin says whether mergeImage() was even entitled to an
+    answer, and is the only one that catches an atom with no bonds stranded from
+    its own molecule, which no bond length can be long enough to reveal.
+    """
+    margin = None
+    if ranges is not None:
+        margin = check_anchor_distances(out_p, ranges,
+                                        structure_fn=structure_fn)
+    unsafe = '' if margin is None or margin['loos_safe'] else (
+        f' The furthest atom sits {margin["max_anchor_offset"]:.3f} nm along '
+        f'axis {margin["axis"]} from its molecule\'s anchor atom, past the '
+        f'{margin["limit"]:.3f} nm half-edge limit mergeImage() assumes, so '
+        f'this system is outside the LOOS backend\'s safe regime. Use the '
+        f'{BACKEND_TRJCONV!r} backend.')
+
     if top_fn is not None:
         n_bad, violations = check_bond_lengths(
             out_p, pairs=bond_pairs(top_fn, include_dir=include_dir),
             max_bond=max_bond, stop_early=True)
         if n_bad:
             frame, i, j, length = violations[0]
-            hint = ''
-            if ranges is not None:
-                margin = check_anchor_distances(
-                    out_p, ranges, structure_fn=structure_fn)
-                if not margin['loos_safe']:
-                    hint = (
-                        f' The furthest atom sits {margin["max_anchor_offset"]:.3f} nm '
-                        f'along axis {margin["axis"]} from its molecule\'s anchor '
-                        f'atom, past the {margin["limit"]:.3f} nm half-edge limit '
-                        f'that LOOS\'s mergeImage() assumes, so this system is '
-                        f'outside the LOOS backend\'s safe regime; use the '
-                        f'{BACKEND_TRJCONV!r} backend.')
             raise RuntimeError(
                 f'{out_p} still has an overlong bond after reimaging: atoms '
                 f'{i}-{j} are {length:.3f} nm apart in frame {frame} (limit '
-                f'{max_bond} nm).{hint}')
-    elif ranges is not None:
-        margin = check_anchor_distances(out_p, ranges,
-                                        structure_fn=structure_fn)
-        if not margin['loos_safe']:
-            print(f'[reimage] WARNING: cannot verify bond lengths without a '
-                  f'.top, and the furthest atom is '
-                  f'{margin["max_anchor_offset"]:.3f} nm from its anchor along '
-                  f'axis {margin["axis"]} (half-edge limit '
-                  f'{margin["limit"]:.3f} nm), so LOOS\'s mergeImage() may have '
-                  f'mis-wrapped atoms. Pass top_fn to get a real check, or use '
-                  f'the trjconv backend.', flush=True)
+                f'{max_bond} nm).{unsafe}')
+    if unsafe:
+        raise RuntimeError(
+            f'{out_p} was reimaged outside the LOOS backend\'s safe '
+            f'regime.{unsafe}')
+    if top_fn is None and margin is None:
+        print(f'[reimage] {out_p} was written unchecked: pass top_fn or ranges '
+              'to have it verified.', flush=True)
 
 
 def _loos_writer(out_p):
