@@ -501,60 +501,57 @@ class Farmer:
             # than making launch decisions on evidence we do not have.
             return [True] * max(1, sum(len(cl) for cl in
                                        self.priority_ordered_clones))
-        for clone_list in self.priority_ordered_clones:
+        for queue_index, clone_list in enumerate(self.priority_ordered_clones):
             # Record one False for a fully emptied clone-list
             if not clone_list:
                 print('not clonelist-triggered')
                 still_running.append(False)
-            else:
-                clone_indexes_to_remove = []
-                for i, clone in enumerate(clone_list):
-                    print('starting into clone loop for clone index',
-                          i, clone.get_tag())
-                    # This probably shouldn't happen, but it's worth checking for
-                    if clone in self.finished_clones or \
-                            clone in self.failed_clone_set:
-                        print('clone is finished clones or failed clones')
-                        still_running.append(False)
-                        clone_indexes_to_remove.append(i)
-                    elif self.check_mark_clone_finished(clone):
-                        print('clone was just marked finished')
-                        still_running.append(False)
-                        clone_indexes_to_remove.append(i)
-                    # If clone is in active set, it may have just finished a generation.
-                    elif clone in self.active_clone_set:
-                        print('clone is in active clone list')
-                        # Try to start another. A bad checkpoint or a failed
-                        # submission fails this clone, not the whole campaign.
-                        did_start = self._safe_check_start_gen(clone)
-                        if did_start:
-                            still_running.append(True)
-                        else:
-                            self.mark_clone_failed(clone)
-                            still_running.append(False)
-                            clone_indexes_to_remove.append(i)
-
-                    # This condition arises when there are few enough active clones
-                    # that we could launch more.
-                    elif len(self.active_clone_set) < self.active_clone_threshold:
-                        print(
-                            'there are some more active clones, let us launch', clone.get_tag())
-                        #  So we try to launch another.
-                        if self._safe_check_start_gen(clone):
-                            print('started clone, adding to active_clone_set')
-                            self.active_clone_set.add(clone)
-                            still_running.append(True)
-                        else:
-                            self.mark_clone_failed(clone)
-                            still_running.append(False)
-                            clone_indexes_to_remove.append(i)
+                continue
+            # The clones this queue keeps for the next tick. Everything else
+            # has either finished or failed, and is dropped.
+            survivors = []
+            for clone in clone_list:
+                print('starting into clone loop for', clone.get_tag())
+                # This probably shouldn't happen, but it's worth checking for
+                if clone in self.finished_clones or \
+                        clone in self.failed_clone_set:
+                    print('clone is finished clones or failed clones')
+                    still_running.append(False)
+                elif self.check_mark_clone_finished(clone):
+                    print('clone was just marked finished')
+                    still_running.append(False)
+                # If clone is in active set, it may have just finished a generation.
+                elif clone in self.active_clone_set:
+                    print('clone is in active clone list')
+                    # Try to start another. A bad checkpoint or a failed
+                    # submission fails this clone, not the whole campaign.
+                    did_start = self._safe_check_start_gen(clone)
+                    if did_start:
+                        survivors.append(clone)
+                        still_running.append(True)
                     else:
-                        print('WARNING:', clone.get_tag(),
-                              'is not accounted for by launch logic.')
-                # Because we are changing the length of the list, this must be done in reverse order
-                clone_indexes_to_remove.reverse()
-                for i in clone_indexes_to_remove:
-                    del clone_list[i]
+                        self.mark_clone_failed(clone)
+                        still_running.append(False)
+
+                # This condition arises when there are few enough active clones
+                # that we could launch more.
+                elif len(self.active_clone_set) < self.active_clone_threshold:
+                    print(
+                        'there are some more active clones, let us launch', clone.get_tag())
+                    #  So we try to launch another.
+                    if self._safe_check_start_gen(clone):
+                        print('started clone, adding to active_clone_set')
+                        self.active_clone_set.add(clone)
+                        survivors.append(clone)
+                        still_running.append(True)
+                    else:
+                        self.mark_clone_failed(clone)
+                        still_running.append(False)
+                else:
+                    print('WARNING:', clone.get_tag(),
+                          'is not accounted for by launch logic.')
+                    survivors.append(clone)
+            self.priority_ordered_clones[queue_index] = survivors
         return still_running
 
     # whether you're starting or restarting, this is probably what you want
