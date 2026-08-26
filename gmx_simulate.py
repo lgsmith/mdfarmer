@@ -382,6 +382,9 @@ def gmx_generation(traj_dir_top_level: str,
                    title: str,
                    # gen 0: path to the starting .gro; gen N: path to the seed
                    # state.cpt (copied into this gen dir by Clone).
+                   # seed_fn and append are here to match the OpenMM runner's
+                   # arguments, and are not read: Clone has already copied the
+                   # seed in under restart_name, and mdrun always -noappends.
                    seed_fn: str,
                    # constant starting structure (.gro) for grompp -c at gen 0.
                    structure_fn: str = None,

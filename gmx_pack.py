@@ -240,7 +240,6 @@ def _resolve_cpus_per_task(manifest):
 
 def gmx_pack_sim_block_json(manifest_fn=PACK_MANIFEST_NAME,
                             poll_seconds=POLL_SECONDS,
-                            reps_per_card=REPS_PER_CARD,
                             pin_stride=PIN_STRIDE,
                             pack_status_name=PACK_STATUS_NAME,
                             ntmpi=NTMPI,

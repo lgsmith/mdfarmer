@@ -687,8 +687,8 @@ def _frame_times(traj_p, scan_chunk=reimage.SCAN_CHUNK):
     return np.concatenate(times) if times else np.array([])
 
 
-def verify_dry_chain(gen_dirs, structure_fn=None, sentinel_name=SENTINEL_NAME,
-                     dry_prefix=DRY_PREFIX, scan_chunk=reimage.SCAN_CHUNK):
+def verify_dry_chain(gen_dirs, sentinel_name=SENTINEL_NAME,
+                     scan_chunk=reimage.SCAN_CHUNK):
     """Check the harvested stream of a clone is contiguous and unduplicated.
 
     Across N harvested generations the dry stream holds
