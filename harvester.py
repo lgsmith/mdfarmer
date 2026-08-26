@@ -1,44 +1,14 @@
-"""Harvesting: reduce a finished generation to the streams we keep, then --
-and only then -- delete the original.
+"""Reduce a finished generation to the two trajectories we keep.
 
-A harvest produces two outputs from one generation's raw trajectory:
+A harvest writes a dry trajectory (every frame, solute only) and a downsampled
+one (every Nth frame, solvent kept), then replaces the original with a symlink
+to the dry one. Deleting the original cannot be undone, so the frames written
+are counted and compared against a plan first, and a .harvested sentinel is
+written at the end so a re-run does nothing instead of reading and writing the
+same file at once.
 
-  * the **dry** stream, every frame, solute only;
-  * the **downsampled** stream, every Nth frame, solvent kept.
-
-and, if both check out, replaces the original with a symlink to the dry stream.
-That last step is irreversible, so everything here is built around making it
-provably safe:
-
-**Counts, not file sizes.** A harvest killed partway through the write loop
--- preemption, walltime, OOM -- leaves both outputs nonzero and truncated, so
-``st_size > 0`` cannot decide whether one finished. Frames are counted in the
-source first, the expected output counts are computed from the frame plan, and
-the written files are re-counted off disk before anything is unlinked.
-
-**Idempotence.** After a successful harvest the original name is a symlink to
-the dry stream, so a second pass would read the dry file and write it at the
-same time. A requeueing scheduler makes re-runs routine, so a ``.harvested``
-sentinel carrying the counts is written last and short-circuits the whole
-thing; a symlinked input with no sentinel is a harvest that died in that
-window, and is repaired rather than repeated.
-
-**Streaming.** Generations here run to ~1 microsecond. ``md.load`` is
-whole-trajectory: 240k frames of 10k atoms is 29 GB of coordinates before
-imaging or slicing. The LOOS backend streams frame by frame; the mdtraj backend
-uses ``md.iterload``. Neither holds the trajectory.
-
-**Backend by box shape, decided by looking.** LOOS cannot represent a triclinic
-cell, and does not raise -- it keeps the diagonal (see ``reimage``). The choice
-therefore cannot be a try/except around the LOOS call, since nothing would be
-raised on the one case it exists to catch. The box is read off frame 0 and the
-off-diagonals decide: rectangular goes to LOOS, anything else to mdtraj.
-
-**One frame plan.** Which frames land in each stream is computed once, in
-``frame_plan``, from the generation's *global* index -- so the downsample phase
-is continuous across generations instead of resetting at every seam, and the
-frame each engine writes at the restart step is dropped exactly once. Both
-backends consume that plan, so they cannot disagree.
+Both backends stream, since a generation can be tens of GB. LOOS is used when
+the box is rectangular and mdtraj when it is not.
 """
 
 import json
@@ -70,11 +40,9 @@ BACKEND_MDTRAJ = 'mdtraj'
 # backend is already frame-at-a-time.
 ITERLOAD_CHUNK = 100
 
-# What to do with the frame an engine writes at the step it restarted from,
-# which duplicates the previous generation's last frame. 'auto' decides from the
-# frame count: a generation holding steps_per_gen/write_interval + 1 frames has
-# one, a generation holding exactly steps_per_gen/write_interval does not.
-# GROMACS writes it; the OpenMM reporters do not.
+# What to do with the frame that repeats the previous generation's last one.
+# GROMACS writes it, the OpenMM reporters do not, and 'auto' tells which by
+# whether the file holds one frame more than the generation is long.
 SEAM_AUTO = 'auto'
 SEAM_DROP = 'drop'
 SEAM_KEEP = 'keep'
@@ -88,8 +56,7 @@ ANGSTROM_PER_NM = reimage.ANGSTROM_PER_NM
 
 
 class HarvestError(RuntimeError):
-    """Raised before the original trajectory is removed, so a generation that
-    fails to harvest still holds everything it started with."""
+    """Raised before the original is removed, so a failed harvest loses nothing."""
 
 
 class Harvester:
@@ -135,25 +102,11 @@ class Harvester:
         return scheduler_output
 
 
-# ---------------------------------------------------------------------------
-# Config-time checks
-# ---------------------------------------------------------------------------
-
 def check_commensurability(steps_per_gen, write_interval, downsample_frq):
-    """Both spacing conditions, checked where a violation is still free to fix.
+    """Return frames per generation, checking both spacings divide evenly.
 
-    ``steps_per_gen % write_interval == 0`` puts a generation's last written
-    frame exactly on the checkpoint the next generation restarts from; without
-    it every seam drops the trajectory between the last frame and the restart
-    state, invisibly in the timestamps and really in the sampling.
-
-    ``frames_per_gen % downsample_frq == 0`` keeps the downsampled stream evenly
-    spaced across the concatenation. Generations are harvested independently, so
-    an incommensurate frame count breaks the spacing at every boundary.
-
-    Returns frames_per_gen, which is the number of *new* frames a generation
-    contributes -- one less than the file holds when the engine writes a frame
-    at its restart step.
+    This is the count of NEW frames, one less than the file holds when the
+    engine also writes a frame at the step it restarted from.
     """
     if write_interval <= 0:
         raise ValueError(f'write_interval must be positive, got {write_interval}')
@@ -173,18 +126,9 @@ def check_commensurability(steps_per_gen, write_interval, downsample_frq):
     return frames_per_gen
 
 
-# ---------------------------------------------------------------------------
-# The frame plan -- the single place that decides what goes where
-# ---------------------------------------------------------------------------
-
 def resolve_seam(n_orig, frames_per_gen, gen_index, seam=SEAM_AUTO):
-    """True when this generation's frame 0 duplicates the previous one's last.
-
-    Generation N+1 restarts from generation N's checkpoint; GROMACS writes a
-    frame at that step, so the two files share a time point. Concatenating
-    without dropping one repeats a frame at every seam, which biases lag times
-    and kinetics without ever failing loudly.
-    """
+    """True when this generation's first frame repeats the previous one's last."""
+    # GROMACS writes a frame at the step it restarts from; OpenMM does not.
     if seam == SEAM_KEEP:
         return False
     if seam == SEAM_DROP:
@@ -207,19 +151,16 @@ def resolve_seam(n_orig, frames_per_gen, gen_index, seam=SEAM_AUTO):
 
 
 def keeps_frame(local_index, first_global_index, downsample_frq, skip_first):
-    """``(write_dry, write_downsample)`` for one frame. The rule, in one place.
-
-    `first_global_index` is where this generation's frames sit in the
-    concatenated stream, which is what keeps the downsample phase continuous
-    across generations rather than resetting at every seam.
-    """
+    """(write_dry, write_downsample) for one frame. The rule lives only here."""
+    # Counting from the frame's place in the whole trajectory, not in this
+    # generation, is what keeps the downsample phase running across seams.
     if skip_first and local_index == 0:
         return False, False
     return True, ((first_global_index + local_index) % downsample_frq == 0)
 
 
 def frame_plan(n_orig, first_global_index, downsample_frq, skip_first):
-    """Yield ``(local_index, write_dry, write_downsample)`` for every frame."""
+    """Yield (local_index, write_dry, write_downsample) for every frame."""
     for local in range(n_orig):
         dry, down = keeps_frame(local, first_global_index, downsample_frq,
                                 skip_first)
@@ -236,28 +177,12 @@ def expected_counts(n_orig, first_global_index, downsample_frq, skip_first):
     return n_dry, n_down
 
 
-# ---------------------------------------------------------------------------
-# Backend selection and subset resolution
-# ---------------------------------------------------------------------------
-
 def source_frame_timing(traj_fn, n_orig):
-    """``(step0, steps_per_frame, time0, time_per_frame)`` read off the source.
+    """(step0, steps_per_frame, time0, time_per_frame), or None for a DCD.
 
-    Both writers need this handed to them, and the harvest deletes the original,
-    so a wrong answer destroys the time axis rather than merely mislabelling it:
-
-      * LOOS's XTCWriter numbers frames from its own counters -- ``dt_ = 1.0``,
-        ``step_ = 0``, ``steps_per_frame_ = 1`` (``src/xtcwriter.hpp``) -- so
-        without an explicit step and time every frame lands 1 ps apart, stamped
-        with its frame index.
-      * mdtraj carries ``time`` but fills ``step`` with the frame index unless
-        told otherwise.
-
-    The extrapolation from frames 0 and 1 is only valid if the source is evenly
-    spaced, so it is checked against the last frame before it is used.
-
-    Returns None for a format that carries no per-frame timing (DCD keeps it in
-    the header, and mdtraj does not surface it on read).
+    Neither writer keeps the source's step and time on its own, so they are read
+    here and passed in explicitly. LOOS would otherwise number frames from zero
+    at 1 ps apart, and mdtraj would write the frame index as the step.
     """
     import numpy as np
     import mdtraj as md
@@ -291,12 +216,9 @@ def source_frame_timing(traj_fn, n_orig):
 
 def select_backend(traj_fn, structure_fn=None, backend=BACKEND_AUTO,
                    triclinic_rtol=reimage.TRICLINIC_RTOL):
-    """Pick a backend by looking at the box, not by catching an exception.
-
-    LOOS does not raise on a triclinic cell; it keeps the diagonal and carries
-    on. Nothing would reach a try/except around the LOOS call, so the
-    off-diagonals are read first and the choice made before either engine runs.
-    """
+    """Return 'loos' for a rectangular box, 'mdtraj' for anything else."""
+    # Looked up rather than caught: LOOS keeps only the diagonal of a triclinic
+    # box and raises nothing, so a try/except would never fire.
     if backend != BACKEND_AUTO:
         if backend not in (BACKEND_LOOS, BACKEND_MDTRAJ):
             raise ValueError(
@@ -326,18 +248,10 @@ def subset_indices(structure_fn, selection, syntax=SYNTAX_LOOS):
 
 
 def indices_to_loos_selection(indices):
-    """A LOOS selection string matching exactly `indices`.
-
-    ``index`` is a numeric selector in the LOOS grammar (``src/grammar.yy``,
-    ``pushAtomIndex``) reading ``Atom::index()`` -- the 0-based position in the
-    model, which is what both engines agree on. Contiguous runs are collapsed so
-    a solute subset stays a handful of clauses rather than thousands.
-
-    Going through a selection string rather than assembling a group atom by atom
-    is not stylistic: ``AtomicGroup::select`` shares the parent's
-    SharedPeriodicBox, and a hand-built group does not -- it would write a
-    frozen or absent cell into the dry stream.
-    """
+    """A LOOS selection string matching exactly these atom indices."""
+    # Runs are collapsed so a solute is a few clauses, not thousands. It has
+    # to be a selection: LOOS shares the box with a selected group, but gives a
+    # hand-built one its own, which then freezes in the dry trajectory.
     runs, start, previous = [], None, None
     for index in sorted(indices):
         if start is None:
@@ -355,16 +269,10 @@ def indices_to_loos_selection(indices):
 
 
 def resolve_subset(structure_fn, selection, syntax=SYNTAX_LOOS):
-    """Resolve a subset once, into a form each backend can use.
+    """Resolve a subset into indices for mdtraj and a selection for LOOS.
 
-    The two engines speak different selection languages, and the backend is
-    chosen from the box rather than by the user -- so a config carrying only a
-    LOOS string must still work when the box turns out to be triclinic, and vice
-    versa. Resolving once and handing each backend its own view of the *same*
-    atoms is what keeps the choice of backend from changing what gets written.
-
-    Returns ``None`` for "keep everything", else a dict with ``indices`` (for
-    mdtraj) and ``loos_selection`` (for LOOS).
+    None means keep every atom. Both forms come from one resolution so that
+    which backend runs cannot change which atoms get written.
     """
     if not selection:
         return None
@@ -379,21 +287,10 @@ def resolve_subset(structure_fn, selection, syntax=SYNTAX_LOOS):
                         else indices_to_loos_selection(indices)))
 
 
-# ---------------------------------------------------------------------------
-# Backends
-# ---------------------------------------------------------------------------
-
 def _harvest_loos(traj_fn, structure_fn, subset_spec, dry_out, down_out,
                   first_global_index, downsample_frq, skip_first,
                   timing=None, dry_topology_name=DRY_TOPOLOGY_NAME):
-    """Stream the trajectory once, writing both outputs. Orthorhombic only.
-
-    The subset comes from ``AtomicGroup::select``, which shares -- rather than
-    copies -- the parent's SharedPeriodicBox (``src/AtomicGroup.cpp:349``). That
-    is what makes the dry stream carry a live per-frame box instead of a frozen
-    one, and it is why the subset is taken with a selection string rather than
-    assembled atom by atom.
-    """
+    """Stream the trajectory once, writing both outputs. Rectangular boxes only."""
     import loos
     from loos import pyloos
 
@@ -448,12 +345,9 @@ def _harvest_mdtraj(traj_fn, structure_fn, subset_spec, dry_out, down_out,
                     timing=None, dry_topology_name=DRY_TOPOLOGY_NAME,
                     iterload_chunk=ITERLOAD_CHUNK,
                     angstrom_per_nm=ANGSTROM_PER_NM):
-    """Same plan, chunked. Handles the cells LOOS cannot represent.
-
-    ``md.iterload`` keeps this off the heap. The downsample must be driven by
-    the running global frame index rather than by slicing each chunk ``[::N]``,
-    which would reset the phase at every chunk boundary.
-    """
+    """Same, in chunks, for the boxes LOOS cannot represent."""
+    # The downsample follows the running frame index, not a [::N] slice of each
+    # chunk, which would restart the phase at every chunk boundary.
     import numpy as np
     import mdtraj as md
 
@@ -506,10 +400,7 @@ def _harvest_mdtraj(traj_fn, structure_fn, subset_spec, dry_out, down_out,
 
 
 class _MdtrajWriter:
-    """Append-as-you-go writer, because Trajectory.save() cannot append.
-
-    XTC carries nm and a 3x3 box; DCD carries Angstroms and lengths/angles.
-    """
+    """Writer that appends, which Trajectory.save() cannot do."""
 
     def __init__(self, out_p, angstrom_per_nm=ANGSTROM_PER_NM):
         import mdtraj as md
@@ -544,10 +435,6 @@ class _MdtrajWriter:
 HARVEST_BACKENDS = {BACKEND_LOOS: _harvest_loos, BACKEND_MDTRAJ: _harvest_mdtraj}
 
 
-# ---------------------------------------------------------------------------
-# The harvest itself
-# ---------------------------------------------------------------------------
-
 def harvest_generation(config_fn, harvester_config_fn,
                        backend=BACKEND_AUTO, seam=SEAM_AUTO,
                        sentinel_name=SENTINEL_NAME,
@@ -557,21 +444,17 @@ def harvest_generation(config_fn, harvester_config_fn,
                        iterload_chunk=ITERLOAD_CHUNK,
                        triclinic_rtol=reimage.TRICLINIC_RTOL,
                        backends=None):
-    """Harvest one generation directory. Idempotent, and safe to interrupt.
+    """Harvest one generation directory. Safe to re-run and safe to interrupt.
 
-    `harvester_config_fn` keys:
-
-    ``harvester_subset``      selection string for the dry stream. Omitted or
-                              empty keeps every atom.
-    ``harvester_subset_syntax``  ``'loos'`` (default) or ``'mdtraj'``
-    ``harvester_structure``   structure file to build the model from. Defaults
-                              to ``config['top_fn']``, which is right for OpenMM
-                              runs and wrong for GROMACS ones -- a ``.top`` is a
-                              force-field topology and neither engine can build
-                              a model from it, so GROMACS runs must point this
-                              at a ``.gro`` / ``.pdb``.
-    ``downsample_frq``        keep every Nth frame in the solvated stream
-    ``harvester_unlink``      delete the original once verified (default True)
+    Keys read from the harvester config file:
+      harvester_subset         which atoms the dry trajectory keeps (all, if unset)
+      harvester_subset_syntax  'loos' (default) or 'mdtraj'
+      harvester_structure      structure file to build the model from. GROMACS
+                               runs MUST set this: top_fn is a force field
+                               topology, and no reader builds a model from one.
+      downsample_frq           keep every Nth frame in the solvated trajectory
+      steps_per_gen            full generation length, if not in the run config
+      harvester_unlink         delete the original once verified (default True)
     """
     backends = HARVEST_BACKENDS if backends is None else backends
     config = json.loads(Path(config_fn).read_text())
@@ -601,9 +484,8 @@ def harvest_generation(config_fn, harvester_config_fn,
         steps_per_gen, write_interval, downsample_frq)
     first_global_index = gen_index * frames_per_gen
 
-    # A symlinked input means a previous harvest unlinked the original but died
-    # before writing the sentinel. Re-running the write loop from here would
-    # read the dry stream and write it at the same time; repair instead.
+    # A symlink with no sentinel is a harvest that deleted the original and
+    # then died. Writing again here would read and write one file at once.
     if traj_p.is_symlink():
         return _repair_from_symlink(
             traj_p, dry_p, down_p, sentinel_p, dry_top_p, structure_fn,
@@ -710,9 +592,8 @@ def _verify_counts(traj_p, dry_p, down_p, dry_top_p, structure_fn, n_orig,
     if n_down != n_down_expected:
         problems.append(
             f'wrote {n_down} downsampled frames, planned {n_down_expected}')
-    # Each stream gets the topology that describes it: the dry stream is the
-    # subset, the downsampled stream is still the whole system. Only the LOOS
-    # fallback consults them, and the wrong one reads as a truncated harvest.
+    # Each stream gets the topology that matches it: the dry one is the
+    # subset, the downsampled one is still the whole system.
     dry_on_disk = util.get_traj_len(
         dry_p, dry_top_p if dry_top_p.is_file() else None)
     down_on_disk = util.get_traj_len(down_p, structure_fn)
@@ -772,10 +653,6 @@ def _repair_from_symlink(traj_p, dry_p, down_p, sentinel_p, dry_top_p,
         f'generation. This generation was harvested incompletely and the raw '
         f'trajectory cannot be rebuilt.')
 
-
-# ---------------------------------------------------------------------------
-# Auditing a campaign after the fact
-# ---------------------------------------------------------------------------
 
 def unharvested_gen_dirs(top_level, sentinel_name=SENTINEL_NAME,
                          config_name='config.json'):
@@ -846,9 +723,8 @@ def verify_dry_chain(gen_dirs, structure_fn=None, sentinel_name=SENTINEL_NAME,
     frames_per_gen = frames_per_gen.pop()
 
     time = np.concatenate(times)
-    # Each generation contributes frames_per_gen new frames. The engine's frame
-    # at the very start of gen 0 is the only extra one -- for every later
-    # generation it duplicates a seam and was dropped at harvest.
+    # Every generation contributes frames_per_gen new frames. Only generation
+    # 0's frame at step 0 is extra; the later ones were dropped as seams.
     writes_step_zero = records[0]['n_orig'] == frames_per_gen + 1
     expected = len(records) * frames_per_gen + (1 if writes_step_zero else 0)
     spacing = np.diff(time)
