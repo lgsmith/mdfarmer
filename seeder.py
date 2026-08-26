@@ -817,6 +817,7 @@ class ClonePack:
                  job_number=None, dry_run=False,
                  pack_manifest_name='pack.json',
                  run_script_name='run.py',
+                 member_cores=None,
                  sep=None,
                  job_name_elements=('{title}', '{seed_index}',
                                     '{clone_index}', '{gen_index}')):
@@ -845,6 +846,14 @@ class ClonePack:
         self.run_script = run_script
         self.run_script_name = run_script_name
         self.cpus_per_task = int(cpus_per_task)
+        # One core count per member, in member order; None splits evenly.
+        if member_cores is not None:
+            member_cores = [int(c) for c in member_cores]
+            if len(member_cores) != len(self.clones):
+                raise ValueError(
+                    f'member_cores has {len(member_cores)} entries for '
+                    f'{len(self.clones)} members')
+        self.member_cores = member_cores
         self.pack_manifest_name = pack_manifest_name
         self.job_number_re = re.compile(job_number_re)
         # The name must parse under the scheme Farmer re-associates by at
@@ -892,8 +901,8 @@ class ClonePack:
             print('Pack job', self.job_number, 'still running', self._job_name())
             return True
 
-        prepared, member_configs = [], []
-        for clone in self.clones:
+        prepared, member_configs, member_indexes = [], [], []
+        for index, clone in enumerate(self.clones):
             try:
                 ok = clone.check_start_gen(scheduler_report,
                                            overwrite=overwrite, submit=False)
@@ -904,6 +913,7 @@ class ClonePack:
             prepared.append(ok)
             if ok:
                 member_configs.append(clone.current_gen_dir / 'config.json')
+                member_indexes.append(index)
         if not any(prepared):
             print(f'{self.get_tag()}: no member could be prepared; failing pack.')
             return False
@@ -916,9 +926,13 @@ class ClonePack:
                   'the rest.')
 
         from . import gmx_pack
+        # Subset the core split to the members that actually prepared, so a
+        # short-handed pack still gets a layout of the right length.
+        member_cores = (None if self.member_cores is None
+                        else [self.member_cores[i] for i in member_indexes])
         gmx_pack.write_pack_manifest(
             self.pack_dir, member_configs, cpus_per_task=self.cpus_per_task,
-            reps_per_card=len(member_configs),
+            reps_per_card=len(member_configs), member_cores=member_cores,
             pack_manifest_name=self.pack_manifest_name)
         (self.pack_dir / self.run_script_name).write_text(self.run_script)
         script_p = (self.pack_dir / self.scheduler).with_suffix('.sh')
