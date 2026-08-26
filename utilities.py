@@ -2,7 +2,6 @@ import inspect
 import os
 import struct
 from pathlib import Path
-import json
 import subprocess as sp
 import openmm as mm
 from openmm import app
@@ -19,16 +18,17 @@ openmm_topology_readers = {
 
 
 def read_openmm_top(top_fn):
+    # Only the lookup is guarded. A reader raises a KeyError of its own when a
+    # topology names an atom type it was never given, and reporting that as an
+    # unsupported format sends the user looking for the wrong problem.
+    top_p = Path(top_fn)
     try:
-        top_p = Path(top_fn)
-        top_ext = top_p.suffix
-        topology = openmm_topology_readers[top_ext](top_fn).topology
+        reader = openmm_topology_readers[top_p.suffix]
     except KeyError:
-        print('You seem to have used a topology format', top_ext,
-              'for which we have not included a reader. Choices are:',
-              *openmm_topology_readers.keys())
-        raise
-    return topology
+        raise ValueError(
+            f'No topology reader for {top_p.suffix!r}. Choices are: '
+            f'{", ".join(openmm_topology_readers)}') from None
+    return reader(top_fn).topology
 
 
 # Frame counting. mdtraj.open() gives a file handle whose length is the frame
@@ -48,7 +48,11 @@ except ImportError:
     pyloos = None
 
 if _mdtraj is None and loos is None:
-    print('Neither mdtraj nor LOOS is importable; frame counting will fail.')
+    # A broken install, not a runtime condition: with no way to count frames
+    # every trajectory measures as empty, which the orchestrator reads as a
+    # generation that never ran and deletes.
+    raise ImportError('mdfarmer needs mdtraj or LOOS to count frames, and '
+                      'neither is importable.')
 
 
 def _traj_len_mdtraj(traj_fn):
@@ -147,7 +151,7 @@ def frame_timing(traj_fn, n_frames=None):
 
 """
 The harvest itself lives in harvester.harvest_generation; these two names are
-what existing submit scripts call, and each pins a backend and hands off.
+what existing submit scripts call, and each hands off to it.
 
 hconfig keys:
  - harvester_subset: which atoms the solute trajectory keeps, in LOOS syntax
@@ -160,14 +164,20 @@ hconfig keys:
 
 
 def strip_and_downsample(config_fn, harvester_config_fn):
-    """Backwards-compatible entry point pinning the LOOS backend."""
+    """Old entry point, kept for the harvest.sh scripts already on disk.
+
+    The backend is chosen by box shape rather than pinned: LOOS keeps only the
+    diagonal of a triclinic cell, so pinning it here would harvest an old
+    triclinic campaign with a silently wrong box. Which atoms are kept does not
+    depend on the backend, so nothing else about the harvest changes.
+    """
     from . import harvester
-    return harvester.harvest_generation(
-        config_fn, harvester_config_fn, backend=harvester.BACKEND_LOOS)
+    return harvester.harvest_generation(config_fn, harvester_config_fn)
 
 
 def strip_ds_mdtraj(config_fn, harvester_config_fn):
-    """Backwards-compatible entry point pinning the mdtraj backend."""
+    """Old entry point pinning the mdtraj backend, which is right for a box of
+    either shape."""
     from . import harvester
     return harvester.harvest_generation(
         config_fn, harvester_config_fn, backend=harvester.BACKEND_MDTRAJ)
@@ -324,16 +334,26 @@ basic_scheduler_fstrings_mps = {
                 """)
 }
 
+# A job of this campaign is named title, seed, clone and gen joined by the
+# separator, and the awk below matches the name field against exactly that, end
+# to end. Anything looser lets a campaign titled '{title}-long' answer to this
+# one: its jobs are named '{title}-long-0-0-5', so they pass any test on the
+# title as a prefix, and their ids then bind to this campaign's (0, 0, 5).
+# The '-' is the default sep; edit these if the Farmer is given another one.
+# Curly braces must be escaped with curly braces when using awk via str.format.
+
 # Basic report to print _only_ a list of job ids associated to this runner.
 # Should have 'title' fstring target somewhere to purify spurious jobids.
 # update_jids calls:
 #   self.scheduler_report_fstring.format(title=self.config_template['title'])
 basic_scheduler_reports = {
-    "lsf": "bjobs -o JOBID -noheader -J '{title}-*'",
+    # -o 'JOBID JOB_NAME' rather than -o JOBID, since the name is what awk tests.
+    "lsf": "bjobs -o 'JOBID JOB_NAME' -noheader -J '{title}-*'"
+           " | awk '$2 ~ /^{title}-[0-9]+-[0-9]+-[0-9]+$/ {{print $1}}'",
     # -h -o '%i %j' prints JobID and untruncated JobName, two whitespace-separated columns.
     # The default -O Name truncates to 8 chars, which silently breaks title matching.
-    # Curly braces must be escaped with curly braces when using awk via str.format.
-    "slurm": "squeue --me -h -o '%i %j' | awk '/{title}/ {{print $1}}'"
+    "slurm": "squeue --me -h -o '%i %j'"
+             " | awk '$2 ~ /^{title}-[0-9]+-[0-9]+-[0-9]+$/ {{print $1}}'"
 }
 
 # Basic report to print the name, and then the jobid, for each job with job title
@@ -343,10 +363,12 @@ basic_scheduler_reports = {
 # __init__ from Orchestrator calls:
 #   self.scheduler_assoc_fstring.format(title=self.config_template['title'])
 basic_scheduler_assoc_reports = {
-    "lsf": "bjobs -o 'JOBID JOB_NAME' -noheader -J '{title}-*'",
+    "lsf": "bjobs -o 'JOBID JOB_NAME' -noheader -J '{title}-*'"
+           " | awk '$2 ~ /^{title}-[0-9]+-[0-9]+-[0-9]+$/'",
     # awk (not grep) so a clean queue exits 0 instead of grep's exit-1-on-no-match,
     # which would crash the boot-time sp.check_output in Farmer.__init__.
-    "slurm": "squeue --me -h -o '%i %j' | awk '/{title}/'"
+    "slurm": "squeue --me -h -o '%i %j'"
+             " | awk '$2 ~ /^{title}-[0-9]+-[0-9]+-[0-9]+$/'"
 }
 
 
@@ -702,7 +724,14 @@ def is_state_xml_usable(p: Path) -> bool:
 
 def state_xml_step_count(p: Path) -> int:
     import xml.etree.ElementTree as ET
-    root = ET.parse(p).getroot()
+    try:
+        root = ET.parse(p).getroot()
+    except ET.ParseError as exc:
+        # The caller cascades to an older generation on ValueError. ParseError
+        # is a SyntaxError, so raising it as it comes escapes that guard and the
+        # clone is dropped for the rest of the run instead.
+        raise ValueError(f'state.xml at {p} is not parseable XML, so the step '
+                         f'it stopped at cannot be read: {exc}') from exc
     sc = root.attrib.get('stepCount')
     if sc is None:
         raise ValueError(f'state.xml at {p} has no stepCount attribute '
@@ -801,8 +830,16 @@ def calx_remaining_steps(traj_fn, top_fn, total_steps, write_interval):
     return remaining
 
 
+# Keys a config carries for the run block rather than for the runner itself.
+# gmx_basic_sim_block_json and omm_basic_sim_block_json take traj_list out of
+# the config before calling the runner, so it is no runner's parameter and still
+# belongs in config.json.
+CONFIG_ONLY_KEYS = ('traj_list',)
+
+
 # This won't be nicely jsonizable unless all default and provided vals are.
-def merge_args_defaults_dict(function, **kwargs):
+def merge_args_defaults_dict(function, config_only_keys=CONFIG_ONLY_KEYS,
+                             **kwargs):
     """A config dict recording the full call: every parameter and its value.
 
     Two things stay out of the result, since both would carry the sentinel
@@ -812,12 +849,24 @@ def merge_args_defaults_dict(function, **kwargs):
       which have no default because they collect leftovers;
     * parameters with no default that the caller did not supply. Those are
       required arguments, and are named in a TypeError instead.
+
+    A keyword that is neither a parameter of the function nor one of
+    config_only_keys is a typo: it is refused, not written into the config,
+    where gmx_generation's **_unused would swallow it at run time and leave
+    config.json describing a call that never happened.
     """
     sig = inspect.signature(function)
     variadic = (inspect.Parameter.VAR_KEYWORD, inspect.Parameter.VAR_POSITIONAL)
     config = {name: param.default
               for name, param in sig.parameters.items()
               if param.kind not in variadic}
+    unknown = sorted(set(kwargs) - set(sig.parameters) - set(config_only_keys))
+    if unknown:
+        raise TypeError(
+            f'{function.__name__} has no parameter {unknown}; check for a '
+            f'typo. Only arguments {function.__name__} takes, plus '
+            f'{list(config_only_keys)}, belong here, so config.json records '
+            f'the call that really happens.')
     config.update(kwargs)
     missing = sorted(name for name, value in config.items()
                      if value is inspect.Parameter.empty)
