@@ -28,7 +28,7 @@ import numpy as np
 # rectangular. GROMACS writes exact zeros, so this only clears float noise.
 TRICLINIC_RTOL = 1e-6
 
-# Backend selectors for `reimage_trajectory`.
+# Backend selectors for reimage_trajectory.
 BACKEND_AUTO = 'auto'
 BACKEND_LOOS = 'loos'
 BACKEND_TRJCONV = 'trjconv'
@@ -38,7 +38,7 @@ BACKEND_TRJCONV = 'trjconv'
 TRJCONV_PBC = 'mol'
 TRJCONV_UR = 'compact'
 
-# Default GROMACS binary. Sites that build an MPI-only GROMACS have `gmx_mpi`.
+# Default GROMACS binary. Sites that build an MPI-only GROMACS have gmx_mpi.
 GMX_BIN = 'gmx'
 
 # Appended to the input stem to name the output, e.g. prod.xtc -> prod-whole.xtc.
@@ -132,7 +132,7 @@ def _box_from_first_frame(traj_p, angstrom_per_nm=ANGSTROM_PER_NM):
 
 
 def is_orthorhombic(box, triclinic_rtol=TRICLINIC_RTOL):
-    """True when the 3x3 box matrix is rectangular to within `triclinic_rtol`."""
+    """True when the 3x3 box matrix is rectangular to within triclinic_rtol."""
     box = np.asarray(box, dtype=float)
     scale = np.abs(np.diag(box)).max()
     if scale == 0.0:
@@ -156,7 +156,7 @@ def molecule_ranges(top_fn, include_dir=None):
             'topology is the only place molecule blocks are recorded; a .gro '
             'carries no connectivity.')
     kwargs = {} if include_dir is None else {'includeDir': str(include_dir)}
-    # A .top's `#include "./ff/..."` lines resolve relative to the process cwd,
+    # A .top's #include lines resolve relative to the process cwd,
     # so parse from the topology's own directory.
     topology = app.GromacsTopFile(str(top_p), **kwargs).topology
 
@@ -179,7 +179,7 @@ def molecule_ranges(top_fn, include_dir=None):
     for start, stop in ranges:
         if start != cursor:
             raise ValueError(
-                f'{top_p.name}: molecule blocks do not tile the atom range -- '
+                f'{top_p.name}: molecule blocks do not tile the atom range, '
                 f'expected next molecule to start at {cursor}, got {start}.')
         cursor = stop
     if cursor != n_atoms:
@@ -316,13 +316,13 @@ def reimage_with_loos(traj_fn, structure_fn, out_fn, top_fn=None,
                       output_tag=OUTPUT_TAG):
     """Make molecules whole and wrap them back into the box, with LOOS.
 
-    Rectangular boxes only. `ranges` are the atom index ranges of each molecule,
-    read from `top_fn` if not given, and are added to the LOOS model as bonds so
+    Rectangular boxes only. ranges are the atom index ranges of each molecule,
+    read from top_fn if not given, and are added to the LOOS model as bonds so
     that splitByMolecule() returns real molecules whose groups share the
     parent's box. A group built by hand instead reports no box at all.
 
     Per frame: mergeImage() on each molecule (unbreak it), then reimage()
-    (wrap its centroid into the cell). That order matters -- ``reimage()`` alone
+    (wrap its centroid into the cell). That order matters: reimage() alone
     wraps a broken molecule by its meaningless centroid and leaves it broken.
     """
     import loos
@@ -425,7 +425,7 @@ def _verify_reimaged(out_p, top_fn=None, ranges=None, structure_fn=None,
                         f'along axis {margin["axis"]} from its molecule\'s anchor '
                         f'atom, past the {margin["limit"]:.3f} nm half-edge limit '
                         f'that LOOS\'s mergeImage() assumes, so this system is '
-                        f'outside the LOOS backend\'s safe regime -- use the '
+                        f'outside the LOOS backend\'s safe regime; use the '
                         f'{BACKEND_TRJCONV!r} backend.')
             raise RuntimeError(
                 f'{out_p} still has an overlong bond after reimaging: atoms '
@@ -439,7 +439,7 @@ def _verify_reimaged(out_p, top_fn=None, ranges=None, structure_fn=None,
                   f'.top, and the furthest atom is '
                   f'{margin["max_anchor_offset"]:.3f} nm from its anchor along '
                   f'axis {margin["axis"]} (half-edge limit '
-                  f'{margin["limit"]:.3f} nm) -- LOOS\'s mergeImage() may have '
+                  f'{margin["limit"]:.3f} nm), so LOOS\'s mergeImage() may have '
                   f'mis-wrapped atoms. Pass top_fn to get a real check, or use '
                   f'the trjconv backend.', flush=True)
 
@@ -512,7 +512,7 @@ def reimage_with_trjconv(traj_fn, tpr_fn, out_fn, gmx_bin=GMX_BIN,
 
 
 def _frame_times(traj_p, limit=2):
-    """First `limit` frame times (ps) of an .xtc."""
+    """First limit frame times (ps) of an .xtc."""
     import mdtraj
     if traj_p.suffix.lower() != '.xtc':
         raise ValueError(
@@ -618,5 +618,5 @@ def reimage_gen_dir(gen_dir, config=None, backend=BACKEND_AUTO,
 
 
 def have_gmx(gmx_bin=GMX_BIN):
-    """True when `gmx_bin` is runnable, so callers can pick a backend up front."""
+    """True when gmx_bin is runnable, so callers can pick a backend up front."""
     return shutil.which(gmx_bin) is not None

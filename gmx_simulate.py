@@ -69,7 +69,7 @@ GEN_SEED_STRIDE = 1000
 
 # Parameters gmx_pack injects into every gmx_generation call at runtime. A
 # config template records them too, so the file's copies must be dropped before
-# it is splatted -- otherwise the call gets two values for the same keyword.
+# it is splatted, or the call gets two values for the same keyword.
 RUNTIME_ONLY_KEYS = ('fleet', 'fleet_key', 'grompp_lock')
 
 # Arguments a Clone supplies per generation. A driver builds its template
@@ -80,25 +80,25 @@ CLONE_FILLED_KEYS = ('seed_index', 'clone_index', 'gen_index', 'seed_fn',
 # Seconds between preempt-sentinel polls while mdrun runs.
 PREEMPT_POLL_SECONDS = 5
 
-# Default binary. Sites with an MPI-only build have `gmx_mpi` instead.
+# Default binary. Sites with an MPI-only build have gmx_mpi instead.
 GMX_BIN = 'gmx'
 
 
 class Preempted(Exception):
     """Raised when a preempt sentinel is seen mid-mdrun; the gen is incomplete
-    and will resume via ``-cpi`` on the next launch."""
+    and will resume via -cpi on the next launch."""
     pass
 
 
 class GenIncomplete(Exception):
     """Raised when mdrun returned cleanly but the generation has not reached its
-    step target -- e.g. mdrun stopped itself at ``-maxh``. The generation
+    step target, for instance because mdrun stopped itself at -maxh. It
     resumes on the next launch; this is a normal event, not a failure."""
     pass
 
 
 # Default run.py body the Farmer writes into each gen dir. The batch script runs
-# `python run.py`; this dispatches to the GROMACS block runner.
+# python run.py, which dispatches to the GROMACS block runner.
 default_gmx_run_script = """
 from mdfarmer.gmx_simulate import gmx_basic_sim_block_json as runner
 runner('config.json')
@@ -213,7 +213,7 @@ def is_checkpoint(cpt_fn, gmx_bin=GMX_BIN):
 
 
 def part_files(gen_dir, deffnm=DEFFNM, traj_suffix='.xtc'):
-    """The ``prod.partNNNN.<suffix>`` files a generation has accumulated, in order."""
+    """The prod.partNNNN.<suffix> files a generation has accumulated, in order."""
     gen_p = Path(gen_dir)
     parts = sorted(gen_p.glob(f'{deffnm}.part[0-9][0-9][0-9][0-9]{traj_suffix}'))
     return parts

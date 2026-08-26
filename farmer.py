@@ -114,7 +114,7 @@ class Farmer:
         self.jids_file.write_text(' '.join(map(str, sorted(self.current_jids))))
         return rep_dict
 
-    # Fill in the run_script, recover_fn and progress_fn that go with `runner`.
+    # Fill in the run_script, recover_fn and progress_fn that go with runner.
     # A hand-supplied set that disagrees with it is refused rather than half
     # applied, since the engine that runs is the one named in the run script.
     def select_engine(self, runner, run_script, recover_fn, progress_fn):
@@ -254,7 +254,7 @@ class Farmer:
                  handle_preempt=False,
                  # Path to the human-readable persistence file that
                  # BadNodeRegistry appends to whenever a clone aborts on
-                 # a node whose log matches `bad_node_patterns`. Reloaded
+                 # a node whose log matches bad_node_patterns. Reloaded
                  # at boot so a restarted farmer doesn't relearn the
                  # same bad nodes.
                  bad_node_persist='bad_nodes.txt',
@@ -302,7 +302,7 @@ class Farmer:
         self.scheduler_fstring = scheduler_fstring
         # Stand up the bad-node registry *before* anything that might
         # call str.format() on the scheduler_fstring, so the
-        # `exclude_nodes` key is present and any persisted bad-node
+        # exclude_nodes key is present and any persisted bad-node
         # exclusion is in effect from the first submission this farmer
         # makes (including resumes after a crash that already learned
         # which nodes were bad).
@@ -414,9 +414,9 @@ class Farmer:
     def group_clones(self, clones):
         """Partition every built Clone into pack-sized groups.
 
-        `pack_grouping` supplies the policy; without one the flat priority
-        order is cut into consecutive runs of `pack_size`. Either way every
-        clone must land in exactly one group -- a clone silently left out of
+        pack_grouping supplies the policy; without one the flat priority
+        order is cut into consecutive runs of pack_size. Either way every
+        clone must land in exactly one group. A clone left out of
         the plan would never be submitted, and one in two packs would get two
         jobs in its generation directory.
         """
@@ -447,9 +447,9 @@ class Farmer:
     def build_packs(self, tdir):
         """Replace the clone queues with ClonePacks, one queue per pack.
 
-        A pack answers every call `launch` makes on a Clone, so the tending
-        loop is unchanged. `active_clone_set` is rebuilt because
-        `_setup_one_clone` populated it with the individual Clones.
+        A pack answers every call launch makes on a Clone, so the tending
+        loop is unchanged. active_clone_set is rebuilt because
+        _setup_one_clone populated it with the individual Clones.
         """
         family = util.scheduler_families.get(self.scheduler, self.scheduler)
         fstring = (self.pack_scheduler_fstring

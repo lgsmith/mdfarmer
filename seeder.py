@@ -22,13 +22,13 @@ class ConfigError(ValueError):
 
     Clone setup otherwise swallows failures so one corrupt generation directory
     cannot stop an orchestrator minding hundreds of others. A config error is
-    not per-clone -- it applies to every clone it touches -- so it propagates
+    not per-clone: it applies to every clone it touches, so it propagates
     instead, rather than booting a campaign quietly short of the seeds asked
     for.
     """
 
 
-# Config entries `Clone.from_disk` computes for each clone from the disk state.
+# Config entries Clone.from_disk computes for each clone from the disk state.
 # A per-seed override naming one of these would be silently overwritten, so it
 # is refused instead.
 CLONE_DERIVED_CONFIG_KEYS = frozenset((
@@ -71,7 +71,7 @@ def _gen_sort_key(path, sep):
 # integrator state is intact and the next gen can seed from it.
 #
 # Note on the gen-relative step math: OpenMM's DCDReporter hard-codes the
-# DCD header's `istart` to `reportInterval`, regardless of cumulative
+# DCD header's istart to reportInterval, regardless of cumulative
 # simulation step. state.xml's stepCount, by contrast, accumulates across
 # gens. So we derive the absolute step at gen start from gen_index and
 # total_steps rather than trusting the DCD header's istart.
@@ -635,11 +635,11 @@ class Clone:
 
     def start_current(self, overwrite=False, count_as_restart=True,
                       submit=True):
-        """Prepare this generation's launch, and (unless `submit` is False)
+        """Prepare this generation's launch, and (unless submit is False)
         submit it.
 
-        `submit=False` is what lets a ClonePack do every member's preparation --
-        gen directory, seed copy, config.json, run script -- and then send a
+        submit=False is what lets a ClonePack do every member's preparation,
+        gen directory, seed copy, config.json, run script, and then send a
         single sbatch for the whole pack.
         """
         should_launch = self.plow_harrow_plant(
@@ -800,26 +800,26 @@ class Clone:
 class ClonePack:
     """K Clones that share one GPU, one sbatch job, and one generation step.
 
-    The cluster's Slurm exposes only a `gpu` gres -- no `mps`, no `shard` -- so
+    The cluster's Slurm exposes only a gpu gres, with no mps and no shard, so
     it cannot co-schedule two independent jobs onto one card. Packing therefore
-    has to happen inside a single job, which is a level above `Clone`: each
-    member does everything `check_start_gen` does *except* submit, and then the
+    has to happen inside a single job, which is a level above Clone: each
+    member does everything check_start_gen does *except* submit, and then the
     pack submits once for all of them.
 
-    `Clone` is deliberately untouched by this. The pack drives members through
-    the same code path a solo clone uses (`check_start_gen(..., submit=False)`),
-    so a packed generation and a solo generation prepare identically -- only the
+    Clone is deliberately untouched by this. The pack drives members through
+    the same code path a solo clone uses, check_start_gen with submit False,
+    so a packed generation and a solo generation prepare identically. Only the
     submission is shared.
 
-    Members must come from ONE condition and system, with identical `steps`:
+    Members must come from ONE condition and system, with identical steps:
     the job holds the card until its slowest member finishes, so mismatched
     per-step costs waste GPU time.
 
-    That rule is about STRAGGLER COST, not data safety -- worth saying plainly,
+    That rule is about straggler cost, not data safety. Worth saying plainly,
     because the next reader will otherwise take it as a safety invariant and
     not know what they are allowed to trade away. Failure is already per-member
-    (`gmx_pack` collects K outcomes and the tender fails exactly one clone) and
-    recovery is already per-member (`mdrun -cpi` off that member's own
+    (gmx_pack collects K outcomes and the tender fails exactly one clone) and
+    recovery is already per-member, from mdrun -cpi off that member's own
     checkpoint), so a bad job costs a lost block that gets redone, not a damaged
     dataset. Packing across conditions is therefore a throughput decision.
     """
@@ -886,7 +886,7 @@ class ClonePack:
         self.job_number = job_number
         for clone in self.clones:
             clone.job_number = job_number
-            # A packed job writes one scheduler log, here -- no member has one
+            # A packed job writes one scheduler log, here. No member has one
             # in its own gen dir, so a node scan rooted there finds nothing.
             clone.scheduler_log_dir = self.pack_dir
         self.dry_run = dry_run

@@ -23,15 +23,15 @@ from . import reimage
 # presence means the generation is harvested; a re-run stops on it.
 SENTINEL_NAME = '.harvested'
 
-# Output name prefixes, joined to the trajectory name with the config's `sep`.
+# Output name prefixes, joined to the trajectory name with the config's sep.
 DRY_PREFIX = 'dry'
 DOWNSAMPLE_PREFIX = 'downsample'
 
 # Solute-only topology written beside the dry stream, so anything reading it
-# later -- get_traj_len's LOOS fallback included -- has a matching atom count.
+# later, get_traj_len's LOOS fallback included, has a matching atom count.
 DRY_TOPOLOGY_NAME = 'dry-top.pdb'
 
-# Backend selectors for `harvest_generation`.
+# Backend selectors for harvest_generation.
 BACKEND_AUTO = 'auto'
 BACKEND_LOOS = 'loos'
 BACKEND_MDTRAJ = 'mdtraj'
@@ -47,7 +47,7 @@ SEAM_AUTO = 'auto'
 SEAM_DROP = 'drop'
 SEAM_KEEP = 'keep'
 
-# Selection-language dialects understood for `harvester_subset`.
+# Selection-language dialects understood for harvester_subset.
 SYNTAX_LOOS = 'loos'
 SYNTAX_MDTRAJ = 'mdtraj'
 
@@ -145,7 +145,7 @@ def resolve_seam(n_orig, frames_per_gen, gen_index, seam=SEAM_AUTO):
         f'generation {gen_index} holds {n_orig} frames, but a generation of '
         f'{frames_per_gen} write intervals should hold either {frames_per_gen} '
         f'(no frame written at the restart step) or {frames_per_gen + 1} (one '
-        f'written). Refusing to guess which frames are duplicates -- pass '
+        f'written). Refusing to guess which frames are duplicates; pass '
         f'seam={SEAM_DROP!r} or {SEAM_KEEP!r} explicitly if this count is '
         f'expected.')
 
@@ -234,7 +234,7 @@ def select_backend(traj_fn, structure_fn=None, backend=BACKEND_AUTO,
 
 
 def subset_indices(structure_fn, selection, syntax=SYNTAX_LOOS):
-    """0-based atom indices matched by `selection`, in file order."""
+    """0-based atom indices matched by selection, in file order."""
     if syntax == SYNTAX_LOOS:
         import loos
         model = loos.createSystem(str(structure_fn))
@@ -555,12 +555,12 @@ def harvest_generation(config_fn, harvester_config_fn,
 
 
 def _steps_per_gen(config, hconfig):
-    """The full generation length, which is not always ``config['steps']``.
+    """The full generation length, which is not always config['steps'].
 
-    On a resumed generation ``config['steps']`` is the steps still owed, which
+    On a resumed generation config['steps'] is the steps still owed, which
     would shorten frames_per_gen and misplace every later generation's global
-    frame index, and with it the downsample phase. `Clone` records the untouched
-    value as ``steps_per_gen``.
+    frame index, and with it the downsample phase. Clone records the untouched
+    value as steps_per_gen.
     """
     for source, key in ((hconfig, 'steps_per_gen'), (config, 'steps_per_gen')):
         if source.get(key) is not None:
@@ -621,7 +621,7 @@ def _repair_from_symlink(traj_p, dry_p, down_p, sentinel_p, dry_top_p,
     """
     if not (dry_p.is_file() and down_p.is_file()):
         raise HarvestError(
-            f'{traj_p} is a symlink -- a previous harvest removed the original '
+            f'{traj_p} is a symlink, so a previous harvest removed the original, '
             f'-- but {dry_p.name} and {down_p.name} are not both present. The '
             'raw trajectory for this generation is gone and cannot be rebuilt.')
     dry_on_disk = util.get_traj_len(
@@ -692,7 +692,7 @@ def verify_dry_chain(gen_dirs, sentinel_name=SENTINEL_NAME,
     """Check the harvested stream of a clone is contiguous and unduplicated.
 
     Across N harvested generations the dry stream holds
-    ``N * frames_per_gen + 1`` frames, and no two consecutive frames carry the
+    N * frames_per_gen + 1 frames, and no two consecutive frames carry the
     same time. Neither fails loudly on its own, hence the check.
     """
     import numpy as np

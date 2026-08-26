@@ -14,8 +14,8 @@ from .gmx_simulate import (gmx_generation, gmx_basic_sim_block_json,
                            gmx_try_recover_gen, gmx_gen_progress,
                            gmx_config_template, default_gmx_run_script)
 # Reimaging is imported as a module, not splatted: it defines short names like
-# `box_vectors` and `bond_pairs` that would collide unhelpfully in the package
-# namespace, and callers read better as `reimage.reimage_trajectory(...)`.
+# box_vectors and bond_pairs that would collide unhelpfully in the package
+# namespace, and callers read better as reimage.reimage_trajectory(...).
 from . import reimage
 # MPS packing: K replicas sharing one GPU inside a single job.
 from . import gmx_pack

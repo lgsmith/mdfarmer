@@ -56,7 +56,7 @@ PER_REPLICA_MDRUN_FLAGS = {'-ntomp': 1, '-pin': 1, '-pinoffset': 1,
 # differ between replicas.
 NTMPI = 1
 
-# Line `gmx -version` prints for the MPI flavour, and the value a thread-MPI
+# Line gmx -version prints for the MPI flavour, and the value a thread-MPI
 # build reports there.
 GMX_MPI_VERSION_KEY = 'MPI library:'
 GMX_THREAD_MPI_VALUE = 'thread_mpi'
@@ -192,7 +192,7 @@ def report_mps_state(mps_control_bin=MPS_CONTROL_BIN,
         print('[pack] WARNING: no MPS daemon is reachable. The replicas in this '
               'job will still run, but they will TIME-SLICE the GPU instead of '
               'sharing it, at roughly 10-20% worse throughput. This is a '
-              'configuration failure, not node variance -- check that the '
+              'configuration failure, not node variance. Check that the '
               f'batch script started {mps_control_bin} and that '
               f'{mps_pipe_env} ({pipe_dir!r}) is writable.', flush=True)
         print('[pack] ' + '=' * 68, flush=True)
@@ -204,7 +204,7 @@ def write_pack_manifest(pack_dir, member_config_fns, *, cpus_per_task,
                         pack_manifest_name=PACK_MANIFEST_NAME):
     """Record which generation configs one packed job should advance.
 
-    `member_cores` is one core count per member, in the same order; None splits
+    member_cores is one core count per member, in the same order; None splits
     the allocation evenly. Validated here so a bad split fails at submission
     rather than inside the job.
     """

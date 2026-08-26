@@ -69,14 +69,14 @@ DRY_TOPOLOGY_NAME = 'dry-top.pdb'
 def get_traj_len(traj_fn, top_fn, dry_topology_name=DRY_TOPOLOGY_NAME):
     """Number of frames in a trajectory, or 0 if it is empty or unreadable.
 
-    `top_fn` is only consulted by the LOOS fallback; the mdtraj path does not
-    need it, which is what makes this work for GROMACS runs whose `top_fn` is a
-    `.top`.
+    top_fn is only consulted by the LOOS fallback; the mdtraj path does not
+    need it, which is what makes this work for GROMACS runs whose top_fn is a
+    .top.
 
     The fallback tries the harvester's solute-only topology as well: after a
     harvest the trajectory name is a symlink to a stripped copy, and LOOS built
-    from the wet `top_fn` would hit an atom-count mismatch, be swallowed by the
-    broad except below, and report 0 frames -- which reads as "never ran".
+    from the wet top_fn would hit an atom-count mismatch, be swallowed by the
+    broad except below, and report 0 frames, which reads as "never ran".
     """
     traj_p = Path(traj_fn)
     if not traj_p.is_file() or traj_p.stat().st_size == 0:
@@ -106,16 +106,16 @@ def get_traj_len(traj_fn, top_fn, dry_topology_name=DRY_TOPOLOGY_NAME):
 
 
 """
-The harvest itself lives in `harvester.harvest_generation`; these two names are
+The harvest itself lives in harvester.harvest_generation; these two names are
 what existing submit scripts call, and each pins a backend and hands off.
 
 hconfig keys:
- - `'harvester_subset'`: selection string for the solute (LOOS syntax by
-   default; set `'harvester_subset_syntax': 'mdtraj'` for the other dialect).
- - `'downsample_frq'`: keep every Nth frame in the solvated stream.
- - `'harvester_structure'`: structure file to build the model from. REQUIRED for
-   GROMACS runs, whose `top_fn` is a force-field topology that neither LOOS nor
-   mdtraj can build a model from. Defaults to `config['top_fn']`.
+ - harvester_subset: which atoms the solute trajectory keeps, in LOOS syntax
+   unless harvester_subset_syntax says 'mdtraj'.
+ - downsample_frq: keep every Nth frame in the solvated stream.
+ - harvester_structure: structure file to build the model from. REQUIRED for
+   GROMACS runs, whose top_fn is a force-field topology that neither LOOS nor
+   mdtraj can build a model from. Defaults to config['top_fn'].
 """
 
 
@@ -137,7 +137,7 @@ def strip_ds_mdtraj(config_fn, harvester_config_fn):
 # These basic strings are useful in many cases on clusters using the scheduler named as the key.
 # NOTE the format target '{job_name}' has to appear for the default queue parser to find the job.
 # The 'NODE:' / 'GPU:' echoes are how BadNodeRegistry learns which host
-# produced a failure and which device was on it -- keep them if you
+# produced a failure and which device was on it. Keep them if you
 # replace this fstring with your own and want bad-node blocking to work.
 # {exclude_nodes} expands to a scheduler directive line excluding any
 # nodes BadNodeRegistry has flagged (empty when none are blocked).
@@ -179,7 +179,7 @@ basic_scheduler_fstrings = {
 # Preempt-aware variants: install a SIGTERM trap that touches the sentinel
 # file SentinelReporter watches for, then background+wait the python
 # invocation so the trap can fire (bash blocks signal delivery while a
-# non-builtin foreground command runs). The trailing `sleep 70` keeps the
+# non-builtin foreground command runs). The trailing sleep 70 keeps the
 # script alive past the 60s preempt grace period so Slurm records the job
 # as CANCELLED rather than FAILED. Pair with Farmer(handle_preempt=True).
 basic_scheduler_fstrings_preempt = {
@@ -373,7 +373,7 @@ default_bad_node_patterns = (
     'No CUDA-capable device is detected',
     'Failed to initialize NVML',
     # GLIBC ABI mismatch ("version `GLIBC_2.34' not found"). Quoted
-    # half is enough -- the rest of the line varies.
+    # half is enough, since the rest of the line varies.
     "version `GLIBC_",
 )
 
@@ -424,12 +424,12 @@ class BadNodeRegistry:
     with the corresponding directive line.
 
     Per detection: scan_and_record(gen_dir, clone_tag) reads the gen's
-    scheduler log (slurm.out / lsf.out), looks for a `bad_node_patterns`
-    hit, harvests `NODE:` (and `GPU:` if present), appends a breadcrumb
+    scheduler log (slurm.out / lsf.out), looks for a bad_node_patterns
+    hit, harvests the NODE: line (and GPU: if present), appends a breadcrumb
     row, and refreshes scheduler_kws['exclude_nodes'].
 
     Breadcrumb file is plain text, tab-separated. Comment-out (prefix
-    `#`) or delete rows to clear entries; the farmer rereads the file
+    with #) or delete rows to clear entries; the farmer rereads the file
     on boot.
     """
 
@@ -440,8 +440,8 @@ class BadNodeRegistry:
         '# The farmer excludes these nodes on subsequent submissions via\n'
         "# the '{exclude_nodes}' placeholder in scheduler_fstring.\n"
         '#\n'
-        '# To clear an entry: comment out (prefix `#`) or delete the row\n'
-        '# and restart the farmer. Lines starting with `#` and blank lines\n'
+        '# To clear an entry: comment it out, or delete the row, then\n'
+        '# restart the farmer. Comment and blank lines are ignored.\n'
         '# are ignored on reload.\n'
         '#\n'
         "# If many nodes from one partition fail with the same pattern,\n"
@@ -540,7 +540,7 @@ class BadNodeRegistry:
         if node is None:
             print(f'BadNodeRegistry: pattern {matched!r} matched in {log_p} '
                   "but no 'NODE:' line found in scheduler log; cannot "
-                  'exclude. Add `echo "NODE: $SLURMD_NODENAME"` (or LSF '
+                  'exclude. Add an echo of NODE: $SLURMD_NODENAME (or LSF '
                   'equivalent) to your scheduler_fstring.')
             return None
         gpu = self._extract_value(text, 'GPU:') or 'unknown'
@@ -725,9 +725,9 @@ def merge_args_defaults_dict(function, **kwargs):
     """A config dict recording the full call: every parameter and its value.
 
     Two things stay out of the result, since both would carry the sentinel
-    `inspect._empty` -- a class, which json.dumps cannot write:
+    inspect._empty, a class, which json.dumps cannot write:
 
-    * ``**kwargs``-style catch-alls (``gmx_generation`` has ``**_unused``),
+    * **kwargs-style catch-alls (gmx_generation has **_unused),
       which have no default because they collect leftovers;
     * parameters with no default that the caller did not supply. Those are
       required arguments, and are named in a TypeError instead.
