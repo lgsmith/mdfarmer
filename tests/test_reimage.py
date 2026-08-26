@@ -71,6 +71,37 @@ def main(steps=STEPS, write_interval=WRITE_INTERVAL,
           f'as .dcd', flush=True)
     suite.check('a .dcd is not falsely flagged as one long bond per bond',
                 n_dcd == n_xtc, f'-> {n_dcd} vs {n_xtc}')
+    suite.section('molecules come back whole, never imaged atom by atom')
+    # GROMACS writes whatever the integrator holds, so its own output already
+    # has molecules cut across box faces.
+    n_raw, worst = reimage.check_bond_lengths(traj, pairs=pairs)
+    longest = max((v[3] for v in worst), default=0.0)
+    print(f'   raw GROMACS output: {n_raw} bonds over {reimage.MAX_BOND} nm, '
+          f'longest {longest:.3f} nm', flush=True)
+    suite.check('the raw trajectory really is broken by the boundary', n_raw > 0)
+    n_whole, _ = reimage.check_bond_lengths(out, pairs=pairs)
+    suite.check('reimaging leaves no bond longer than a bond can be',
+                n_whole == 0, f'-> {n_whole}')
+
+    # The worst case: shift by half a box so every molecule straddles a face,
+    # then wrap each atom on its own, which is what breaks a trajectory beyond
+    # repair if the molecules are ever lost.
+    frames = md.load(str(traj), top=str(structure))
+    box = frames.unitcell_lengths[0]
+    shifted = frames.xyz + box / 2.0
+    frames.xyz = shifted - box * np.floor(shifted / box)
+    frames.save_xtc(str(work / 'per-atom.xtc'))
+    n_split, _ = reimage.check_bond_lengths(work / 'per-atom.xtc', pairs=pairs)
+    print(f'   after wrapping every atom on its own: {n_split} long bonds',
+          flush=True)
+    suite.check('wrapping atom by atom breaks more molecules', n_split >= n_raw)
+    healed, _ = reimage.reimage_with_loos(
+        work / 'per-atom.xtc', structure_fn=str(structure),
+        out_fn=str(work / 'per-atom-whole.xtc'), ranges=ranges, verify=False)
+    n_healed, _ = reimage.check_bond_lengths(healed, pairs=pairs)
+    suite.check('reimaging puts every one of them back together',
+                n_healed == 0, f'-> {n_healed}')
+
     return suite.report()
 
 
