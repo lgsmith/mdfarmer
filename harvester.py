@@ -664,8 +664,9 @@ def verify_dry_chain(gen_dirs, sentinel_name=SENTINEL_NAME,
     same time. Neither fails loudly on its own, hence the check.
     """
     import numpy as np
-    import mdtraj as md
 
+    if not gen_dirs:
+        raise HarvestError('verify_dry_chain was given no generations')
     times, records = [], []
     for gen_dir in gen_dirs:
         gen_p = Path(gen_dir)
@@ -674,7 +675,13 @@ def verify_dry_chain(gen_dirs, sentinel_name=SENTINEL_NAME,
             raise HarvestError(f'{gen_p} has not been harvested')
         record = json.loads(sentinel_p.read_text())
         records.append(record)
-        times.append(_frame_times(gen_p / record['dry'], scan_chunk=scan_chunk))
+        frame_times = _frame_times(gen_p / record['dry'],
+                                   scan_chunk=scan_chunk)
+        if frame_times is None:
+            raise HarvestError(
+                f'{gen_p / record["dry"]} carries no per-frame time, so the '
+                'spacing of the chain cannot be checked.')
+        times.append(frame_times)
     order = sorted(range(len(records)), key=lambda i: records[i]['gen_index'])
     records = [records[i] for i in order]
     times = [times[i] for i in order]
@@ -692,8 +699,10 @@ def verify_dry_chain(gen_dirs, sentinel_name=SENTINEL_NAME,
 
     time = np.concatenate(times)
     # Every generation contributes frames_per_gen new frames. Only generation
-    # 0's frame at step 0 is extra; the later ones were dropped as seams.
-    writes_step_zero = records[0]['n_orig'] == frames_per_gen + 1
+    # 0's frame at step 0 is extra; the later ones were dropped as seams, so a
+    # chain that starts partway through a campaign has no extra frame at all.
+    writes_step_zero = (records[0]['gen_index'] == 0
+                        and records[0]['n_orig'] == frames_per_gen + 1)
     expected = len(records) * frames_per_gen + (1 if writes_step_zero else 0)
     spacing = np.diff(time)
     return dict(
