@@ -94,6 +94,72 @@ nohup python straight-sampling-farmer.py > straight-sampling-farmer.out 2>&1 &
 
 This nohupped process can be annoying to stop. You can find it using `pgrep` and `pkill`, but if you want it to stop gracefully you can create a file in the directory you launched it from called `stop`. This file can be empty, it just needs to be present. At each update interval, if the script detects a file with that name, it'll exit and the process will return.
 
+## Running GROMACS
+
+Pass `runner=mdf.gmx_generation` and the Farmer picks the matching run script,
+disk-recovery function and progress hook; supplying a mismatched set by hand is
+refused rather than half-applied. Build the config template with
+`gmx_config_template`, which records every `gmx_generation` parameter:
+
+```python
+cfg_template = mdf.gmx_config_template(
+    traj_dir_top_level='trajectories',
+    title='mysystem',
+    structure_fn='start.gro',      # grompp -c for generation 0
+    mdp_fn='prod.mdp',
+    steps=12_500_000,
+    steps_per_gen=12_500_000,
+    write_interval=50_000,
+    traj_suffix='.xtc',
+    mdrun_args=['-nb', 'gpu', '-pme', 'gpu', '-update', 'gpu', '-pin', 'on'],
+)
+farmer = mdf.Farmer(..., runner=mdf.gmx_generation, config_template=cfg_template)
+```
+
+`gmx_config_template` fills placeholders for the five parameters a Clone
+supplies per generation (`seed_index`, `clone_index`, `gen_index`, `seed_fn`,
+`top_fn` — all overwritten before any job reads them) and omits the three
+`gmx_pack` injects at runtime. Passing either group through to `gmx_generation`
+raises, so building the template any other way means knowing both lists.
+
+Generations chain with `gmx convert-tpr -nsteps` plus `mdrun -cpi`, not
+`grompp -t`: the later generation inherits its predecessor's tpr, so the
+integrator parameters and the Nose-Hoover / Parrinello-Rahman coupling state
+carry across and the step and time counters stay globally continuous.
+
+### Packing replicas onto one GPU
+
+Where Slurm exposes only a `gpu` gres — no `mps`, no `shard` — it cannot
+co-schedule two jobs onto one card, so the packing has to happen inside one
+job. `pack_size` members share one sbatch, one MPS daemon and one generation
+step:
+
+```python
+farmer = mdf.Farmer(
+    ...,
+    pack_size=2,
+    pack_cpus_per_task=16,
+    # Optional: a policy other than consecutive runs of the priority order.
+    pack_grouping=lambda clones: [...],
+    # Optional: per-member core widths, for members with different core knees.
+    pack_member_cores=[12, 4],
+    # Optional: one dict per seed, applied over the shared template.
+    seed_config_overrides=[dict(mdrun_args=[...]), dict(mdrun_args=[...])],
+)
+```
+
+Each replica gets a private, contiguous block of cores (`-ntomp`, `-pinoffset`,
+`-pinstride`), and `-ntmpi 1` on the thread-MPI builds that accept it — a
+real-MPI build takes its rank count from `mpirun` and makes that flag fatal, so
+it is probed for rather than assumed. Without the pinning, two replicas that
+both say a bare `-pin on` start at core 0 and fight over the same cores, which
+reads as node variance rather than a misconfiguration.
+
+Failure is per-member: one replica raising does not abort the others, and the
+tender fails exactly one clone. Preemption is the exception that must reach
+everyone, so the sentinel is watched once and SIGTERM is fanned out to all K
+mdruns — that handshake is what protects trajectory contiguity.
+
 ## Dataset structure
 
 These tools generate datasets that look roughly like the following:
@@ -302,6 +368,12 @@ The harvest does **not** reimage — it preserves the per-frame box (LOOS subset
 share the parent's `SharedPeriodicBox`, so the dry stream carries a live cell,
 not a frozen one), which is what lets you run `mdfarmer.reimage` on the dry
 stream afterwards.
+
+## Tests
+
+`tests/` holds plain scripts — no framework. `python tests/run_all.py` runs
+them all and reports pass, fail or skip per suite; see `tests/README.md` for
+what each one needs.
 
 ## AI assistance
 
