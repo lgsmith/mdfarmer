@@ -108,6 +108,18 @@ def main(n_clones=N_CLONES):
                 'WARNING' in log and '77' in log
                 and 'someone-elses-job' in log)
 
+    suite.section('two queued jobs for one generation')
+    farmer, _ = captured(lambda: make_farmer(work))
+    farmer.scheduler_assoc_rep_cmd = "printf '11 fm_0_0_0\\n22 fm_0_0_0\\n'"
+    rep_dict, log = captured(farmer.reassociate_running_jobs)
+    suite.check('boot names both job ids and the generation they share',
+                'WARNING' in log and '11' in log and '22' in log
+                and '(0, 0, 0)' in log)
+    suite.check('the tender keeps tending, bound to the newer job',
+                rep_dict == {(0, 0, 0): 22}, f'-> {rep_dict}')
+    suite.check('both jobs are still counted as ours',
+                farmer.current_jids == {11, 22}, f'-> {farmer.current_jids}')
+
     suite.section('a clone waiting for a free slot')
     farmer, _ = captured(lambda: make_farmer(
         work, seeds_first=False, active_clone_threshold=1))

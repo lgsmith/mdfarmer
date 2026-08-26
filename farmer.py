@@ -118,7 +118,16 @@ class Farmer:
                       f'{self.sep}gen indices. No clone will be bound to it, '
                       'and one may launch a second job on top of it.')
                 continue
-            rep_dict[(six, cix, gix)] = jid
+            key = (six, cix, gix)
+            # Two live jobs in one generation directory share a checkpoint and
+            # a set of part numbers, which no checkpoint can undo. The tender
+            # cannot cancel either one, so all it can do is say so.
+            if key in rep_dict:
+                print(f'WARNING: jobs {rep_dict[key]} and {jid} are both '
+                      f'queued for seed/clone/gen {key}. Two jobs in one '
+                      'generation directory will corrupt it -- cancel one by '
+                      'hand.')
+            rep_dict[key] = jid
         self.jids_file.write_text(' '.join(map(str, sorted(self.current_jids))))
         return rep_dict
 
