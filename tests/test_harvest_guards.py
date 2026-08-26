@@ -119,6 +119,22 @@ def main(frames_per_gen=FRAMES_PER_GEN, downsample_frq=DOWNSAMPLE_FRQ,
             suite.check(f'downsample_frq={bad} is refused',
                         'downsample_frq' in str(exc), f'-> {str(exc)[:45]}')
 
+    suite.section('sweeping a campaign for lost harvests')
+    farm = work / 'farm'
+    for gen in range(3):
+        gen_dir = farm / 'seed-00' / 'clone-00' / f'gen-{gen:02d}'
+        gen_dir.mkdir(parents=True)
+        (gen_dir / 'config.json').write_text('{}')
+        if gen == 0:
+            (gen_dir / hv.SENTINEL_NAME).write_text('{}')
+    all_stale = [d.name for d in hv.unharvested_gen_dirs(farm)]
+    running = [d.name for d in hv.unharvested_gen_dirs(farm, skip_newest=True)]
+    print(f'   all: {all_stale}   skipping the newest: {running}', flush=True)
+    suite.check('a finished campaign reports every unharvested generation',
+                all_stale == ['gen-01', 'gen-02'], f'-> {all_stale}')
+    suite.check('a running campaign leaves out the one in flight',
+                running == ['gen-01'], f'-> {running}')
+
     suite.section('a dry-run harvest submits nothing')
     harvester = hv.Harvester('#!/bin/bash\necho hi\n', 'sbatch')
     suite.check('reap returns nothing and writes only its script',
