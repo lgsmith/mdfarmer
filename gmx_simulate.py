@@ -31,6 +31,7 @@ Per-seed Farmer inputs map onto GROMACS as:
 """
 
 import json
+import os
 import re
 import shutil
 import signal
@@ -385,6 +386,19 @@ class MdrunFleet:
         return True
 
 
+def _mdrun_env(cmd, environ=None):
+    """Environment for an mdrun, with OMP_NUM_THREADS agreeing with -ntomp.
+
+    mdrun refuses to start when the two disagree, and a batch job inherits
+    whatever the submitting shell had exported.
+    """
+    env = dict(os.environ if environ is None else environ)
+    cmd = [str(c) for c in cmd]
+    if '-ntomp' in cmd and cmd.index('-ntomp') + 1 < len(cmd):
+        env['OMP_NUM_THREADS'] = cmd[cmd.index('-ntomp') + 1]
+    return env
+
+
 def _wait_in_fleet(proc, fleet, fleet_key):
     """Wait for a packed mdrun. The fleet owner watches and signals; a member
     only registers itself and reports whether a stop was called."""
@@ -431,7 +445,8 @@ def _run_mdrun(cmd, cwd, handle_preempt, poll_seconds=PREEMPT_POLL_SECONDS,
         if sentinel.exists():
             sentinel.unlink()
     print('[gmx mdrun]', ' '.join(map(str, cmd)), flush=True)
-    proc = sp.Popen([str(c) for c in cmd], cwd=str(cwd), text=True)
+    proc = sp.Popen([str(c) for c in cmd], cwd=str(cwd), text=True,
+                    env=_mdrun_env(cmd))
     if fleet is not None:
         rc = _wait_in_fleet(proc, fleet, fleet_key)
     else:
