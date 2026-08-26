@@ -18,10 +18,9 @@ openmm_topology_readers = {
 
 
 def read_openmm_top(top_fn):
-    # Only the lookup is guarded. A reader raises KeyError of its own over a
-    # topology naming an atom type it was never given, and answering that with
-    # 'no reader for .top' sends the reader of the message hunting for the
-    # wrong thing.
+    # Only the lookup is guarded. A reader raises a KeyError of its own when a
+    # topology names an atom type it was never given, and reporting that as an
+    # unsupported format sends the user looking for the wrong problem.
     top_p = Path(top_fn)
     try:
         reader = openmm_topology_readers[top_p.suffix]
