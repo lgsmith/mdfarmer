@@ -214,7 +214,8 @@ class Clone:
         'scheduler_fstring', 'scheduler', 'traj_list', 'sep', 'dirname_pad',
         'scheduler_kws', 'restarts_per_gen', 'restart_attempts', 'run_script',
         'harvester', 'remaining_steps', 'run_script_name', 'total_steps',
-        'preemption_checker', 'node_blocklist', 'progress_fn')
+        'preemption_checker', 'node_blocklist', 'progress_fn',
+        'scheduler_log_dir')
 
     # This should mostly be used by the init function, and by adaptive sampling scripts.
 
@@ -350,6 +351,10 @@ class Clone:
         self.node_blocklist = node_blocklist
         self.progress_fn = progress_fn
         self.run_script = run_script
+        # Where this clone's scheduler log lands. None means its own generation
+        # directory; a ClonePack points every member at the pack directory,
+        # which is the only place a packed job writes one.
+        self.scheduler_log_dir = None
         self.scheduler_script_p = None  # always redefined each run
 
     # Construct a Clone by walking the on-disk state for (seed_index,
@@ -751,7 +756,8 @@ class Clone:
             # plow_harrow_plant renders a directive that steers off it.
             if self.node_blocklist is not None:
                 self.node_blocklist.scan_and_record(
-                    self.current_gen_dir, self.get_tag())
+                    self.scheduler_log_dir or self.current_gen_dir,
+                    self.get_tag())
             # A trajectory of an unstarted sim can be a zero-frame file, which
             # breaks many appenders; clear it so the next launch starts clean.
             traj_p = (self.current_gen_dir / self.config['traj_name']
@@ -828,9 +834,14 @@ class ClonePack:
         self.pack_dir.mkdir(parents=True, exist_ok=True)
         self.scheduler = scheduler
         self.scheduler_fstring = inspect.cleandoc(scheduler_fstring)
-        self.scheduler_kws = dict(scheduler_kws)
-        self.scheduler_kws.setdefault('run_script_name', run_script_name)
-        self.scheduler_kws['cpus'] = cpus_per_task
+        # Held by reference, not copied: BadNodeRegistry writes new
+        # exclusions into the Farmer's dict, and a pack built once at boot
+        # would otherwise keep submitting to a node the Farmer has blocked.
+        # Pack-specific keys are overlaid at format time so this stays
+        # read-only.
+        self.scheduler_kws = scheduler_kws
+        self.pack_scheduler_kws = {'cpus': int(cpus_per_task),
+                                   'run_script_name': run_script_name}
         self.run_script = run_script
         self.run_script_name = run_script_name
         self.cpus_per_task = int(cpus_per_task)
@@ -852,6 +863,9 @@ class ClonePack:
         self.job_number = job_number
         for clone in self.clones:
             clone.job_number = job_number
+            # A packed job writes one scheduler log, here -- no member has one
+            # in its own gen dir, so a node scan rooted there finds nothing.
+            clone.scheduler_log_dir = self.pack_dir
         self.dry_run = dry_run
 
     @property
@@ -909,7 +923,8 @@ class ClonePack:
         (self.pack_dir / self.run_script_name).write_text(self.run_script)
         script_p = (self.pack_dir / self.scheduler).with_suffix('.sh')
         script_p.write_text(self.scheduler_fstring.format(
-            job_name=self._job_name(), **self.scheduler_kws))
+            job_name=self._job_name(),
+            **{**self.scheduler_kws, **self.pack_scheduler_kws}))
 
         if self.dry_run:
             print(f'{self.get_tag()}: dry run, wrote {script_p} and manifest.')
