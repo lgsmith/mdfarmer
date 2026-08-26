@@ -236,7 +236,7 @@ def _try_recover_gen(gen_path: Path, *,
 class Clone:
     __slots__ = (
         'config', 'dry_run', 'job_number', 'job_number_re', 'job_name_fstring', 'current_seed',
-        'current_gen_dir', 'current_gen', 'config_p', 'scheduler_script_p', 'compare_keys',
+        'current_gen_dir', 'config_p', 'scheduler_script_p', 'compare_keys',
         'scheduler_fstring', 'scheduler', 'traj_list', 'sep', 'dirname_pad',
         'scheduler_kws', 'restarts_per_gen', 'restart_attempts', 'run_script',
         'harvester', 'remaining_steps', 'run_script_name', 'total_steps',
@@ -344,7 +344,6 @@ class Clone:
             sep=self.config['sep'],
             mkdir=True
         )
-        self.current_gen = self.config['gen_index']
         self.job_number = job_number
         self.sep = sep
         if job_name_fstring:
@@ -745,10 +744,17 @@ class Clone:
         self.config['append'] = False
         # because we want to start next, increment the gen before building
         self.config['gen_index'] += 1
-        self.current_gen += 1
         attempted_launch = self.start_current(overwrite=overwrite,
                                               submit=submit)
         return attempted_launch
+
+    # The generation this clone would run next. Read from the config rather
+    # than tracked alongside it, so a caller that moves config['gen_index'] --
+    # which is how an adaptive-sampling script redirects a clone -- cannot
+    # leave the two disagreeing.
+    @property
+    def current_gen(self):
+        return self.config['gen_index']
 
     # True once this clone has finished its last configured generation and
     # will never start another. False when last_gen_index is None, since
@@ -826,8 +832,9 @@ class Clone:
             if (self.last_gen_index is not None
                     and self.config['gen_index'] >= self.last_gen_index):
                 # This was the last generation asked for; count it done
-                # instead of starting one more.
-                self.current_gen += 1
+                # instead of starting one more. Nothing builds a directory for
+                # the generation this now names, since is_done is True.
+                self.config['gen_index'] += 1
                 return True
             return self.start_next(overwrite=overwrite, submit=submit)
 
