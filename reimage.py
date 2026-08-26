@@ -131,6 +131,15 @@ def _box_from_first_frame(traj_p, angstrom_per_nm=ANGSTROM_PER_NM):
         'from; pass structure_fn instead')
 
 
+def length_scale(traj_fn, angstrom_per_nm=ANGSTROM_PER_NM):
+    """What to multiply this format's raw coordinates by to get nanometres.
+
+    mdtraj.open() hands back whatever the file holds: nm for an .xtc, Angstroms
+    for a .dcd. Everything here compares against nanometre thresholds.
+    """
+    return 1.0 if Path(traj_fn).suffix.lower() == '.xtc' else 1 / angstrom_per_nm
+
+
 def is_orthorhombic(box, triclinic_rtol=TRICLINIC_RTOL):
     """True when the 3x3 box matrix is rectangular to within triclinic_rtol."""
     box = np.asarray(box, dtype=float)
@@ -229,10 +238,11 @@ def check_bond_lengths(traj_fn, top_fn=None, pairs=None, max_bond=MAX_BOND,
 
     violations = []
     frame_index = 0
+    to_nm = length_scale(traj_p)
     with mdtraj.open(str(traj_p)) as fh:
         while True:
             chunk = fh.read(scan_chunk)
-            xyz = np.asarray(chunk[0])
+            xyz = np.asarray(chunk[0]) * to_nm
             if xyz.size == 0:
                 break
             if xyz.shape[1] <= max(left.max(), right.max()):
@@ -283,9 +293,10 @@ def check_anchor_distances(traj_fn, ranges, structure_fn=None,
 
     worst, worst_frame, worst_atom, worst_axis = 0.0, -1, -1, -1
     frame_index = 0
+    to_nm = length_scale(traj_p)
     with mdtraj.open(str(traj_p)) as fh:
         while True:
-            xyz = np.asarray(fh.read(scan_chunk)[0])
+            xyz = np.asarray(fh.read(scan_chunk)[0]) * to_nm
             if xyz.size == 0:
                 break
             # fraction of each axis' half-edge used up, so axes compare directly
