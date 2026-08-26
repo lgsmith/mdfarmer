@@ -493,7 +493,7 @@ class Farmer:
             traceback.print_exc()
             return False
 
-    def launch(self, sleep=None, update_jids=True):
+    def launch(self, update_jids=True):
         still_running = []  # note, this will be flat
         if update_jids and not self.update_jids():
             # Scheduler unreachable. Every clone we know about is presumed to
@@ -511,8 +511,6 @@ class Farmer:
                 for i, clone in enumerate(clone_list):
                     print('starting into clone loop for clone index',
                           i, clone.get_tag())
-                    if sleep:
-                        time.sleep(sleep)
                     # This probably shouldn't happen, but it's worth checking for
                     if clone in self.finished_clones or \
                             clone in self.failed_clone_set:
@@ -572,7 +570,7 @@ class Farmer:
                 'No clones could be set up; nothing to tend. Check the '
                 'per-clone setup errors printed above (missing structure, '
                 'topology, .mdp, or an unreadable checkpoint).')
-        still_running = self.launch(sleep=None, update_jids=False)
+        still_running = self.launch(update_jids=False)
         brake_file_p = Path('stop')
         # this needs to be while all(list of T/F for completed seeds/clones)
         print('still_running:', *still_running, flush=True)
@@ -591,7 +589,7 @@ class Farmer:
             # a stalled filesystem, a harvest blowing up. Losing the tender
             # leaves every running job unminded, which is what costs.
             try:
-                still_running = self.launch(sleep=None)
+                still_running = self.launch()
             except Exception as exc:
                 print(f'ERROR in tending loop: {type(exc).__name__}: {exc}')
                 traceback.print_exc()
