@@ -8,6 +8,11 @@ from . import gmx_simulate as gmx
 from . import gmx_pack
 import time
 
+# Consecutive failed advances a clone is allowed before it is given up on. A
+# failed submission or a scheduler hiccup is usually transient; abandoning a
+# clone ends its part of the campaign until a human notices.
+SUBMIT_FAILURE_LIMIT = 3
+
 
 class Farmer:
     __slots__ = ('priority_ordered_clones', 'n_seeds', 'n_clones', 'n_gens', 'runner', 'jids_file',
@@ -21,7 +26,8 @@ class Farmer:
                  'restarts_per_gen', 'pack_size', 'pack_grouping',
                  'pack_cpus_per_task', 'pack_scheduler_fstring',
                  'pack_run_script', 'pack_member_cores',
-                 'seed_config_overrides')
+                 'seed_config_overrides', 'submit_failure_limit',
+                 'submit_failures')
 
     # Refresh the set of job ids the scheduler says are ours and alive.
     # Returns False when the answer could not be trusted, leaving current_jids
@@ -208,6 +214,10 @@ class Farmer:
                  # clone is abandoned. A generation spanning many walltime
                  # blocks wants more headroom than one that is a single job.
                  restarts_per_gen=3,
+                 # Ticks in a row a clone may fail to advance before the tender
+                 # gives up on it. Counts submissions the scheduler refused and
+                 # generations that ran out of restarts alike.
+                 submit_failure_limit=SUBMIT_FAILURE_LIMIT,
                  # MPS packing. pack_size members share one job and one GPU;
                  # None lets every clone submit on its own. pack_grouping,
                  # callable(clones) -> list of lists, chooses who goes with
@@ -265,6 +275,9 @@ class Farmer:
         self.n_seeds = n_seeds
         self.n_clones = n_clones
         self.restarts_per_gen = restarts_per_gen
+        self.submit_failure_limit = submit_failure_limit
+        # clone -> failed advances in a row, cleared by any advance that works.
+        self.submit_failures = {}
         self.pack_size = pack_size
         self.pack_grouping = pack_grouping
         self.pack_cpus_per_task = pack_cpus_per_task
@@ -498,6 +511,19 @@ class Farmer:
             traceback.print_exc()
             return False
 
+    # Record one failed advance. True means the clone keeps its place in the
+    # queue for another tick: a refused submission, a stalled filesystem or a
+    # generation that used up its restarts are all worth retrying before the
+    # rest of this clone's campaign is written off.
+    def note_failure(self, clone):
+        count = self.submit_failures.get(clone, 0) + 1
+        self.submit_failures[clone] = count
+        if count < self.submit_failure_limit:
+            print(f'{clone.get_tag()} failed to advance: attempt {count} of '
+                  f'{self.submit_failure_limit}, retrying next tick.')
+            return True
+        return False
+
     def launch(self, update_jids=True):
         still_running = []  # note, this will be flat
         if update_jids and not self.update_jids():
@@ -530,8 +556,11 @@ class Farmer:
                     print('clone is in active clone list')
                     # Try to start another. A bad checkpoint or a failed
                     # submission fails this clone, not the whole campaign.
-                    did_start = self._safe_check_start_gen(clone)
-                    if did_start:
+                    if self._safe_check_start_gen(clone):
+                        self.submit_failures.pop(clone, None)
+                        survivors.append(clone)
+                        still_running.append(True)
+                    elif self.note_failure(clone):
                         survivors.append(clone)
                         still_running.append(True)
                     else:
@@ -546,7 +575,11 @@ class Farmer:
                     #  So we try to launch another.
                     if self._safe_check_start_gen(clone):
                         print('started clone, adding to active_clone_set')
+                        self.submit_failures.pop(clone, None)
                         self.active_clone_set.add(clone)
+                        survivors.append(clone)
+                        still_running.append(True)
+                    elif self.note_failure(clone):
                         survivors.append(clone)
                         still_running.append(True)
                     else:

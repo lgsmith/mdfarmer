@@ -134,6 +134,8 @@ def main(n_gens=N_GENS, pack_n_gens=PACK_N_GENS, steps_per_gen=STEPS_PER_GEN):
     farm.priority_ordered_clones = [[clone]]
     farm.current_jids = set()
     farm.overwrite = True
+    farm.submit_failures = {}
+    farm.submit_failure_limit = fm.SUBMIT_FAILURE_LIMIT
 
     for _ in range(n_gens + 3):
         if clone in farm.finished_clones:

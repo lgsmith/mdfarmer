@@ -52,6 +52,37 @@ def make_farmer(work, template=None, n_seeds=N_SEEDS, n_clones=N_CLONES,
         overwrite=True, jids_file=work / 'jids.txt', **kwargs)
 
 
+class StubClone:
+    """Answers the handful of calls launch makes, and reports what it did.
+
+    `succeeds` is what its check_start_gen returns, so a test can stage a run
+    of failures and then a recovery.
+    """
+
+    def __init__(self, tag='stub', current_gen=0, succeeds=False):
+        self.tag = tag
+        self.current_gen = current_gen
+        self.succeeds = succeeds
+        self.starts = 0
+
+    def get_tag(self):
+        return self.tag
+
+    def check_start_gen(self, scheduler_report, overwrite=False):
+        self.starts += 1
+        return self.succeeds
+
+
+def tend(farmer, clone):
+    """Put one stub clone in the tender's care, as an already-running clone."""
+    farmer.priority_ordered_clones = [[clone]]
+    farmer.active_clone_set = {clone}
+    farmer.finished_clones = set()
+    farmer.failed_clone_set = set()
+    farmer.submit_failures = {}
+    return farmer
+
+
 def captured(call):
     """Run call(), returning (result, everything it printed)."""
     out = io.StringIO()
@@ -82,6 +113,50 @@ def main(n_clones=N_CLONES):
                 not farmer.failed_clone_set)
     suite.check('waiting is not reported as a launch-logic failure',
                 'not accounted for' not in log)
+
+    suite.section('a clone that cannot advance is retried before it is failed')
+    limit = 3
+    farmer, _ = captured(lambda: make_farmer(work, submit_failure_limit=limit))
+    stub = StubClone('always-fails')
+    tend(farmer, stub)
+    for attempt in range(1, limit):
+        still_running, _ = captured(lambda: farmer.launch(update_jids=False))
+        suite.check(f'failure {attempt} of {limit} keeps the clone',
+                    still_running == [True]
+                    and farmer.priority_ordered_clones == [[stub]]
+                    and not farmer.failed_clone_set,
+                    f'-> {still_running}')
+    still_running, _ = captured(lambda: farmer.launch(update_jids=False))
+    suite.check(f'failure {limit} of {limit} fails the clone',
+                still_running == [False] and stub in farmer.failed_clone_set,
+                f'-> {still_running}')
+    suite.check('it took every attempt before giving up',
+                stub.starts == limit, f'-> {stub.starts}')
+
+    farmer, _ = captured(lambda: make_farmer(work, submit_failure_limit=limit))
+    stub = StubClone('never-launches')
+    tend(farmer, stub)
+    farmer.active_clone_set = set()
+    still_running, _ = captured(lambda: farmer.launch(update_jids=False))
+    suite.check('a clone that will not start at all is retried too',
+                still_running == [True] and not farmer.failed_clone_set,
+                f'-> {still_running}')
+
+    suite.section('an advance that works clears the failure count')
+    farmer, _ = captured(lambda: make_farmer(work, submit_failure_limit=limit))
+    stub = StubClone('recovers')
+    tend(farmer, stub)
+    captured(lambda: farmer.launch(update_jids=False))
+    stub.succeeds = True
+    captured(lambda: farmer.launch(update_jids=False))
+    suite.check('the count is cleared by the advance that worked',
+                farmer.submit_failures.get(stub, 0) == 0,
+                f'-> {farmer.submit_failures.get(stub, 0)}')
+    stub.succeeds = False
+    still_running, _ = captured(lambda: farmer.launch(update_jids=False))
+    suite.check('so the next failure starts the count over',
+                still_running == [True] and not farmer.failed_clone_set,
+                f'-> {still_running}')
 
     suite.section('a threshold that would leave every clone waiting')
     try:
