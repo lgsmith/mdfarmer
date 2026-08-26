@@ -14,8 +14,10 @@ lets gmx trjcat put the generations back together in order.
 
 Each launch writes its own prod.partNNNN.xtc, because mdrun -cpi will not append
 into a directory that does not already hold the files its checkpoint names. The
-parts are merged with trjcat when the generation finishes, which also drops the
-frames a resumed part covers twice.
+parts are merged with trjcat when the generation finishes; where two parts cover
+the same time, trjcat keeps the later file's frames, so a part left behind by a
+rewound relaunch is moved aside before mdrun runs rather than left for trjcat to
+prefer over the branch that actually continued.
 
 Whether a generation is finished is read from the checkpoint's step counter, not
 by counting frames. GROMACS writes a frame at step 0 too, so frame counting is
@@ -57,6 +59,10 @@ TPR_NAME = 'prod.tpr'
 
 # mdrun -deffnm stem; also the prefix of the .partNNNN outputs.
 DEFFNM = 'prod'
+
+# Prefix a stale part is renamed to, so it stops matching part_files' glob but
+# stays on disk as a record of the abandoned branch.
+ABANDONED_PART_PREFIX = 'abandoned-'
 
 # How often mdrun writes a checkpoint, in minutes. GROMACS defaults to 15, which
 # is how much work a hard kill can cost; a shorter period costs almost nothing.
@@ -188,6 +194,23 @@ def _run_capture(cmd, cwd=None):
 
 
 _STEP_RE = re.compile(r'^\s*step\s*=\s*(\d+)', re.MULTILINE)
+_PART_RE = re.compile(r'^\s*simulation part\s*#\s*=\s*(\d+)', re.MULTILINE)
+
+
+def checkpoint_part_step(cpt_fn, gmx_bin=GMX_BIN):
+    """(simulation part #, step) recorded in a GROMACS checkpoint.
+
+    The part number is the part mdrun was writing when the checkpoint was
+    saved; a relaunch with -cpi on this checkpoint writes part number + 1.
+    """
+    out = _run_capture([gmx_bin, 'dump', '-cp', str(cpt_fn)])
+    step_match = _STEP_RE.search(out)
+    if step_match is None:
+        raise ValueError(f'no step counter in checkpoint {cpt_fn}')
+    part_match = _PART_RE.search(out)
+    if part_match is None:
+        raise ValueError(f'no simulation part counter in checkpoint {cpt_fn}')
+    return int(part_match.group(1)), int(step_match.group(1))
 
 
 def checkpoint_step(cpt_fn, gmx_bin=GMX_BIN):
@@ -196,11 +219,7 @@ def checkpoint_step(cpt_fn, gmx_bin=GMX_BIN):
     Frame counts cannot answer that. GROMACS writes a frame at step 0, and the
     checkpoint is allowed to lag the last frame written.
     """
-    out = _run_capture([gmx_bin, 'dump', '-cp', str(cpt_fn)])
-    match = _STEP_RE.search(out)
-    if match is None:
-        raise ValueError(f'no step counter in checkpoint {cpt_fn}')
-    return int(match.group(1))
+    return checkpoint_part_step(cpt_fn, gmx_bin=gmx_bin)[1]
 
 
 def is_checkpoint(cpt_fn, gmx_bin=GMX_BIN):
@@ -223,12 +242,33 @@ def part_files(gen_dir, deffnm=DEFFNM, traj_suffix='.xtc'):
     return parts
 
 
+def _part_number(part_fn, deffnm=DEFFNM):
+    """The NNNN in a deffnm.partNNNN.<suffix> filename part_files returned."""
+    stem = Path(part_fn).name
+    return int(stem[len(deffnm) + len('.part'):len(deffnm) + len('.partNNNN')])
+
+
+def _move_aside_stale_parts(gen_dir, resume_part, deffnm=DEFFNM,
+                            traj_suffix='.xtc', prefix=ABANDONED_PART_PREFIX):
+    """Move aside any part numbered past resume_part.
+
+    The launch about to happen writes part resume_part + 1, so a higher part
+    already on disk was written by a branch this checkpoint has rewound past.
+    Left in place it would still match part_files' glob, and concat_parts has
+    no way to tell it apart from the branch that actually continued.
+    """
+    for part in part_files(gen_dir, deffnm=deffnm, traj_suffix=traj_suffix):
+        if _part_number(part, deffnm=deffnm) > resume_part:
+            part.rename(part.with_name(prefix + part.name))
+
+
 def concat_parts(gen_dir, out_fn, deffnm=DEFFNM, traj_suffix='.xtc',
                  gmx_bin=GMX_BIN):
     """Merge a generation's parts into the one trajectory the orchestrator wants.
 
-    trjcat sorts by time and drops the frames a resumed part covers twice, which
-    works because the chain keeps time counting from the start of the run.
+    trjcat sorts by time and, where two parts cover the same time, keeps the
+    later file's frames. That is only correct because callers move any part
+    left behind by a rewound relaunch aside before it ever reaches this glob.
     """
     parts = part_files(gen_dir, deffnm=deffnm, traj_suffix=traj_suffix)
     if not parts:
@@ -499,20 +539,27 @@ def gmx_generation(traj_dir_top_level: str,
             f'(looked at {own_cpt} and {seed_cpt}). Its predecessor did not '
             'leave a readable state.cpt.')
 
+    # The launch about to happen writes part resume_part + 1 (part 1 when
+    # nothing is resumed), so any higher part already here is a branch this
+    # checkpoint has rewound past. Move it aside before concat_parts can see
+    # it, whether or not mdrun actually runs below.
+    if resume_from is not None:
+        resume_part, already = checkpoint_part_step(resume_from, gmx_bin=gmx_bin)
+    else:
+        resume_part, already = 0, None
+    _move_aside_stale_parts(gen_dir, resume_part, deffnm=deffnm,
+                            traj_suffix=traj_suffix)
+
     # Already finished? Finalise instead of re-running. mdrun given a
     # checkpoint at or past its nsteps aborts, so a relaunch after a lost status
     # file would otherwise turn a finished generation into a failure.
-    if resume_from is not None:
-        already = checkpoint_step(resume_from, gmx_bin=gmx_bin)
-        if already >= target_step:
-            print(f'[gmx] generation {gen_index} is already at step {already} '
-                  f'of {target_step}; finalising without running mdrun.',
-                  flush=True)
-            if resume_from != own_cpt:
-                shutil.copy(resume_from, own_cpt)
-            reached = already
-        else:
-            reached = None
+    if already is not None and already >= target_step:
+        print(f'[gmx] generation {gen_index} is already at step {already} '
+              f'of {target_step}; finalising without running mdrun.',
+              flush=True)
+        if resume_from != own_cpt:
+            shutil.copy(resume_from, own_cpt)
+        reached = already
     else:
         reached = None
 
