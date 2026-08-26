@@ -84,6 +84,67 @@ class Farmer:
                 print('done_before_launch', clone.get_tag())
         return enough_gens
 
+    # Ask the scheduler which of our jobs are alive, and match them back to the
+    # (seed, clone, gen) they belong to. One query answers both questions: two
+    # would let a job come or go in between, binding a dead id to a Clone.
+    def reassociate_running_jobs(self):
+        self.current_jids = set()
+        rep_dict = {}
+        assoc_raw = sp.check_output(self.scheduler_assoc_rep_cmd, shell=True,
+                                    executable='/bin/bash', text=True).strip()
+        print('boot re-association scheduler report:')
+        print(assoc_raw)
+        for line in assoc_raw.split('\n'):
+            fields = line.split()
+            try:
+                jid = int(fields[0])
+            except (ValueError, IndexError):
+                continue
+            self.current_jids.add(jid)
+            try:
+                # The last three fields only. The title comes first and may
+                # contain the separator itself, which would otherwise leave a
+                # running job unbound and get a second one launched over it.
+                six, cix, gix = map(int, fields[1].split(self.sep)[-3:])
+            except (ValueError, IndexError):
+                # Not one of our job names. It stays in current_jids so we do
+                # not relaunch over it, but no Clone is bound to it.
+                continue
+            rep_dict[(six, cix, gix)] = jid
+        self.jids_file.write_text(' '.join(map(str, sorted(self.current_jids))))
+        return rep_dict
+
+    # Fill in the run_script, recover_fn and progress_fn that go with `runner`.
+    # A hand-supplied set that disagrees with it is refused rather than half
+    # applied, since the engine that runs is the one named in the run script.
+    def select_engine(self, runner, run_script, recover_fn, progress_fn):
+        self.runner = runner
+        self.run_script = run_script
+        self.recover_fn = recover_fn
+        self.progress_fn = progress_fn
+        if runner is gmx.gmx_generation:
+            gmx_defaults = (('run_script', gmx.default_gmx_run_script),
+                            ('recover_fn', gmx.gmx_try_recover_gen),
+                            ('progress_fn', gmx.gmx_gen_progress))
+            for name, default in gmx_defaults:
+                if getattr(self, name) is None:
+                    setattr(self, name, default)
+            custom = [name for name, default in gmx_defaults
+                      if getattr(self, name) is not default]
+            if custom:
+                print(f'NOTE: runner=gmx_generation with custom {custom}; '
+                      'make sure they implement the GROMACS contract.')
+        elif runner is sims.omm_generation:
+            gmx_pieces = (gmx.default_gmx_run_script, gmx.gmx_try_recover_gen,
+                          gmx.gmx_gen_progress)
+            for name in ('run_script', 'recover_fn', 'progress_fn'):
+                if getattr(self, name) in gmx_pieces:
+                    raise ValueError(
+                        f'runner is the OpenMM omm_generation but {name} is the '
+                        'GROMACS one. Pass runner=gmx_generation for a GROMACS '
+                        'campaign; mixing them runs one engine with the '
+                        "other's recovery logic.")
+
     # Build one Clone via disk-state discovery, isolating failures so one
     # corrupt clone dir can't kill orchestrator boot.
     def _setup_one_clone(self, tdir, seed_index, clone_index, rep_dict):
@@ -234,41 +295,7 @@ class Farmer:
                            for p in system_fns]
         self.top_fns = [str(self.check_path(Path(p)).resolve())
                         for p in top_fns]
-        # runner picks the matching run_script, recover_fn and progress_fn. A
-        # hand-supplied set that disagrees is refused rather than half applied,
-        # since the engine that runs is the one named in the run script.
-        self.runner = runner
-        self.run_script = run_script
-        self.recover_fn = recover_fn
-        self.progress_fn = progress_fn
-        if runner is gmx.gmx_generation:
-            if self.run_script is None:
-                self.run_script = gmx.default_gmx_run_script
-            if self.recover_fn is None:
-                self.recover_fn = gmx.gmx_try_recover_gen
-            if self.progress_fn is None:
-                self.progress_fn = gmx.gmx_gen_progress
-            mismatched = [
-                name for name, got, want in (
-                    ('run_script', self.run_script, gmx.default_gmx_run_script),
-                    ('recover_fn', self.recover_fn, gmx.gmx_try_recover_gen),
-                    ('progress_fn', self.progress_fn, gmx.gmx_gen_progress))
-                if got is not want]
-            if mismatched:
-                print(f'NOTE: runner=gmx_generation with custom {mismatched}; '
-                      'make sure they implement the GROMACS contract.')
-        elif runner is sims.omm_generation:
-            for name, value in (('run_script', self.run_script),
-                                ('recover_fn', self.recover_fn),
-                                ('progress_fn', self.progress_fn)):
-                if value is not None and value in (
-                        gmx.default_gmx_run_script, gmx.gmx_try_recover_gen,
-                        gmx.gmx_gen_progress):
-                    raise ValueError(
-                        f'runner is the OpenMM omm_generation but {name} is the '
-                        'GROMACS one. Pass runner=gmx_generation for a GROMACS '
-                        'campaign; mixing them runs one engine with the '
-                        "other's recovery logic.")
+        self.select_engine(runner, run_script, recover_fn, progress_fn)
         self.seeds_first = seeds_first
         self.scheduler = scheduler
         self.scheduler_kws = scheduler_kws
@@ -360,40 +387,7 @@ class Farmer:
                 self.config_template['traj_list'] = str(Path('traj_list.txt')
                                                         .resolve())
 
-        # One scheduler query at boot, used to populate both current_jids and
-        # rep_dict. Calling scheduler_report_cmd and scheduler_assoc_rep_cmd
-        # separately let a job appear / disappear between the two, producing a
-        # stale jid that would be bound to a Clone and double-launched on the
-        # first tick.
-        self.current_jids = set()
-        rep_dict = {}
-        assoc_raw = sp.check_output(self.scheduler_assoc_rep_cmd,
-                                    shell=True,
-                                    executable='/bin/bash',
-                                    text=True).strip()
-        print('boot re-association scheduler report:')
-        print(assoc_raw)
-        for line in assoc_raw.split('\n'):
-            if not line.strip():
-                continue
-            ls = line.split()
-            try:
-                jid = int(ls[0])
-            except (ValueError, IndexError):
-                continue
-            self.current_jids.add(jid)
-            try:
-                # The last three fields only. The title comes first and may
-                # contain the separator itself, which would otherwise leave a
-                # running job unbound and get a second one launched over it.
-                six, cix, gix = map(int, ls[1].split(self.sep)[-3:])
-                rep_dict[(six, cix, gix)] = jid
-            except (ValueError, IndexError):
-                # Job name doesn't fit our seed-clone-gen suffix scheme;
-                # leave it in current_jids so we don't relaunch over it
-                # but don't try to bind it to a Clone.
-                continue
-        self.jids_file.write_text(' '.join(map(str, sorted(self.current_jids))))
+        rep_dict = self.reassociate_running_jobs()
 
         tdir = Path(self.config_template['traj_dir_top_level'])
         self.priority_ordered_clones = []
