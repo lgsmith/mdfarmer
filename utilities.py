@@ -19,16 +19,18 @@ openmm_topology_readers = {
 
 
 def read_openmm_top(top_fn):
+    # Only the lookup is guarded. A reader raises KeyError of its own over a
+    # topology naming an atom type it was never given, and answering that with
+    # 'no reader for .top' sends the reader of the message hunting for the
+    # wrong thing.
+    top_p = Path(top_fn)
     try:
-        top_p = Path(top_fn)
-        top_ext = top_p.suffix
-        topology = openmm_topology_readers[top_ext](top_fn).topology
+        reader = openmm_topology_readers[top_p.suffix]
     except KeyError:
-        print('You seem to have used a topology format', top_ext,
-              'for which we have not included a reader. Choices are:',
-              *openmm_topology_readers.keys())
-        raise
-    return topology
+        raise ValueError(
+            f'No topology reader for {top_p.suffix!r}. Choices are: '
+            f'{", ".join(openmm_topology_readers)}') from None
+    return reader(top_fn).topology
 
 
 # Frame counting. mdtraj.open() gives a file handle whose length is the frame
