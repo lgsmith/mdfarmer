@@ -16,7 +16,8 @@ class Farmer:
                  'quiet', 'sep', 'dirname_pad', 'seed_state_fns', 'scheduler',
                  'scheduler_report_cmd', 'scheduler_fstring', 'scheduler_kws',
                  'scheduler_assoc_rep_cmd', 'system_fns', 'top_fns',
-                 'node_blocklist', 'run_script', 'recover_fn', 'progress_fn')
+                 'node_blocklist', 'run_script', 'recover_fn', 'progress_fn',
+                 'restarts_per_gen')
 
     # Refresh the set of job ids the scheduler says are ours and alive.
     #
@@ -104,6 +105,7 @@ class Farmer:
                 harvester=self.harvester,
                 preemption_checker=util.preemption_checkers.get(self.scheduler),
                 node_blocklist=self.node_blocklist,
+                restarts_per_gen=self.restarts_per_gen,
                 rep_dict=rep_dict,
                 run_script=self.run_script,
                 recover_fn=self.recover_fn,
@@ -134,6 +136,10 @@ class Farmer:
                  active_clone_threshold=50,
                  dirname_pad=3,
                  job_number_re='[1-9][0-9]*',
+                 # Consecutive dead launches a generation may take before its
+                 # clone is abandoned. A generation spanning many walltime
+                 # blocks wants more headroom than one that is a single job.
+                 restarts_per_gen=3,
                  sep='-',
                  seeds_first=True,
                  job_name_elements=(
@@ -174,6 +180,7 @@ class Farmer:
                  ):
         self.n_seeds = n_seeds
         self.n_clones = n_clones
+        self.restarts_per_gen = restarts_per_gen
         # gen-seed is base + stride * seed_index + clone_index, so a stride at
         # or below n_clones makes two seeds draw the same initial velocities.
         gen_seed_stride = config_template.get('gen_seed_stride',

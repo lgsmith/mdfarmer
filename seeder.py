@@ -388,6 +388,7 @@ class Clone:
                   harvester=None,
                   preemption_checker=None,
                   node_blocklist=None,
+                  restarts_per_gen=3,
                   # GROMACS support hooks. None -> OpenMM defaults:
                   #   recover_fn -> _try_recover_gen (state.xml/DCD recovery)
                   #   run_script -> Clone's default_run_script (omm runner)
@@ -486,6 +487,7 @@ class Clone:
             job_number=jid,
             job_number_re=job_number_re,
             job_name_fstring=job_name_fstring,
+            restarts_per_gen=restarts_per_gen,
             dirname_pad=dirname_pad,
             sep=sep,
             harvester=harvester,
