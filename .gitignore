@@ -1,2 +1,5 @@
 __pycache__/
 plans/
+.claude/
+.vscode/
+*.egg-info/
