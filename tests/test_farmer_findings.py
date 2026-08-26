@@ -21,6 +21,12 @@ N_GENS = 2
 STEPS_PER_GEN = 1000
 WRITE_INTERVAL = 100
 CPUS = 8
+PACK_SIZE = 2
+# Clones per pack-threshold check, and how many clones a short campaign asks
+# for when only half of them build.
+PACK_THRESHOLD = 3
+SHORT_CLONES = 4
+FAILURE_LIMIT = 3
 
 
 def make_template(work, steps_per_gen=STEPS_PER_GEN,
@@ -106,7 +112,9 @@ def captured(call):
     return result, out.getvalue()
 
 
-def main(n_clones=N_CLONES):
+def main(n_clones=N_CLONES, pack_size=PACK_SIZE,
+         pack_threshold=PACK_THRESHOLD, short_clones=SHORT_CLONES,
+         failure_limit=FAILURE_LIMIT):
     suite = Suite('farmer_findings')
     work = harness.workdir('farmer_findings')
     for name in ('a.gro', 'topol.top', 'base.mdp'):
@@ -128,29 +136,27 @@ def main(n_clones=N_CLONES):
     trapless = '\n'.join(
         line for line in util.basic_scheduler_fstrings_mps['slurm'].splitlines()
         if 'PREEMPT_SIGTERM' not in line and 'trap ' not in line)
-    farmer, log = captured(lambda: make_farmer(
-        work, pack_size=2, pack_scheduler_fstring=trapless))
+    _, log = captured(lambda: make_farmer(
+        work, pack_size=pack_size, pack_scheduler_fstring=trapless))
     suite.check('a pack template with no trap warns rather than refusing',
                 'WARNING' in log and 'pack template' in log)
-    farmer, log = captured(lambda: make_farmer(work, pack_size=2))
+    _, log = captured(lambda: make_farmer(work, pack_size=pack_size))
     suite.check('the stock pack template passes the same check',
                 'pack template' not in log)
     label = 'packing checks the pack template, not the unsubmitted one'
     try:
-        farmer, log = captured(lambda: make_farmer(
-            work, handle_preempt=True, pack_size=2,
+        _, log = captured(lambda: make_farmer(
+            work, handle_preempt=True, pack_size=pack_size,
             scheduler_fstring=util.basic_scheduler_fstrings['slurm']))
         suite.check(label, 'pack template' not in log)
     except ValueError as exc:
         suite.check(label, False, f'-> refused over the solo one: {exc}'[:60])
 
     suite.section('packing changes what active_clone_threshold counts')
-    pack_size = 2
-    threshold = 3
-    farmer, log = captured(lambda: make_farmer(
-        work, pack_size=pack_size, active_clone_threshold=threshold))
+    _, log = captured(lambda: make_farmer(
+        work, pack_size=pack_size, active_clone_threshold=pack_threshold))
     suite.check('boot says how many clones the threshold now allows',
-                f'{threshold * pack_size} clones will run at once' in log)
+                f'{pack_threshold * pack_size} clones will run at once' in log)
 
     suite.section('a generation that is not a whole number of write intervals')
     ragged = make_template(work, steps_per_gen=STEPS_PER_GEN + 1)
@@ -186,17 +192,16 @@ def main(n_clones=N_CLONES):
                 f"-> {farmer.config_template['traj_list']}")
 
     suite.section('clones that could not be set up are counted, not just listed')
-    n_clones_short = 4
     farmer, log = captured(lambda: make_farmer(
-        work, n_clones=n_clones_short, cls=HalfBuildingFarmer))
+        work, n_clones=short_clones, cls=HalfBuildingFarmer))
     built = sum(len(queue) for queue in farmer.priority_ordered_clones)
     suite.check('only half the clones were built',
-                built == n_clones_short // 2, f'-> {built}')
+                built == short_clones // 2, f'-> {built}')
     suite.check('boot says how many of how many are missing',
-                f'{n_clones_short - built} of {n_clones_short} clones' in log)
+                f'{short_clones - built} of {short_clones} clones' in log)
     suite.check('the campaign still boots on what it has',
                 any(farmer.priority_ordered_clones))
-    farmer, log = captured(lambda: make_farmer(work))
+    _, log = captured(lambda: make_farmer(work))
     suite.check('a campaign that builds every clone says nothing',
                 'could not be set up' not in log)
 
@@ -241,7 +246,7 @@ def main(n_clones=N_CLONES):
                 'not accounted for' not in log)
 
     suite.section('a clone that cannot advance is retried before it is failed')
-    limit = 3
+    limit = failure_limit
     farmer, _ = captured(lambda: make_farmer(work, submit_failure_limit=limit))
     stub = StubClone('always-fails')
     tend(farmer, stub)
