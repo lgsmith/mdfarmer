@@ -31,19 +31,10 @@ def read_openmm_top(top_fn):
     return topology
 
 
-# Frame counting. mdtraj.open(...) returns a format-specific file handle
-# (DCD/XTC) whose __len__ reports the frame count without loading coordinates,
-# and -- importantly -- without needing a topology at all. LOOS is used only as
-# a fallback, because loos.createSystem() cannot read the one topology format a
-# GROMACS run actually has:
-#
-#     >>> loos.createSystem('topol.top')
-#     RuntimeError: Error- unknown system file type 'top'
-#
-# That RuntimeError is not a loos.LOOSError, so it escaped the except clause
-# below, propagated out of calx_remaining_steps, and killed the Farmer process
-# on its first tick of any GROMACS run in an environment where LOOS imports --
-# which is every environment where the reimaging tools are installed.
+# Frame counting. mdtraj.open() gives a file handle whose length is the frame
+# count, without reading coordinates and without needing a topology at all.
+# LOOS is only the fallback, since it cannot read a GROMACS .top and raises a
+# plain RuntimeError when asked to, which is why the except below is broad.
 try:
     import mdtraj as _mdtraj
 except ImportError:
@@ -164,12 +155,10 @@ basic_scheduler_fstrings = {
 
                 python {run_script_name}
                 """),
-    # -J (not -j) is sbatch's job-name flag; -j is not an sbatch option at all,
-    # so the old template was rejected outright. The shebang matters too: with
-    # no interpreter line the job runs under the submitting user's login shell.
-    # {exclude_nodes} expands to '' when nothing is blocked, and a bare blank
-    # line is fine -- Slurm stops scanning #SBATCH directives at the first
-    # non-comment, non-blank line, so keep all directives above the echoes.
+    # -J is sbatch's job-name flag, and the shebang decides which shell runs
+    # the job. {exclude_nodes} is empty when nothing is blocked; the blank line
+    # that leaves is fine, but keep every #SBATCH above the echoes, since Slurm
+    # stops reading directives at the first real command.
     "slurm": inspect.cleandoc("""#!/bin/bash
                 #SBATCH -J {job_name}
                 #SBATCH -e slurm.out
@@ -211,10 +200,9 @@ basic_scheduler_fstrings_preempt = {
                 python {run_script_name} &
                 wait
                 """),
-    # --signal=B:TERM@120 is what makes this fire on a WALLTIME boundary as well
-    # as on preemption: without it Slurm only signals at the very end of the
-    # allocation, leaving no time to checkpoint. B: targets the batch shell, so
-    # the trap below runs rather than the signal going straight to mdrun.
+    # --signal=B:TERM@120 gives 120 seconds' warning at the end of the
+    # allocation as well as on preemption, which is the time to checkpoint in.
+    # B: sends it to the batch shell so the trap below runs.
     "slurm": inspect.cleandoc("""#!/bin/bash
                 #SBATCH -J {job_name}
                 #SBATCH -e slurm.out
@@ -242,20 +230,11 @@ basic_gpu_lines = {
     "slurm": "#SBATCH --gpus=1"
 }
 
-# MPS-packed variant: one job, one GPU, K replicas sharing the card through the
-# CUDA Multi-Process Service. Pair with gmx_pack.gmx_pack_sim_block_json, which
-# does the per-replica core pinning and the per-member outcome reporting.
-#
-# Two details that bite:
-#   * The pipe and log directories are keyed on $SLURM_JOB_ID. Two packed jobs
-#     landing on the same node otherwise share -- or clobber -- one daemon.
-#   * If the daemon fails to start the mdruns still run, just time-sliced at
-#     10-20% worse throughput. The runner checks and says so loudly; the script
-#     echoes its own failure too, rather than tolerating it silently.
-#
-# --signal=B:TERM@120 is what makes the checkpoint handshake fire at a WALLTIME
-# boundary as well as on preemption; B: sends it to the batch shell so the trap
-# runs instead of the signal going straight to mdrun.
+# One job, one GPU, several replicas sharing it through CUDA MPS. Goes with
+# gmx_pack.gmx_pack_sim_block_json, which does the core pinning. The MPS pipe
+# and log directories are named after the job id, so two packed jobs on one node
+# cannot clobber each other's daemon. A daemon that fails to start is only a
+# slowdown, not an error, so the script says so loudly instead of dying.
 basic_scheduler_fstrings_mps = {
     "slurm": inspect.cleandoc("""#!/bin/bash
                 #SBATCH -J {job_name}
@@ -272,11 +251,9 @@ basic_scheduler_fstrings_mps = {
                 echo "NODE: $SLURMD_NODENAME"
                 echo "GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | paste -sd, -)"
 
-                # Refuse to be the second job in this pack directory: both
-                # would share one pack.json, one checkpoint and one part-number
-                # sequence, which -cpi cannot undo. Job-name re-association can
-                # still miss a live job whose generation has moved on, so the
-                # lock backs it up. Held on fd 9 for the job's lifetime.
+                # Refuse to be a second job in this pack directory. Two
+                # would share one checkpoint and one set of part numbers, which
+                # no checkpoint can undo. Held on fd 9 until the job ends.
                 exec 9>pack.lock
                 if ! flock -n 9; then
                     echo "PACK LOCK: another job already holds $(pwd)/pack.lock; exiting rather than putting a second mdrun on this checkpoint."
@@ -852,9 +829,8 @@ default_straight_sampling_init_config = dict(
 
 
 #  make two trajs--one stripped of solvent, the _other_ downsampled by some integer factor but not dried.
-# `harvest_generation` picks its backend from the box on the trajectory, so the
-# same script is right for a rectangular cell (LOOS, streaming) and a triclinic
-# one (mdtraj, chunked). A requeued harvest job that already ran is a no-op.
+# harvest_generation reads the box and picks its own backend, so one script
+# suits any cell. A requeued harvest that already ran does nothing.
 default_harvest_shellscript = inspect.cleandoc("""#!/bin/bash
                 #BSUB -J harvest
                 #BSUB -o harvest.out

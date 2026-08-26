@@ -1,37 +1,23 @@
-"""Pack K GROMACS replicas onto one GPU in a single Slurm job, under MPS.
+"""Run several GROMACS replicas on one GPU, in a single job, sharing it via MPS.
 
-WHY THIS EXISTS
----------------
-Running two replicas per card costs about 6% of the per-replica sampling rate
-and halves the GPU-hour bill. The zero-code way to get that would be to let
-Slurm co-schedule two independent jobs onto one GPU, but this cluster's Slurm
-has ``GresTypes = gpu`` only -- no ``mps``, no ``shard`` -- so it cannot. The
-packing therefore has to happen *inside* one job, which is what this module
-does: one sbatch, K generations advancing together, K separate ``gmx mdrun``
-processes sharing the card through the MPS daemon.
+Two replicas per card costs about 6% of each one's sampling rate and halves the
+GPU-hour bill. Slurm here offers only a plain gpu gres, with no mps or shard, so
+it cannot put two jobs on one card and the packing has to happen inside one job:
+one sbatch, K generations advancing together, K separate mdrun processes.
 
-K separate processes, not ``mdrun -multidir``: GROMACS could run the ensemble
-itself, but that makes the K trajectories a single failure domain, and one crash
-taking out every replica is the wrong trade when contiguity is the point.
+They are separate processes rather than mdrun -multidir so that one crash costs
+one replica instead of all of them.
 
-THE PART THAT SILENTLY EATS THE BENEFIT
----------------------------------------
-CPU pinning. Two replicas in one job that both say a bare ``-pin on`` each pin
-starting at core 0 and fight over the same cores. You keep the packing and lose
-most of the retention, and it looks like node variance rather than a
-misconfiguration. `replica_mdrun_args` therefore *strips* any inherited
-``-ntomp``/``-pin*`` flags and derives this replica's own from its index within
-the pack -- and refuses to run rather than overcommit the allocation.
+The thing that quietly wastes the benefit is CPU pinning. Two replicas that both
+say a bare '-pin on' both start at core 0 and fight over the same cores, which
+reads as a slow node rather than a mistake. replica_mdrun_args strips any
+inherited thread and pinning flags and works out this replica's own from its
+place in the pack, refusing to run if they would not fit.
 
-FAILURE IS PER-REPLICA
-----------------------
-A packed job's outcome is K outcomes. One replica raising must not abort the
-others, so every member runs to completion and the exceptions are collected;
-only then is the per-member result reported, which lets the tender fail exactly
-one clone. Preempt/walltime is the exception that must reach *everyone*: the
-sentinel is watched once and SIGTERM is fanned out to all K mdruns (see
-``gmx_simulate.MdrunFleet``), because that handshake is what protects
-trajectory contiguity.
+A packed job has one outcome per replica. One replica failing does not stop the
+others, so the tender can fail exactly one clone. Preemption is the exception
+that has to reach everyone: the sentinel is watched once and SIGTERM is passed
+on to every mdrun, since that handshake is what keeps trajectories contiguous.
 """
 
 import itertools
@@ -62,18 +48,12 @@ PACK_STATUS_NAME = 'pack_status.json'
 PER_REPLICA_MDRUN_FLAGS = {'-ntomp': 1, '-pin': 1, '-pinoffset': 1,
                            '-pinstride': 1, '-ntmpi': 1, '-nt': 1}
 
-# Thread-MPI ranks per replica. Without it a thread-MPI mdrun picks its own
-# decomposition from every core it can SEE rather than the ones this replica was
-# given -- several ranks of -ntomp threads each, and pinning offsets that then
-# describe nothing. One GPU per member means one rank.
-#
-# Only a thread-MPI build accepts the flag; a real-MPI build takes its rank
-# count from mpirun and makes it fatal. Such a build already gets one rank per
-# replica, since the pack launches mdrun directly rather than under mpirun, so
-# `gmx_supports_ntmpi` decides once per job whether to emit it at all.
-#
-# '-nt' is stripped for a related reason: it fixes TOTAL threads, so it cannot
-# vary per replica and goes fatal the moment two members differ in size.
+# Ranks per replica. One GPU per member means one rank; without saying so a
+# thread-MPI mdrun spreads over every core it can see, not the ones it was
+# given, and the pinning offsets stop meaning anything. Only a thread-MPI build
+# takes the flag at all, so gmx_supports_ntmpi asks before it is used.
+# '-nt' is stripped for a related reason: it fixes total threads, so it cannot
+# differ between replicas.
 NTMPI = 1
 
 # Line `gmx -version` prints for the MPI flavour, and the value a thread-MPI
@@ -101,12 +81,10 @@ runner('pack.json')
 
 
 def member_core_layout(cpus_per_task, n_replicas, member_cores=None):
-    """``[(cores, offset), ...]``: one contiguous, non-overlapping core block
-    per replica.
+    """[(cores, offset), ...], one block of neighbouring cores per replica.
 
-    `member_cores` sets each member's width independently, for a pack whose
-    members have different core knees. Absent, the allocation is split evenly,
-    which is what a pack of one condition wants.
+    member_cores widens some members and narrows others, for a pack whose
+    members stop scaling at different core counts. Left out, the split is even.
     """
     cpus_per_task = int(cpus_per_task)
     if n_replicas < 1:
@@ -135,12 +113,10 @@ def member_core_layout(cpus_per_task, n_replicas, member_cores=None):
 def replica_mdrun_args(base_args, replica_index, n_replicas, cpus_per_task,
                        pin_stride=PIN_STRIDE, ntmpi=NTMPI, member_cores=None,
                        per_replica_flags=PER_REPLICA_MDRUN_FLAGS):
-    """This replica's mdrun flags: shared template minus pinning, plus its own.
+    """This replica's mdrun flags: the shared ones, plus its own core block.
 
-    ``-ntomp <cores> -pin on -pinoffset <offset> -pinstride 1`` gives replica i
-    a private, contiguous block of cores. Raises rather than overcommitting: K
-    replicas each taking more cores than the allocation holds is exactly the
-    silent slowdown this function exists to prevent.
+    Raises rather than handing out more cores than the job holds, which is the
+    silent slowdown this exists to prevent.
     """
     if not 0 <= replica_index < n_replicas:
         raise ValueError(
@@ -169,11 +145,10 @@ def replica_mdrun_args(base_args, replica_index, n_replicas, cpus_per_task,
 def gmx_supports_ntmpi(gmx_bin=gmx.GMX_BIN,
                        mpi_version_key=GMX_MPI_VERSION_KEY,
                        thread_mpi_value=GMX_THREAD_MPI_VALUE, timeout=60):
-    """True when this GROMACS is a thread-MPI build, so -ntmpi is legal.
+    """True when this GROMACS is a thread-MPI build, which is what takes -ntmpi.
 
-    `gmx -version` reports either ``MPI library: thread_mpi`` or ``MPI library:
-    MPI (...)``. Only the first accepts -ntmpi; the second makes it fatal, so an
-    unprobeable binary returns False.
+    A real-MPI build makes the flag fatal, so a binary that cannot be asked
+    returns False.
     """
     try:
         result = sp.run([gmx_bin, '-version'], capture_output=True, text=True,

@@ -1,68 +1,31 @@
-"""GROMACS per-generation runner for mdfarmer.
+"""Run one GROMACS generation, in place of simulate.omm_generation.
 
-Mirrors the contract of ``simulate.omm_generation`` / ``omm_basic_sim_block_json``
-so the engine-agnostic ``Farmer``/``Clone`` orchestration (priority queue,
-active-clone throttling, disk-driven resume, preempt budget, bad-node registry)
-drives GROMACS exactly as it drives OpenMM.
+It takes the same arguments the OpenMM runner does, so Farmer and Clone drive
+GROMACS without knowing which engine they have. Nothing here imports OpenMM; it
+shells out to the gmx binary.
 
-HOW GENERATIONS CHAIN
----------------------
-Generations are chained the way GROMACS documents for an *exact* continuation:
-``gmx convert-tpr`` extends the run's step budget and ``gmx mdrun -cpi`` resumes
-from the previous generation's checkpoint. The obvious-looking alternative --
-``grompp -t prev/state.cpt`` -- is **not** an exact continuation and was measured
-to lose real state:
+Generations chain with gmx convert-tpr, to extend the step budget, plus
+mdrun -cpi to resume from the last generation's checkpoint. This is the only
+exact continuation: grompp -t reads coordinates, velocities and box size and
+nothing else, which silently zeroes the Nose-Hoover and Parrinello-Rahman
+integrals at every generation boundary. The chain also keeps step and time
+counting from the start of the run rather than restarting at zero, which is what
+lets gmx trjcat put the generations back together in order.
 
-    checkpoint written by gen N     tpr built by `grompp -t` from it
-    ---------------------------     --------------------------------
-    nosehoover-xi   = -9.30e-02     nosehoover_xi: not available
-    nosehoover-vxi  = -2.93e-01     (absent)
-    pres_prev       = <nonzero>     pres_prev = 0
-                                    boxv      = 0
+Each launch writes its own prod.partNNNN.xtc, because mdrun -cpi will not append
+into a directory that does not already hold the files its checkpoint names. The
+parts are merged with trjcat when the generation finishes, which also drops the
+frames a resumed part covers twice.
 
-grompp itself only claims "Reading Coordinates, Velocities and Box size from old
-trajectory". With ``tcoupl = nose-hoover`` and ``pcoupl = Parrinello-Rahman`` --
-deterministic, memory-bearing couplings -- that zeroes the thermostat and
-barostat integrals at every generation boundary. ``-cpi`` carries them.
+Whether a generation is finished is read from the checkpoint's step counter, not
+by counting frames. GROMACS writes a frame at step 0 too, so frame counting is
+off by one write interval, and a generation killed inside its last interval
+would look finished when it is not.
 
-The chain also keeps the step and time counters **globally continuous**
-(gen N ends at t=10 ps, gen N+1's frames start at t=10 ps, not t=0), which is
-what makes ``gmx trjcat`` able to assemble the dataset: trjcat orders and
-de-duplicates by time, so per-generation files that all restart at t=0 would be
-silently mangled by it.
-
-WHY THERE ARE ``partNNNN`` FILES
--------------------------------
-``mdrun -cpi`` refuses to append into a directory that does not already contain
-the exact output files named in the checkpoint, so a cross-directory resume must
-use ``-noappend``, and every mdrun invocation writes its own
-``prod.partNNNN.xtc``. A generation therefore accumulates one part per launch
-(first run, plus one per walltime/preempt continuation). When the generation
-finishes, the parts are merged with ``gmx trjcat`` into the single
-``<traj_name><traj_suffix>`` the orchestrator expects. Because the parts carry
-globally-correct times, trjcat removes the overlap a resumed part re-covers;
-this was verified to turn parts of 11 and 1 frames into a merged 11 frames with
-monotonic, uniformly-spaced times.
-
-COMPLETION IS DECIDED BY THE CHECKPOINT, NOT BY COUNTING FRAMES
---------------------------------------------------------------
-GROMACS writes an output frame at step 0 of every run, so a complete generation
-holds ``nsteps/nstxout-compressed + 1`` frames, not ``nsteps/nstxout-compressed``
-(verified: 11, not 10). Deciding completion by ``total_steps - frames *
-write_interval`` is therefore off by one interval: a generation killed anywhere
-inside its final write interval scores exactly 0 and is misread as finished,
-after which the next generation seeds from a checkpoint that does not match the
-end of the saved trajectory -- a silent rewind at the boundary. Instead this
-runner reads the step counter out of the checkpoint and records it, with the
-generation's step target, in ``GEN_STATUS_NAME``. The orchestrator reads that
-file; it never has to count frames or run ``gmx`` itself.
-
-Per-seed Farmer inputs map to GROMACS as:
-    seed_structure_fns -> the .gro structure (also the gen-0 seed)
+Per-seed Farmer inputs map onto GROMACS as:
+    seed_structure_fns -> the .gro structure, also the generation-0 seed
     top_fns            -> the .top topology
-    system_fns         -> the .mdp run parameters   (repurposed; see ``mdp_fn``)
-
-This module does not import OpenMM; it only shells out to the ``gmx`` binary.
+    system_fns         -> the .mdp run parameters, see mdp_fn
 """
 
 import json
@@ -83,10 +46,9 @@ PREEMPT_SENTINEL_NAME = 'PREEMPT_SIGTERM'
 # a generation is finished without counting frames or invoking gmx.
 GEN_STATUS_NAME = 'gen_status.json'
 
-# The incoming seed checkpoint is copied in by Clone under `restart_name`; the
-# runner immediately moves it aside to this name so `restart_name` refers only
-# to a checkpoint *this* generation's mdrun wrote. Sharing one name for both is
-# what made `-cpi` fatal on a generation that died before its first checkpoint.
+# Clone copies the incoming checkpoint in under restart_name, and the runner
+# moves it here at once, so restart_name only ever names a checkpoint this
+# generation's own mdrun wrote.
 SEED_CPT_NAME = 'seed.cpt'
 
 # Per-generation tpr. Generation N>0 is built from generation N-1's by
@@ -110,10 +72,8 @@ GEN_SEED_STRIDE = 1000
 # it is splatted -- otherwise the call gets two values for the same keyword.
 RUNTIME_ONLY_KEYS = ('fleet', 'fleet_key', 'grompp_lock')
 
-# Parameters a Clone fills in for each of its generations: four from
-# `Clone.from_disk` and `seed_fn` from `Clone.set_seed`. A driver builds its
-# template before any of them is known, so `gmx_config_template` supplies
-# placeholders; whatever it puts there is overwritten before a job reads it.
+# Arguments a Clone supplies per generation. A driver builds its template
+# before it knows any of them, so gmx_config_template leaves placeholders.
 CLONE_FILLED_KEYS = ('seed_index', 'clone_index', 'gen_index', 'seed_fn',
                      'top_fn')
 
@@ -165,22 +125,17 @@ LEGACY_MDP_KEYS = {
 def write_gen_mdp(base_mdp, out_mdp, *, nsteps, nstxout_compressed,
                   gen_vel, continuation, gen_seed=None, gen_temp=None,
                   ld_seed=None, legacy_mdp_keys=LEGACY_MDP_KEYS):
-    """Copy base_mdp to out_mdp, overriding only the per-gen control keys.
-
-    Only generation 0 needs this: later generations inherit their parameters
-    from the previous generation's tpr through ``convert-tpr``, which is what
-    makes the continuation exact.
-    """
+    """Copy base_mdp to out_mdp, changing only the per-generation control keys."""
+    # Only generation 0 needs it. Later ones inherit their parameters from the
+    # previous tpr through convert-tpr, which is what keeps them exact.
     overrides = {
         'nsteps': str(int(nsteps)),
         'nstxout-compressed': str(int(nstxout_compressed)),
         'gen-vel': 'yes' if gen_vel else 'no',
         'continuation': 'yes' if continuation else 'no',
     }
-    # ld-seed is not gated on gen_vel: it drives a stochastic thermostat for
-    # the whole run, not just the initial velocities. GROMACS keys its draws on
-    # (seed, step, atom), so one value per replica stays decorrelated across a
-    # continuation. Left alone when None, which keeps an mdp's `ld-seed = -1`.
+    # ld-seed is set whether or not velocities are generated: it drives a
+    # stochastic thermostat for the whole run, not just the start.
     if ld_seed is not None:
         overrides['ld-seed'] = str(int(ld_seed))
     if gen_vel:
@@ -232,12 +187,10 @@ _STEP_RE = re.compile(r'^\s*step\s*=\s*(\d+)', re.MULTILINE)
 
 
 def checkpoint_step(cpt_fn, gmx_bin=GMX_BIN):
-    """Step counter recorded in a GROMACS checkpoint.
+    """The step counter in a GROMACS checkpoint: how far this generation got.
 
-    This is the authoritative measure of how far a generation actually got.
-    Frame counts are not: GROMACS writes a frame at step 0, and the checkpoint
-    can legitimately lag the last written frame, which is exactly the gap that
-    lets a short generation masquerade as a complete one.
+    Frame counts cannot answer that. GROMACS writes a frame at step 0, and the
+    checkpoint is allowed to lag the last frame written.
     """
     out = _run_capture([gmx_bin, 'dump', '-cp', str(cpt_fn)])
     match = _STEP_RE.search(out)
@@ -247,12 +200,8 @@ def checkpoint_step(cpt_fn, gmx_bin=GMX_BIN):
 
 
 def is_checkpoint(cpt_fn, gmx_bin=GMX_BIN):
-    """True when `cpt_fn` is a checkpoint gmx can actually read.
-
-    Guards the case where the file at ``restart_name`` is not a checkpoint at
-    all -- at generation 0 the seed is the starting ``.gro``, and handing that
-    to ``-cpi`` fatals with 'Start of file magic number mismatch'.
-    """
+    """True when this file is a checkpoint gmx can actually read."""
+    # At generation 0 the seed is a .gro, and handing that to -cpi is fatal.
     path = Path(cpt_fn)
     if not path.is_file() or path.stat().st_size == 0:
         return False
@@ -272,11 +221,10 @@ def part_files(gen_dir, deffnm=DEFFNM, traj_suffix='.xtc'):
 
 def concat_parts(gen_dir, out_fn, deffnm=DEFFNM, traj_suffix='.xtc',
                  gmx_bin=GMX_BIN):
-    """Merge a generation's ``-noappend`` parts into one trajectory.
+    """Merge a generation's parts into the one trajectory the orchestrator wants.
 
-    ``gmx trjcat`` orders by time and drops the overlap that a resumed part
-    re-covers, which is correct here precisely because the continuation keeps
-    times globally monotonic.
+    trjcat sorts by time and drops the frames a resumed part covers twice, which
+    works because the chain keeps time counting from the start of the run.
     """
     parts = part_files(gen_dir, deffnm=deffnm, traj_suffix=traj_suffix)
     if not parts:
@@ -288,10 +236,9 @@ def concat_parts(gen_dir, out_fn, deffnm=DEFFNM, traj_suffix='.xtc',
         # idempotent and the part stays as the provenance record.
         shutil.copy(parts[0], out_p)
         return out_p
-    # The temp file must keep the trajectory SUFFIX: gmx picks the output format
-    # from the extension, so a name like 'prod.xtc.tmp' is rejected outright.
-    # Writing to a temp and renaming keeps a reader from ever seeing a partly
-    # merged trajectory at the real path.
+    # Written to a temp name and renamed, so nothing ever reads a half-merged
+    # trajectory. The temp name keeps the suffix, since gmx reads the format
+    # from the extension.
     tmp_p = out_p.with_name(f'{out_p.stem}.trjcat-tmp{out_p.suffix}')
     _run([gmx_bin, 'trjcat', '-f', *[str(p) for p in parts], '-o', str(tmp_p)],
          gen_dir)
@@ -327,14 +274,11 @@ def read_gen_status(gen_dir, gen_status_name=GEN_STATUS_NAME):
 
 
 class MdrunFleet:
-    """Shared stop-signal for a group of mdruns running in one job.
+    """One stop signal shared by every mdrun in a packed job.
 
-    When K replicas are packed onto one GPU under MPS, the preempt/walltime
-    handshake has to reach ALL of them and wait for ALL to checkpoint -- this is
-    the code path that protects trajectory contiguity, so a replica that misses
-    the signal loses work that a single-replica job would have kept. One watcher
-    polls the sentinel and fans SIGTERM out to every registered process, rather
-    than each replica polling independently and racing.
+    A preempt or walltime warning has to reach all of them and let all of them
+    checkpoint, or a replica loses work a lone job would have kept. One watcher
+    passes SIGTERM on to every registered process, so they do not race.
     """
 
     def __init__(self, sentinel_path, poll_seconds=PREEMPT_POLL_SECONDS):
@@ -386,11 +330,10 @@ class MdrunFleet:
 
 def _run_mdrun(cmd, cwd, handle_preempt, poll_seconds=PREEMPT_POLL_SECONDS,
                fleet=None, fleet_key=None):
-    """Run mdrun; if handle_preempt, watch for the preempt sentinel and forward
-    SIGTERM to mdrun (which writes a checkpoint) before raising Preempted.
+    """Run mdrun, passing on a preempt signal so it checkpoints before it dies.
 
-    With a `fleet`, the sentinel is watched by whoever owns the fleet and this
-    call only registers its process and reports whether the stop was signalled.
+    With a fleet, the fleet owner watches the sentinel and this only registers
+    its process and reports whether a stop was signalled.
     """
     cwd = Path(cwd)
     sentinel = cwd / PREEMPT_SENTINEL_NAME
@@ -452,10 +395,9 @@ def gmx_generation(traj_dir_top_level: str,
                    traj_name: str = 'prod',
                    traj_suffix: str = '.xtc',
                    restart_name: str = 'state.cpt',
-                   # Full per-generation step count. On a resume the orchestrator
-                   # narrows config['steps'], so the untouched full length is
-                   # carried separately -- the tpr's nsteps must be the absolute
-                   # cumulative target, never a remainder.
+                   # Full generation length. config['steps'] shrinks to the
+                   # remainder on a resume, but the tpr's nsteps has to be the
+                   # total from the start of the run.
                    steps: int = 500000,
                    steps_per_gen: int = None,
                    # xtc stride; steps must be a whole number of these or the
@@ -464,10 +406,9 @@ def gmx_generation(traj_dir_top_level: str,
                    temperature=None,            # gen-temp for gen-0 velocities (K)
                    new_velocities: bool = False,  # True only on gen 0
                    gen_seed_base: int = 1,
-                   # gen-seed = base + stride * seed_index + clone_index. The
-                   # stride keeps seeds apart: without it (seed 0, clone 0) and
-                   # (seed 1, clone 0) draw identical velocities. Must exceed
-                   # n_clones, which Farmer checks.
+                   # gen-seed = base + stride * seed + clone, so two seeds
+                   # cannot draw the same velocities. Farmer checks the stride
+                   # is bigger than n_clones.
                    gen_seed_stride: int = GEN_SEED_STRIDE,
                    # Written to ld-seed when set, making a stochastic thermostat
                    # reproducible. None keeps whatever the mdp holds.
@@ -515,12 +456,9 @@ def gmx_generation(traj_dir_top_level: str,
     # the checkpoint's absolute step and runs until the tpr's nsteps.
     target_step = (gen_index + 1) * steps_per_gen
 
-    # --- separate the incoming seed from this generation's own checkpoint ----
-    # Clone copies the previous generation's checkpoint in under `restart_name`,
-    # which is also mdrun's -cpo target. Left alone, `-cpi restart_name` would
-    # hand mdrun a checkpoint from another run (or, at gen 0, the .gro) and
-    # fatal. Moving it aside means anything later found at `restart_name` can
-    # only be a checkpoint this generation's mdrun wrote.
+    # Move the incoming seed aside. restart_name is also where mdrun writes
+    # its own checkpoint, and -cpi given a checkpoint from another run, or the
+    # .gro at generation 0, is fatal.
     if not seed_cpt.exists() and own_cpt.exists() and not tpr.is_file():
         # No tpr yet => mdrun has not run here => restart_name is the seed.
         own_cpt.replace(seed_cpt)
@@ -539,11 +477,9 @@ def gmx_generation(traj_dir_top_level: str,
             sep=sep, tpr_name=tpr_name, gmx_bin=gmx_bin,
             grompp_maxwarn=grompp_maxwarn, grompp_lock=grompp_lock)
 
-    # ------------------------------- run ------------------------------------
-    # -cpi must name a checkpoint this run can legitimately continue from: our
-    # own if mdrun has already run here, otherwise the seed. -noappend because
-    # mdrun refuses to append into a directory lacking the checkpoint's own
-    # output files, which is always the case for a fresh generation directory.
+    # -cpi takes our own checkpoint if mdrun has run here, else the seed.
+    # -noappend because mdrun will not append into a directory that does not
+    # already hold the output files its checkpoint names.
     resume_from = None
     if is_checkpoint(own_cpt, gmx_bin=gmx_bin):
         resume_from = own_cpt
@@ -555,13 +491,9 @@ def gmx_generation(traj_dir_top_level: str,
             f'(looked at {own_cpt} and {seed_cpt}). Its predecessor did not '
             'leave a readable state.cpt.')
 
-    # Already there? Don't re-run. mdrun handed a checkpoint at or past the
-    # tpr's nsteps aborts ("the checkpoint file has already reached step N"),
-    # so a redundant launch -- which happens whenever the orchestrator acts on a
-    # stale or missing status file, e.g. after the job was SIGKILLed between
-    # mdrun finishing and the status being written -- would otherwise turn a
-    # finished generation into a hard failure. Finalising instead makes the
-    # relaunch self-healing.
+    # Already finished? Finalise instead of re-running. mdrun given a
+    # checkpoint at or past its nsteps aborts, so a relaunch after a lost status
+    # file would otherwise turn a finished generation into a failure.
     if resume_from is not None:
         already = checkpoint_step(resume_from, gmx_bin=gmx_bin)
         if already >= target_step:
@@ -611,13 +543,11 @@ def _build_gen_tpr(*, tpr, gen_dir, gen_index, new_velocities, target_step,
                    ld_seed, clone_index, seed_index,
                    traj_dir_top_level, dirname_pad, sep, tpr_name, gmx_bin,
                    grompp_maxwarn, grompp_lock=None):
-    """Build this generation's tpr, holding `grompp_lock` if one was supplied.
+    """Build this generation's tpr, holding grompp_lock if one was given.
 
-    Generation 0 is grompp'd from the .mdp with fresh per-clone velocities.
-    Every later generation is ``convert-tpr``'d from its predecessor, extending
-    the cumulative step budget -- that inheritance is what makes the
-    continuation exact, since the parameters (and, via ``-cpi``, the coupling
-    state) are carried rather than rebuilt.
+    Generation 0 is grompp'd from the .mdp with fresh velocities. Later ones are
+    convert-tpr'd from the one before, which extends the step budget and carries
+    the parameters over rather than rebuilding them.
     """
     import contextlib
     guard = grompp_lock if grompp_lock is not None else contextlib.nullcontext()
@@ -678,12 +608,11 @@ def _previous_gen_tpr(top_level, seed_index, clone_index, gen_index,
 
 def gmx_config_template(clone_filled_keys=CLONE_FILLED_KEYS,
                         runtime_only_keys=RUNTIME_ONLY_KEYS, **overrides):
-    """A Farmer `config_template` recording the whole `gmx_generation` call.
+    """A Farmer config_template recording the whole gmx_generation call.
 
-    Supplies placeholders for the parameters a Clone fills in per generation,
-    and omits the ones `gmx_pack` injects at runtime -- passing either through
-    to `gmx_generation` raises, so a driver would otherwise have to know both
-    lists. Everything else comes from `overrides` or the function's defaults.
+    Fills in placeholders for the arguments a Clone supplies per generation and
+    leaves out the ones gmx_pack passes at run time, so a driver need not know
+    either list. Everything else comes from overrides or the defaults.
     """
     placeholders = {key: (0 if key.endswith('_index') else '')
                     for key in clone_filled_keys}
@@ -695,12 +624,11 @@ def gmx_config_template(clone_filled_keys=CLONE_FILLED_KEYS,
 
 
 def gmx_basic_sim_block_json(config):
-    """Entry point invoked by the per-gen run.py.
+    """What the run.py in each generation directory calls.
 
-    Appends to traj_list only when the generation actually finished, so the list
-    holds one line per generation rather than one per mdrun invocation. An
-    incomplete generation (preempt, ``-maxh``) exits 0: the work is checkpointed
-    and the orchestrator resumes it, so the job is not a failure.
+    traj_list gains a line only when the generation finished, so it holds one
+    per generation rather than one per launch. An unfinished generation exits 0:
+    its work is checkpointed and will be resumed, so the job did not fail.
     """
     conf = json.loads(Path(config).read_text())
     traj_list = Path(conf.pop('traj_list'))
@@ -715,16 +643,12 @@ def gmx_basic_sim_block_json(config):
 
 def gmx_gen_progress(gen_path, *, total_steps, gen_index=None,
                      gen_status_name=GEN_STATUS_NAME, **_unused):
-    """Steps still owed by a generation, from its recorded status.
+    """Steps a generation still owes, read from the status the runner wrote.
 
-    The orchestrator's engine-agnostic default infers this from frame counts,
-    which is wrong for GROMACS by one write interval (the step-0 frame) and
-    cannot see that a checkpoint lags the last written frame. Reading the step
-    the runner recorded avoids both.
-
-    Returns `total_steps` when the generation has never reported, which is what
-    the orchestrator reads as "nothing ran here yet".
+    Returns total_steps when it has never reported, which the orchestrator reads
+    as nothing having run yet.
     """
+    # Not counted from frames, which for GROMACS is out by one write interval.
     gen_p = Path(gen_path)
     status = read_gen_status(gen_p, gen_status_name=gen_status_name)
     if status is None:
@@ -749,17 +673,14 @@ def gmx_try_recover_gen(gen_path: Path, *,
                         gen_status_name: str = GEN_STATUS_NAME,
                         seed_cpt_name: str = SEED_CPT_NAME,
                         tpr_name: str = TPR_NAME):
-    """GROMACS analog of ``seeder._try_recover_gen``.
+    """The GROMACS version of seeder._try_recover_gen.
 
-    Classifies a generation directory as done / partial / never-started and
-    returns ``(gen_index, seed_fn, steps_to_run, append)`` or None to cascade to
-    an older generation.
-
-    There is no trajectory surgery to do: ``mdrun -cpi`` resumes from the
-    checkpoint and ``trjcat`` drops the overlap, so a partial generation only
-    has to be pointed back at its own checkpoint. What this must get right is
-    never calling a generation complete when its checkpoint has not reached the
-    step target -- that is the silent-rewind case.
+    Sorts a generation directory into done, partial or never started, and
+    returns (gen_index, seed_fn, steps_to_run, append), or None to fall back to
+    an older generation. No trajectory has to be trimmed: mdrun -cpi resumes
+    from the checkpoint and trjcat drops the overlap. The one thing it must
+    never do is call a generation complete before its checkpoint reaches the
+    step target, which would rewind the trajectory at the boundary.
     """
     config_p = gen_path / 'config.json'
     if not config_p.is_file():
@@ -777,10 +698,8 @@ def gmx_try_recover_gen(gen_path: Path, *,
     tpr = gen_path / tpr_name
 
     if status is None:
-        # Never reported. Either nothing ran, or it died before finishing its
-        # first mdrun. Both are relaunchable provided we can still find a
-        # checkpoint to continue from -- but only one this generation wrote, or
-        # the seed that was staged for it.
+        # Never reported: nothing ran, or it died before its first
+        # checkpoint. Relaunchable either way, if a checkpoint can be found.
         seed_cpt = gen_path / seed_cpt_name
         if have_own_cpt and tpr.is_file():
             return gen_index, str(own_cpt.resolve()), total_steps, True
