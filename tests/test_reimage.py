@@ -119,6 +119,39 @@ def main(steps=STEPS, write_interval=WRITE_INTERVAL,
     suite.check('reimaging puts every one of them back together',
                 n_healed == 0, f'-> {n_healed}')
 
+    suite.section('an unsafe anchor margin is refused, bonds or no bonds')
+    # Declaring the whole box one molecule puts its furthest atom well past the
+    # half-edge mergeImage() assumes, which is the regime LOOS cannot answer in.
+    whole_system = [(0, md.load(str(structure)).n_atoms)]
+    try:
+        reimage.reimage_with_loos(
+            traj, structure_fn=str(structure),
+            out_fn=str(work / 'unsafe.xtc'), ranges=whole_system, verify=True)
+        suite.check('reimaging outside the safe regime raises', False,
+                    '-> no exception')
+    except RuntimeError as exc:
+        suite.check('reimaging outside the safe regime raises',
+                    'safe regime' in str(exc), f'-> {str(exc)[:50]}')
+        suite.check('the message names the backend that can do it',
+                    reimage.BACKEND_TRJCONV in str(exc))
+    # Measured on the reimaged output: the raw trajectory's molecules are still
+    # split, so its atoms really are a box length from their anchors.
+    margin = reimage.check_anchor_distances(out, ranges)
+    suite.check('whole molecules are comfortably inside it',
+                margin['loos_safe'], f"-> {margin['max_anchor_offset']:.3f} nm")
+
+    suite.section('a missing tpr says so')
+    try:
+        reimage.reimage_with_trjconv(traj, None, str(work / 'no-tpr.xtc'))
+        suite.check('no tpr at all is reported as such', False,
+                    '-> no exception')
+    except FileNotFoundError as exc:
+        suite.check('no tpr at all is reported as such', True,
+                    f'-> {str(exc)[:50]}')
+    except TypeError as exc:
+        suite.check('no tpr at all is reported as such', False,
+                    f'-> TypeError instead: {exc}')
+
     return suite.report()
 
 
