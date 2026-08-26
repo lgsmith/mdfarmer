@@ -64,6 +64,10 @@ DEFFNM = 'prod'
 # stays on disk as a record of the abandoned branch.
 ABANDONED_PART_PREFIX = 'abandoned-'
 
+# First four bytes of every GROMACS checkpoint, big-endian 171817. Reading them
+# tells a checkpoint from a .gro without asking gmx.
+CHECKPOINT_MAGIC = b'\x00\x02\x9f\x29'
+
 # How often mdrun writes a checkpoint, in minutes. GROMACS defaults to 15, which
 # is how much work a hard kill can cost; a shorter period costs almost nothing.
 CHECKPOINT_MINUTES = 5
@@ -222,17 +226,19 @@ def checkpoint_step(cpt_fn, gmx_bin=GMX_BIN):
     return checkpoint_part_step(cpt_fn, gmx_bin=gmx_bin)[1]
 
 
-def is_checkpoint(cpt_fn, gmx_bin=GMX_BIN):
-    """True when this file is a checkpoint gmx can actually read."""
-    # At generation 0 the seed is a .gro, and handing that to -cpi is fatal.
+def is_checkpoint(cpt_fn, magic=CHECKPOINT_MAGIC):
+    """True when this file carries the GROMACS checkpoint magic number.
+
+    Only asks whether the file is a checkpoint at all, which at generation 0 it
+    is not: the seed is a .gro, and handing that to -cpi is fatal. A checkpoint
+    gmx cannot read is a different problem, and checkpoint_part_step raises on
+    it rather than letting it look like a generation that never started.
+    """
     path = Path(cpt_fn)
-    if not path.is_file() or path.stat().st_size == 0:
+    if not path.is_file():
         return False
-    try:
-        checkpoint_step(path, gmx_bin=gmx_bin)
-    except (RuntimeError, ValueError):
-        return False
-    return True
+    with path.open('rb') as handle:
+        return handle.read(len(magic)) == magic
 
 
 def part_files(gen_dir, deffnm=DEFFNM, traj_suffix='.xtc'):
@@ -529,9 +535,9 @@ def gmx_generation(traj_dir_top_level: str,
     # -noappend because mdrun will not append into a directory that does not
     # already hold the output files its checkpoint names.
     resume_from = None
-    if is_checkpoint(own_cpt, gmx_bin=gmx_bin):
+    if is_checkpoint(own_cpt):
         resume_from = own_cpt
-    elif gen_index > 0 and is_checkpoint(seed_cpt, gmx_bin=gmx_bin):
+    elif gen_index > 0 and is_checkpoint(seed_cpt):
         resume_from = seed_cpt
     elif gen_index > 0:
         raise FileNotFoundError(
