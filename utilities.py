@@ -417,6 +417,44 @@ default_bad_node_patterns = (
     "version `GLIBC_",
 )
 
+# Seconds a scheduler query may take before it counts as failed.
+SCHEDULER_QUERY_TIMEOUT = 120
+
+# Some schedulers say "nothing matched" with a non-zero exit rather than with
+# empty output. LSF's bjobs does; an empty Slurm queue exits 0.
+empty_query_messages = ('no unfinished job found', 'no matching job found',
+                        'is not found')
+
+
+def scheduler_query(command, timeout=SCHEDULER_QUERY_TIMEOUT,
+                    empty_messages=empty_query_messages):
+    """Ask the scheduler something. Returns (trusted, text).
+
+    trusted is False when the query itself failed, which is not at all the same
+    as the queue being empty. These commands end in a pipe, so a squeue that
+    times out still exits 0 through awk and prints nothing; reading that as "no
+    jobs are running" relaunches every live clone on top of itself. pipefail
+    makes the pipeline fail instead, and a scheduler that reports an empty
+    queue by exiting non-zero is recognised by what it says.
+    """
+    try:
+        result = sp.run(f'set -o pipefail; {command}', shell=True,
+                        executable='/bin/bash', text=True,
+                        capture_output=True, timeout=timeout)
+    except (sp.TimeoutExpired, OSError) as exc:
+        print(f'WARNING: scheduler query {command!r} did not run: {exc}')
+        return False, ''
+    output = result.stdout.strip()
+    if result.returncode == 0:
+        return True, output
+    said = (result.stderr or '').lower()
+    if not output and any(m in said for m in empty_messages):
+        return True, ''
+    print(f'WARNING: scheduler query {command!r} exited {result.returncode}: '
+          f'{(result.stderr or "").strip()[:200]}')
+    return False, output
+
+
 default_scheduler_log_names = {
     'sbatch': 'slurm.out',
     'slurm': 'slurm.out',

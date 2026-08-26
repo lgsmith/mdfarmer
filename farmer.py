@@ -29,15 +29,10 @@ class Farmer:
     # exits 0 and prints nothing, and reading that as "no jobs running" would
     # relaunch every live clone. pipefail makes the pipeline fail instead.
     def update_jids(self):
-        try:
-            jids_string = sp.check_output(
-                f'set -o pipefail; {self.scheduler_report_cmd}',
-                shell=True, text=True,
-                executable='/bin/bash').strip()
-        except sp.CalledProcessError as exc:
-            print(f'WARNING: scheduler query failed (exit {exc.returncode}); '
-                  f'keeping the previous {len(self.current_jids)} job ids and '
-                  f'skipping this tick rather than relaunching live jobs.')
+        trusted, jids_string = util.scheduler_query(self.scheduler_report_cmd)
+        if not trusted:
+            print(f'WARNING: keeping the previous {len(self.current_jids)} job '
+                  'ids and skipping this tick rather than relaunching live jobs.')
             return False
         print(f'jids_string:\n{jids_string}')
         try:
@@ -90,8 +85,13 @@ class Farmer:
     def reassociate_running_jobs(self):
         self.current_jids = set()
         rep_dict = {}
-        assoc_raw = sp.check_output(self.scheduler_assoc_rep_cmd, shell=True,
-                                    executable='/bin/bash', text=True).strip()
+        trusted, assoc_raw = util.scheduler_query(self.scheduler_assoc_rep_cmd)
+        if not trusted:
+            raise RuntimeError(
+                'the scheduler could not be queried at boot, so which of this '
+                "campaign's jobs are still running is unknown. Booting anyway "
+                'would submit a second job into every live generation '
+                'directory. Fix the query and start again.')
         print('boot re-association scheduler report:')
         print(assoc_raw)
         for line in assoc_raw.split('\n'):
