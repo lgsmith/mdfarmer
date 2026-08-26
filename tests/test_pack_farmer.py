@@ -144,6 +144,34 @@ def main(cpus=CPUS, pack_size=PACK_SIZE, member_cores=MEMBER_CORES,
             suite.check(f'refuses a grouping that {label}', True,
                         f'-> {str(exc)[:50]}')
 
+    suite.section('packs of different conditions get different core budgets')
+
+    def cpus_for(group):
+        return 24 if group[0].config['seed_index'] == 0 else 8
+
+    def cores_for(group):
+        return [12, 12] if group[0].config['seed_index'] == 0 else [4, 4]
+
+    def by_seed_pairs(clones):
+        by_key = {(c.config['seed_index'], c.config['clone_index']): c
+                  for c in clones}
+        return [[by_key[(s, 0)], by_key[(s, 1)]] for s in range(n_seeds)]
+
+    farmer = make_farmer(work, pack_size=pack_size, pack_grouping=by_seed_pairs,
+                         pack_cpus_per_task=cpus_for,
+                         pack_member_cores=cores_for)
+    budgets = {p.clones[0].config['seed_index']:
+               (p.cpus_per_task, p.member_cores) for p in packs_of(farmer)}
+    print('   seed -> (cpus, member_cores):', budgets, flush=True)
+    suite.check('each pack asks for its own core budget',
+                budgets == {0: (24, [12, 12]), 1: (8, [4, 4])}, f'-> {budgets}')
+    arm_b = [p for p in packs_of(farmer)
+             if p.clones[0].config['seed_index'] == 1][0]
+    arm_b.check_start_gen(set(), overwrite=True)
+    script = (arm_b.pack_dir / 'sbatch.sh').read_text()
+    suite.check('the submit script asks for that many, not the global figure',
+                '--cpus-per-task=8' in script and '--cpus-per-task=24' not in script)
+
     suite.section('per-seed config overrides')
     farmer = make_farmer(
         work, pack_size=pack_size, pack_grouping=pair_seeds,

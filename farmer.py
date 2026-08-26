@@ -218,6 +218,8 @@ class Farmer:
                  # gives each member its own number of cores.
                  pack_size=None,
                  pack_grouping=None,
+                 # A number, or callable(group) -> number when packs of
+                 # different conditions need different core budgets.
                  pack_cpus_per_task=None,
                  pack_scheduler_fstring=None,
                  pack_run_script=None,
@@ -463,6 +465,11 @@ class Farmer:
         flat = [c for queue in self.priority_ordered_clones for c in queue]
         packs = []
         for group in self.group_clones(flat):
+            # Both may be callables of the group, since packs of different
+            # conditions ask Slurm for different amounts. One global figure
+            # would make the smaller pack request what the larger one needs,
+            # and strand the cores it never uses.
+            group_cpus = cpus(group) if callable(cpus) else cpus
             tag = self.sep.join(
                 f's{c.config["seed_index"]:0{self.dirname_pad}d}'
                 f'c{c.config["clone_index"]:0{self.dirname_pad}d}'
@@ -473,7 +480,7 @@ class Farmer:
             packs.append(seeder.ClonePack(
                 group, Path(tdir) / 'packs' / f'pack{self.sep}{tag}',
                 self.scheduler, fstring, self.scheduler_kws,
-                run_script=run_script, cpus_per_task=cpus,
+                run_script=run_script, cpus_per_task=group_cpus,
                 member_cores=member_cores, sep=self.sep,
                 job_number_re=self.job_number_re,
                 dry_run=self.dry_run))
