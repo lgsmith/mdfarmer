@@ -149,7 +149,7 @@ def frame_timing(traj_fn, n_frames=None):
 
 """
 The harvest itself lives in harvester.harvest_generation; these two names are
-what existing submit scripts call, and each pins a backend and hands off.
+what existing submit scripts call, and each hands off to it.
 
 hconfig keys:
  - harvester_subset: which atoms the solute trajectory keeps, in LOOS syntax
@@ -162,14 +162,20 @@ hconfig keys:
 
 
 def strip_and_downsample(config_fn, harvester_config_fn):
-    """Backwards-compatible entry point pinning the LOOS backend."""
+    """Old entry point, kept for the harvest.sh scripts already on disk.
+
+    The backend is chosen by box shape rather than pinned: LOOS keeps only the
+    diagonal of a triclinic cell, so pinning it here would harvest an old
+    triclinic campaign with a silently wrong box. Which atoms are kept does not
+    depend on the backend, so nothing else about the harvest changes.
+    """
     from . import harvester
-    return harvester.harvest_generation(
-        config_fn, harvester_config_fn, backend=harvester.BACKEND_LOOS)
+    return harvester.harvest_generation(config_fn, harvester_config_fn)
 
 
 def strip_ds_mdtraj(config_fn, harvester_config_fn):
-    """Backwards-compatible entry point pinning the mdtraj backend."""
+    """Old entry point pinning the mdtraj backend, which is right for a box of
+    either shape."""
     from . import harvester
     return harvester.harvest_generation(
         config_fn, harvester_config_fn, backend=harvester.BACKEND_MDTRAJ)

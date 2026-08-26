@@ -11,6 +11,7 @@ import sys
 import harness
 from harness import Suite
 
+from mdfarmer import harvester
 from mdfarmer import utilities as util
 
 
@@ -75,11 +76,36 @@ def check_state_xml_step_count(suite, work):
                 isinstance(raises(util.state_xml_step_count, old), ValueError))
 
 
+def check_harvest_entry_points(suite):
+    """The old shims must not pin LOOS: it keeps only the diagonal of a
+    triclinic cell, and only the auto choice looks at the box at all."""
+    suite.section('the harvest entry points scripts on disk still call')
+    calls = []
+    real = harvester.harvest_generation
+    harvester.harvest_generation = lambda *args, **kws: calls.append(kws)
+    try:
+        util.strip_and_downsample('config.json', 'hconfig.json')
+        util.strip_ds_mdtraj('config.json', 'hconfig.json')
+    finally:
+        harvester.harvest_generation = real
+    suite.check('strip_and_downsample lets the box pick the backend',
+                calls[0].get('backend', harvester.BACKEND_AUTO)
+                == harvester.BACKEND_AUTO, f'-> {calls[0]}')
+    suite.check('strip_ds_mdtraj still pins mdtraj, right for either box',
+                calls[1].get('backend') == harvester.BACKEND_MDTRAJ,
+                f'-> {calls[1]}')
+    suite.check('only the auto choice consults the box at all',
+                harvester.select_backend('traj.dcd',
+                                         backend=harvester.BACKEND_LOOS)
+                == harvester.BACKEND_LOOS)
+
+
 def main():
     suite = Suite('utilities_guards')
     work = harness.workdir('utilities_guards')
     check_topology_reader(suite)
     check_state_xml_step_count(suite, work)
+    check_harvest_entry_points(suite)
     return suite.report()
 
 
