@@ -17,6 +17,7 @@ Nothing here overwrites its input: the orchestrator counts frames in the raw
 trajectory to decide whether a generation has finished.
 """
 
+import os
 import subprocess as sp
 from pathlib import Path
 
@@ -170,7 +171,22 @@ def gromacs_topology(top_fn, include_dir=None):
     # A .top's #include lines resolve relative to the process cwd, so a force
     # field that lives elsewhere needs include_dir.
     kwargs = {} if include_dir is None else {'includeDir': str(include_dir)}
-    return app.GromacsTopFile(str(top_p), **kwargs).topology
+    try:
+        return app.GromacsTopFile(str(top_p), **kwargs).topology
+    except Exception as exc:
+        if include_dir is not None:
+            raise
+        # openmm guesses an include directory from $GMXDATA, then $GMXBIN.
+        # $GMXBIN holding a binary NAME rather than the directory that binary
+        # lives in, which is how a module-installed GROMACS is often set up,
+        # sends that guess somewhere that does not exist.
+        raise ValueError(
+            f'{top_p.name}: {type(exc).__name__}: {exc}. No include_dir was '
+            f'given, so openmm guessed one from GMXDATA='
+            f'{os.environ.get("GMXDATA")!r} and GMXBIN='
+            f'{os.environ.get("GMXBIN")!r}. GMXBIN must be the directory the '
+            f'gmx binary lives in, not its name. Pass include_dir naming the '
+            f"force field's share/gromacs/top instead.") from exc
 
 
 def molecule_ranges(top_fn, include_dir=None):
@@ -618,7 +634,8 @@ def reimage_gen_dir(gen_dir, config=None, backend=BACKEND_AUTO,
                     tpr_name=TPR_NAME):
     """Reimage one generation directory, writing beside the raw trajectory.
 
-    Reads config.json for the trajectory name, topology and structure. The raw
+    Reads config.json for the trajectory name, topology, structure and, when
+    the caller names none, the include_dir its #include lines need. The raw
     trajectory is left alone so a generation still being resumed keeps its frame
     count. skip_first_frame defaults to dropping it for every generation after
     the first, since GROMACS repeats the previous generation's last frame.
@@ -627,6 +644,8 @@ def reimage_gen_dir(gen_dir, config=None, backend=BACKEND_AUTO,
     gen_p = Path(gen_dir)
     if config is None:
         config = json.loads((gen_p / 'config.json').read_text())
+    if include_dir is None:
+        include_dir = config.get('include_dir')
 
     traj_p = (gen_p / config['traj_name']).with_suffix(config['traj_suffix'])
     if not traj_p.is_file():
