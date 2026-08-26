@@ -351,15 +351,8 @@ class Farmer:
                   'flushes the kernel buffer after every frame; remove the '
                   'buffering=0 entry.')
 
-        seed_structure_fps = [Path(s).resolve()
-                              for s in seed_structure_fns]
-        self.seed_state_fns = []
-        for p in seed_structure_fps:
-            if p.is_file():
-                self.seed_state_fns.append(str(p))
-            else:
-                print(p)
-                raise FileNotFoundError
+        self.seed_state_fns = [str(self.check_path(Path(s).resolve()))
+                               for s in seed_structure_fns]
 
         self.sep = sep
         self.config_template['sep'] = self.sep
