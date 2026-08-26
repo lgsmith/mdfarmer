@@ -144,6 +144,9 @@ def write_gen_mdp(base_mdp, out_mdp, *, nsteps, nstxout_compressed,
     # previous tpr through convert-tpr, which is what keeps them exact.
     overrides = {
         'nsteps': str(int(nsteps)),
+        # nsteps is this generation's absolute cumulative target, so the run has
+        # to count from zero; an inherited init-step would offset every step.
+        'init-step': '0',
         'nstxout-compressed': str(int(nstxout_compressed)),
         'gen-vel': 'yes' if gen_vel else 'no',
         'continuation': 'yes' if continuation else 'no',
@@ -166,6 +169,10 @@ def write_gen_mdp(base_mdp, out_mdp, *, nsteps, nstxout_compressed,
             key = _norm_mdp_key(code.split('=', 1)[0])
             key = legacy_mdp_keys.get(key, key)
             if key in targets:
+                if key == 'init-step' and code.split('=', 1)[1].strip() != '0':
+                    print(f'[gmx] {base_mdp} sets {line.strip()}; this runner '
+                          'needs nsteps to be the absolute step target, so '
+                          'init-step is pinned to 0.', flush=True)
                 if key in seen:
                     # A duplicate assignment later in the file would override
                     # ours; drop it rather than emit a second, conflicting line.
