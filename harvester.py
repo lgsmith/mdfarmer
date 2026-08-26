@@ -158,7 +158,12 @@ def keeps_frame(local_index, first_global_index, downsample_frq, skip_first):
 
 
 def frame_plan(n_orig, first_global_index, downsample_frq, skip_first):
-    """Yield (local_index, write_dry, write_downsample) for every frame."""
+    """Yield (local_index, write_dry, write_downsample) for every frame.
+
+    The LOOS backend asks keeps_frame directly; the mdtraj one works the same
+    rule out in numpy over a whole chunk. _verify_counts is what proves the two
+    agreed, by comparing what each wrote against what this predicts.
+    """
     for local in range(n_orig):
         dry, down = keeps_frame(local, first_global_index, downsample_frq,
                                 skip_first)
@@ -627,19 +632,35 @@ def _repair_from_symlink(traj_p, dry_p, down_p, sentinel_p, dry_top_p,
 
 
 def unharvested_gen_dirs(top_level, sentinel_name=SENTINEL_NAME,
-                         config_name='config.json'):
+                         config_name='config.json', skip_newest=False):
     """Generation directories that ran but carry no harvest sentinel.
 
     The tender swallows harvest failures so a lost harvest cannot stop a
     campaign, and nothing observes the harvest job's exit status. This does.
+
+    On a campaign that is still running, each clone's newest generation is
+    normally the one in flight and has no sentinel yet; skip_newest leaves
+    those out. On a finished campaign leave it False, since the newest
+    generation is exactly the one whose lost harvest you want to hear about.
     """
     top = Path(top_level)
-    stale = []
+    by_clone = {}
     for config_p in sorted(top.glob(f'*/*/*/{config_name}')):
         gen_dir = config_p.parent
-        if not (gen_dir / sentinel_name).is_file():
-            stale.append(gen_dir)
+        by_clone.setdefault(gen_dir.parent, []).append(gen_dir)
+    stale = []
+    for clone_dir, gen_dirs in sorted(by_clone.items()):
+        gen_dirs.sort(key=lambda p: _gen_sort_key(p))
+        if skip_newest:
+            gen_dirs = gen_dirs[:-1]
+        stale += [d for d in gen_dirs if not (d / sentinel_name).is_file()]
     return stale
+
+
+def _gen_sort_key(gen_dir):
+    """Order generation directories by their number, not by their name."""
+    tail = gen_dir.name.rsplit('-', 1)[-1].rsplit('_', 1)[-1]
+    return (0, int(tail)) if tail.isdigit() else (1, 0)
 
 
 def _frame_times(traj_p, scan_chunk=reimage.SCAN_CHUNK):
