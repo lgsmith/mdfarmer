@@ -2,7 +2,6 @@ import inspect
 import os
 import struct
 from pathlib import Path
-import json
 import subprocess as sp
 import openmm as mm
 from openmm import app
