@@ -228,7 +228,7 @@ def bond_pairs(top_fn, include_dir=None):
 
 
 def check_bond_lengths(traj_fn, top_fn=None, pairs=None, max_bond=MAX_BOND,
-                       stride=1, scan_chunk=SCAN_CHUNK, stop_early=True):
+                       scan_chunk=SCAN_CHUNK, stop_early=True):
     """Find bonds longer than a chemical bond can be, one per split molecule.
 
     This is what actually says whether a trajectory is imaged correctly, and it
@@ -261,13 +261,10 @@ def check_bond_lengths(traj_fn, top_fn=None, pairs=None, max_bond=MAX_BOND,
                 raise ValueError(
                     f'{traj_p} has {xyz.shape[1]} atoms but the topology '
                     f'describes at least {max(left.max(), right.max()) + 1}')
-            sl = slice(None, None, stride)
-            block = xyz[sl]
-            lengths = np.linalg.norm(block[:, left, :] - block[:, right, :],
+            lengths = np.linalg.norm(xyz[:, left, :] - xyz[:, right, :],
                                      axis=-1)
-            bad = np.argwhere(lengths > max_bond)
-            for row, bond in bad:
-                violations.append((frame_index + int(row) * stride,
+            for row, bond in np.argwhere(lengths > max_bond):
+                violations.append((frame_index + int(row),
                                    int(left[bond]), int(right[bond]),
                                    float(lengths[row, bond])))
             if violations and stop_early:
