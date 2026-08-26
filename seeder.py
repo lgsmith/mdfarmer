@@ -46,6 +46,57 @@ def _gen_sort_key(path, sep):
     return (1, 0, path.name)
 
 
+# Trim the velocity and force trajectories back to the frame count positions
+# were just truncated to.
+#
+# True once every tandem trajectory the config names is aligned. False when one
+# cannot be: a format that cannot be truncated, a header that will not read, a
+# truncation that missed its target, or a tandem BEHIND positions, whose missing
+# frames cannot be fabricated without a matching checkpoint. The caller cascades
+# on False, which redoes this gen -- safe, since it is a dead gen either way.
+def _align_tandem_dcds(gen_path: Path, prev_config: dict, target_nset: int):
+    for name_key, suffix_key, default_name in (
+            ('velocity_name', 'velocity_traj_suffix', 'velocities'),
+            ('force_name', 'force_traj_suffix', 'forces')):
+        tandem_suffix = prev_config.get(suffix_key)
+        if not tandem_suffix:
+            continue
+        tandem_p = (gen_path / prev_config.get(name_key, default_name)
+                    ).with_suffix(tandem_suffix)
+        if (not tandem_p.is_file()) or tandem_p.stat().st_size == 0:
+            continue
+        if tandem_suffix != '.dcd':
+            print(f'_align_tandem_dcds: cannot frame-align {tandem_p} '
+                  f'(only .dcd truncation is supported); cascading.')
+            return False
+        try:
+            tandem_nset = util.dcd_header_info(tandem_p)['nset']
+        except Exception as exc:
+            print(f'_align_tandem_dcds: bad tandem DCD header at {tandem_p}: '
+                  f'{exc}; cascading.')
+            return False
+        if tandem_nset == target_nset:
+            continue
+        if tandem_nset < target_nset:
+            print(f'_align_tandem_dcds: {tandem_p} has {tandem_nset} frames, '
+                  f'behind positions/state ({target_nset}); cannot realign '
+                  f'without a matching checkpoint, cascading.')
+            return False
+        print(f'_align_tandem_dcds: trimming {tandem_p} from {tandem_nset} '
+              f'to {target_nset} frames to match positions.')
+        try:
+            tandem_actual = util.truncate_dcd_to_nframes(tandem_p, target_nset)
+        except Exception as exc:
+            print(f'_align_tandem_dcds: could not truncate {tandem_p}: '
+                  f'{exc}; cascading.')
+            return False
+        if tandem_actual != target_nset:
+            print(f'_align_tandem_dcds: tandem truncate returned '
+                  f'{tandem_actual} != target {target_nset}; cascading.')
+            return False
+    return True
+
+
 # Examine one gen directory and decide whether it can seed the next launch.
 #
 # Returns (gen_index, seed_fn, steps_to_run, append) on success:
@@ -168,56 +219,12 @@ def _try_recover_gen(gen_path: Path, *,
                   f'target {target_nset}; cascading.')
             return None
         nset = actual
-        # Keep the parallel velocity/force DCDs frame-aligned with positions.
-        # This lives INSIDE the position-truncation branch on purpose: it only
-        # runs when the position DCD is ahead of state (an unclean kill), which
-        # never happens for a healthy in-flight gen (positions and state advance
-        # together, so that gen takes the target_nset == nset path and skips
-        # this entirely). So it inherits the position truncation's in-flight
-        # safety and won't touch a live clone's tandem files during graceful
-        # re-association. Trim any tandem that is ahead; if one is behind we
-        # can't fabricate the missing frame without a matching checkpoint, so
-        # cascade — this is a dead gen, so redoing it is safe.
-        for name_key, suffix_key, default_name in (
-                ('velocity_name', 'velocity_traj_suffix', 'velocities'),
-                ('force_name', 'force_traj_suffix', 'forces')):
-            tandem_suffix = prev_config.get(suffix_key)
-            if not tandem_suffix:
-                continue
-            tandem_p = (gen_path / prev_config.get(name_key, default_name)
-                        ).with_suffix(tandem_suffix)
-            if (not tandem_p.is_file()) or tandem_p.stat().st_size == 0:
-                continue
-            if tandem_suffix != '.dcd':
-                print(f'_try_recover_gen: cannot frame-align {tandem_p} '
-                      f'(only .dcd truncation is supported); cascading.')
-                return None
-            try:
-                tandem_nset = util.dcd_header_info(tandem_p)['nset']
-            except Exception as exc:
-                print(f'_try_recover_gen: bad tandem DCD header at {tandem_p}: '
-                      f'{exc}; cascading.')
-                return None
-            if tandem_nset == target_nset:
-                continue
-            if tandem_nset < target_nset:
-                print(f'_try_recover_gen: {tandem_p} has {tandem_nset} frames, '
-                      f'behind positions/state ({target_nset}); cannot realign '
-                      f'without a matching checkpoint, cascading.')
-                return None
-            print(f'_try_recover_gen: trimming {tandem_p} from {tandem_nset} '
-                  f'to {target_nset} frames to match positions.')
-            try:
-                tandem_actual = util.truncate_dcd_to_nframes(tandem_p,
-                                                         target_nset)
-            except Exception as exc:
-                print(f'_try_recover_gen: could not truncate {tandem_p}: '
-                      f'{exc}; cascading.')
-                return None
-            if tandem_actual != target_nset:
-                print(f'_try_recover_gen: tandem truncate returned '
-                      f'{tandem_actual} != target {target_nset}; cascading.')
-                return None
+        # Only from here, the position-truncation branch: a healthy in-flight
+        # gen has positions and state in step, takes the target_nset == nset
+        # path above, and so never reaches this. That is what keeps a live
+        # clone's tandem files from being rewritten under it.
+        if not _align_tandem_dcds(gen_path, prev_config, target_nset):
+            return None
 
     remaining = total_steps - nset * nsavc
     if remaining > 0:
@@ -236,12 +243,12 @@ def _try_recover_gen(gen_path: Path, *,
 class Clone:
     __slots__ = (
         'config', 'dry_run', 'job_number', 'job_number_re', 'job_name_fstring', 'current_seed',
-        'current_gen_dir', 'current_gen', 'config_p', 'scheduler_script_p', 'compare_keys',
+        'current_gen_dir', 'config_p', 'scheduler_script_p', 'compare_keys',
         'scheduler_fstring', 'scheduler', 'traj_list', 'sep', 'dirname_pad',
         'scheduler_kws', 'restarts_per_gen', 'restart_attempts', 'run_script',
         'harvester', 'remaining_steps', 'run_script_name', 'total_steps',
         'preemption_checker', 'node_blocklist', 'progress_fn',
-        'scheduler_log_dir', 'last_gen_index')
+        'scheduler_log_dir', 'last_gen_index', 'reaped_gen')
 
     # This should mostly be used by the init function, and by adaptive sampling scripts.
 
@@ -344,7 +351,6 @@ class Clone:
             sep=self.config['sep'],
             mkdir=True
         )
-        self.current_gen = self.config['gen_index']
         self.job_number = job_number
         self.sep = sep
         if job_name_fstring:
@@ -379,6 +385,9 @@ class Clone:
                     raise ConfigError(str(exc)) from exc
         self.preemption_checker = preemption_checker
         self.node_blocklist = node_blocklist
+        # The generation whose harvest has already been submitted, so a
+        # generation that is checked in on again does not get a second one.
+        self.reaped_gen = None
         self.progress_fn = progress_fn
         self.last_gen_index = last_gen_index
         self.run_script = run_script
@@ -543,9 +552,10 @@ class Clone:
         # when config['steps'] has been narrowed to a remainder.
         config['steps_per_gen'] = steps_per_gen
 
-        # Only override Clone's default run_script when one was supplied, so
-        # OpenMM callers keep the default and GROMACS callers get their runner.
-        run_script_kw = {} if run_script is None else {'run_script': run_script}
+        # OpenMM callers pass nothing and get the OpenMM runner; GROMACS
+        # callers pass their own.
+        if run_script is None:
+            run_script = default_run_script
         return cls(
             config,
             scheduler,
@@ -565,7 +575,7 @@ class Clone:
             progress_fn=progress_fn,
             last_gen_index=last_gen_index,
             dry_run=dry_run,
-            **run_script_kw,
+            run_script=run_script,
         )
 
     # Two clones should be the same if their config has the same seed, clone, and title in it.
@@ -706,12 +716,22 @@ class Clone:
                 print('  stdout:', result.stdout)
                 print('  stderr:', result.stderr)
                 return False
-            scheduler_output = result.stdout
             # NOTE: this assumes that some text is printed when a job is started,
             # and that within that text the first number matching job_number_re
             # is the Job number.
-            self.job_number = int(
-                self.job_number_re.search(scheduler_output).group(0))
+            match = self.job_number_re.search(result.stdout)
+            if match is None:
+                # The job IS running; only its id is lost. Say so, so it can be
+                # found and cancelled rather than left to write into a
+                # directory the tender has given up on.
+                print(f'{self.scheduler} SUBMITTED a job for {self.get_tag()} '
+                      f'in {self.current_gen_dir}, but no job number could be '
+                      f'read from its output. That job is RUNNING AND '
+                      f'UNTRACKED: find and cancel it by hand.')
+                print('  stdout:', result.stdout)
+                print('  stderr:', result.stderr)
+                return False
+            self.job_number = int(match.group(0))
             print('Started:', self.get_tag())
         return should_launch
 
@@ -732,10 +752,17 @@ class Clone:
         self.config['append'] = False
         # because we want to start next, increment the gen before building
         self.config['gen_index'] += 1
-        self.current_gen += 1
         attempted_launch = self.start_current(overwrite=overwrite,
                                               submit=submit)
         return attempted_launch
+
+    # The generation this clone would run next. Read from the config rather
+    # than tracked alongside it, so a caller that moves config['gen_index'] --
+    # which is how an adaptive-sampling script redirects a clone -- cannot
+    # leave the two disagreeing.
+    @property
+    def current_gen(self):
+        return self.config['gen_index']
 
     # True once this clone has finished its last configured generation and
     # will never start another. False when last_gen_index is None, since
@@ -791,13 +818,15 @@ class Clone:
             self.restart_attempts = 0
 
         if self.remaining_steps <= 0:
-            # Generation finished.
-            self.restart_attempts = 0
-            self.config['steps'] = self.total_steps
+            # Generation finished. start_next resets this clone's counters.
             print('Preparing to move to next generation!')
             # do any automated traj postprocessing encoded by harvester
-            if self.harvester:
+            if self.harvester and self.reaped_gen != self.config['gen_index']:
                 print('running harvester!')
+                # Recorded before the attempt: a pack member whose start_next
+                # raises is checked in on again next tick, and one harvest is
+                # all this generation gets either way.
+                self.reaped_gen = self.config['gen_index']
                 try:
                     self.harvester.reap(
                         self.current_gen_dir, dry_run=self.dry_run)
@@ -809,8 +838,9 @@ class Clone:
             if (self.last_gen_index is not None
                     and self.config['gen_index'] >= self.last_gen_index):
                 # This was the last generation asked for; count it done
-                # instead of starting one more.
-                self.current_gen += 1
+                # instead of starting one more. Nothing builds a directory for
+                # the generation this now names, since is_done is True.
+                self.config['gen_index'] += 1
                 return True
             return self.start_next(overwrite=overwrite, submit=submit)
 
@@ -1069,7 +1099,13 @@ class ClonePack:
             return False
         match = self.job_number_re.search(result.stdout)
         if match is None:
-            print(f'could not parse a job number from {result.stdout!r}')
+            # As for a solo clone: the pack's job is running, untracked.
+            print(f'{self.scheduler} SUBMITTED the job for {self.get_tag()} in '
+                  f'{self.pack_dir}, but no job number could be read from its '
+                  f'output. That job is RUNNING AND UNTRACKED: find and cancel '
+                  f'it by hand.')
+            print('  stdout:', result.stdout)
+            print('  stderr:', result.stderr)
             return False
         self.job_number = int(match.group(0))
         # Every member answers to the pack's job id, so the Farmer's
