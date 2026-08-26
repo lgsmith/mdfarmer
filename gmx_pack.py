@@ -272,6 +272,15 @@ def gmx_pack_sim_block_json(manifest_fn=PACK_MANIFEST_NAME,
           flush=True)
     mps_state = report_mps_state()
 
+    # Checked once, out here: a mismatch is a mistake in this module, not one
+    # replica's bad luck, and inside a member it would be reported as one.
+    injected = {'fleet', 'fleet_key', 'grompp_lock'}
+    if injected != set(runtime_only_keys):
+        raise RuntimeError(
+            f'this module injects {sorted(injected)} but RUNTIME_ONLY_KEYS '
+            f'names {sorted(runtime_only_keys)}; they have to match or a '
+            "config's own copies stop being dropped.")
+
     fleet = gmx.MdrunFleet(pack_dir / gmx.PREEMPT_SENTINEL_NAME,
                            poll_seconds=poll_seconds)
     fleet.clear_sentinel()
@@ -291,11 +300,6 @@ def gmx_pack_sim_block_json(manifest_fn=PACK_MANIFEST_NAME,
             # derived from the injected dict so the two cannot drift apart.
             runtime_kwargs = dict(fleet=fleet, fleet_key=index,
                                   grompp_lock=grompp_lock)
-            if set(runtime_kwargs) != set(runtime_only_keys):
-                raise RuntimeError(
-                    f'runtime kwargs {sorted(runtime_kwargs)} no longer match '
-                    f'RUNTIME_ONLY_KEYS {sorted(runtime_only_keys)}; update the '
-                    'constant so config.json copies keep getting dropped.')
             for key in runtime_kwargs:
                 conf.pop(key, None)
             conf['mdrun_args'] = replica_mdrun_args(
