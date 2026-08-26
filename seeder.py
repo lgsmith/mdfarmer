@@ -819,6 +819,9 @@ class Clone:
         # Partially run: continue it.
         self.config['steps'] = self.remaining_steps
         self.config['append'] = True
+        # A continuation always reloads the checkpoint's momenta; redrawing
+        # them here would splice a thermal discontinuity into the trajectory.
+        self.config['new_velocities'] = False
         self.check_copy_set_restart_seed()
         return self.start_current(
             overwrite=overwrite, count_as_restart=count_as_restart,
