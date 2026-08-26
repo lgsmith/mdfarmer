@@ -127,6 +127,17 @@ Generations chain with `gmx convert-tpr -nsteps` plus `mdrun -cpi`, not
 integrator parameters and the Nose-Hoover / Parrinello-Rahman coupling state
 carry across and the step and time counters stay globally continuous.
 
+Every launch writes its own `prod.partNNNN.xtc`, merged with `gmx trjcat` when
+the generation finishes. Where two parts cover the same time trjcat keeps the
+**later** file's frames, so a part left behind by a relaunch that rewound to an
+earlier checkpoint is renamed out of the way first — otherwise trjcat would
+splice the abandoned branch into the one that actually continued.
+
+Generation 0 is built with `grompp -c` from `seed_fn` when that is a structure
+file, falling back to `structure_fn`. That is what lets seeds differ in
+topology, and what lets an adaptive scheme reseed from a configuration it
+picked rather than from the structure the campaign started with.
+
 ### Packing replicas onto one GPU
 
 Where Slurm exposes only a `gpu` gres — no `mps`, no `shard` — it cannot
@@ -360,8 +371,11 @@ time and write them explicitly, verified against the source's last frame.
 Two things to check on a campaign after the fact:
 
 ```python
-mdf.unharvested_gen_dirs('trajectories')     # gens that ran but have no sentinel
-mdf.verify_dry_chain(sorted_gen_dirs)        # frame count, spacing, duplicates
+# Generations that ran but have no sentinel. On a campaign that is still
+# running, skip_newest=True leaves out the one each clone is mid-way through.
+mdf.unharvested_gen_dirs('trajectories', skip_newest=True)
+# Frame count, spacing and duplicates across a clone's harvested generations.
+mdf.verify_dry_chain(sorted_gen_dirs)
 ```
 
 The harvest does **not** reimage — it preserves the per-frame box (LOOS subsets
