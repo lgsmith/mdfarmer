@@ -157,7 +157,12 @@ def _try_recover_gen(gen_path: Path, *,
         # Kill between DCDReporter and CheckpointReporter writes.
         print(f'_try_recover_gen: trimming {traj_p} from {nset} to '
               f'{target_nset} frames to match state.xml stepCount.')
-        actual = util.truncate_dcd_to_nframes(traj_p, target_nset)
+        try:
+            actual = util.truncate_dcd_to_nframes(traj_p, target_nset)
+        except Exception as exc:
+            print(f'_try_recover_gen: could not truncate {traj_p}: {exc}; '
+                  f'cascading.')
+            return None
         if actual != target_nset:
             print(f'_try_recover_gen: truncate returned {actual} != '
                   f'target {target_nset}; cascading.')
@@ -202,7 +207,13 @@ def _try_recover_gen(gen_path: Path, *,
                 return None
             print(f'_try_recover_gen: trimming {tandem_p} from {tandem_nset} '
                   f'to {target_nset} frames to match positions.')
-            tandem_actual = util.truncate_dcd_to_nframes(tandem_p, target_nset)
+            try:
+                tandem_actual = util.truncate_dcd_to_nframes(tandem_p,
+                                                             target_nset)
+            except Exception as exc:
+                print(f'_try_recover_gen: could not truncate {tandem_p}: '
+                      f'{exc}; cascading.')
+                return None
             if tandem_actual != target_nset:
                 print(f'_try_recover_gen: tandem truncate returned '
                       f'{tandem_actual} != target {target_nset}; cascading.')
