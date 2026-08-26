@@ -440,6 +440,10 @@ def harvest_generation(config_fn, harvester_config_fn,
 
     structure_fn = hconfig.get('harvester_structure') or config['top_fn']
     downsample_frq = hconfig['downsample_frq']
+    if downsample_frq < 1:
+        raise HarvestError(
+            f'downsample_frq is {downsample_frq}; keeping every Nth frame '
+            'needs N of at least 1.')
     gen_index = config['gen_index']
     write_interval = config['write_interval']
     steps_per_gen = _steps_per_gen(config, hconfig)
