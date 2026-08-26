@@ -713,12 +713,14 @@ class Clone:
         previous_remaining = self.remaining_steps
         self.remaining_steps = self.gen_remaining_steps()
         # A launch that moved the generation forward is not a "restart" in the
-        # sense the budget is meant to police -- it is the normal way a
-        # generation longer than one walltime allocation gets finished. Charging
-        # it meant an ultralong generation exhausted restarts_per_gen and had
-        # its clone abandoned while it was working perfectly.
+        # sense the budget polices -- it is how a generation longer than one
+        # walltime allocation gets finished. Progress also CLEARS the budget:
+        # it counts consecutive dead launches, so a generation spanning many
+        # walltime blocks is not abandoned for three isolated bad nodes spread
+        # across its life.
         if self.remaining_steps < previous_remaining:
             count_as_restart = False
+            self.restart_attempts = 0
 
         if self.remaining_steps <= 0:
             # Generation finished.
