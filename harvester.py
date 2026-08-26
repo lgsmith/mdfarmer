@@ -156,7 +156,12 @@ def resolve_seam(n_orig, frames_per_gen, gen_index, seam=SEAM_AUTO):
 
 
 def keeps_frame(local_index, first_global_index, downsample_frq, skip_first):
-    """(write_dry, write_downsample) for one frame. The rule lives only here."""
+    """(write_dry, write_downsample) for one frame.
+
+    The LOOS backend calls this; the mdtraj one works the same rule out in
+    numpy over a whole chunk. _verify_counts is what proves the two agreed, by
+    comparing what each wrote against what expected_counts predicts.
+    """
     # Counting from the frame's place in the whole trajectory, not in this
     # generation, is what keeps the downsample phase running across seams.
     if skip_first and local_index == 0:
@@ -164,24 +169,12 @@ def keeps_frame(local_index, first_global_index, downsample_frq, skip_first):
     return True, ((first_global_index + local_index) % downsample_frq == 0)
 
 
-def frame_plan(n_orig, first_global_index, downsample_frq, skip_first):
-    """Yield (local_index, write_dry, write_downsample) for every frame.
-
-    The LOOS backend asks keeps_frame directly; the mdtraj one works the same
-    rule out in numpy over a whole chunk. _verify_counts is what proves the two
-    agreed, by comparing what each wrote against what this predicts.
-    """
-    for local in range(n_orig):
-        dry, down = keeps_frame(local, first_global_index, downsample_frq,
-                                skip_first)
-        yield local, dry, down
-
-
 def expected_counts(n_orig, first_global_index, downsample_frq, skip_first):
     """(n_dry, n_downsample) the plan will produce. Computed, never observed."""
     n_dry = n_down = 0
-    for _, dry, down in frame_plan(n_orig, first_global_index, downsample_frq,
-                                   skip_first):
+    for local in range(n_orig):
+        dry, down = keeps_frame(local, first_global_index, downsample_frq,
+                                skip_first)
         n_dry += dry
         n_down += down
     return n_dry, n_down
