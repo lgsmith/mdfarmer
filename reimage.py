@@ -508,7 +508,7 @@ def reimage_with_trjconv(traj_fn, tpr_fn, out_fn, gmx_bin=GMX_BIN,
         raise ValueError(
             f'refusing to reimage {traj_p} onto itself; write to a new file '
             f'(e.g. {traj_p.stem}{output_tag}{traj_p.suffix}).')
-    if not Path(tpr_fn).is_file():
+    if tpr_fn is None or not Path(tpr_fn).is_file():
         raise FileNotFoundError(
             f'{tpr_fn}: gmx trjconv -pbc {pbc} needs the run .tpr for molecule '
             'definitions')
