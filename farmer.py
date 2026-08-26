@@ -366,6 +366,20 @@ class Farmer:
                 self.check_path(Path(self.config_template['integrator_xml'])).resolve()
             )
 
+        # A generation's last partial chunk writes neither a frame nor a
+        # checkpoint, so the steps in it can never be counted as done: the
+        # clone would spend its whole restart budget on that last sliver and
+        # then be failed. Both keys are optional, since not every engine's
+        # template carries them.
+        steps = self.config_template.get('steps')
+        write_interval = self.config_template.get('write_interval')
+        if steps and write_interval and steps % write_interval:
+            raise ValueError(
+                f'config_template steps={steps} is not a whole number of '
+                f'write_interval={write_interval} steps. The remaining '
+                f'{steps % write_interval} would write no frame and no '
+                'checkpoint, so the generation would never finish.')
+
         # buffering=0 on the DCD reporter's underlying file would make every
         # struct.pack inside DCDFile.writeModel its own syscall — much slower
         # than buffered writes plus an explicit flush per frame (which is what

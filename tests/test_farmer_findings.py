@@ -97,6 +97,21 @@ def main(n_clones=N_CLONES):
     for name in ('a.gro', 'topol.top', 'base.mdp'):
         (work / name).write_text('placeholder\n')
 
+    suite.section('a generation that is not a whole number of write intervals')
+    ragged = make_template(work, steps_per_gen=STEPS_PER_GEN + 1)
+    try:
+        captured(lambda: make_farmer(work, template=ragged))
+        suite.check('a ragged generation length is refused at boot', False,
+                    '-> no exception')
+    except ValueError as exc:
+        suite.check('a ragged generation length is refused at boot',
+                    'write_interval' in str(exc), f'-> {str(exc)[:60]}')
+    engineless = make_template(work)
+    engineless.pop('write_interval')
+    farmer, _ = captured(lambda: make_farmer(work, template=engineless))
+    suite.check('a template without write_interval still boots',
+                'write_interval' not in farmer.config_template)
+
     suite.section('traj_list is resolved however it arrives')
     relative = 'given-by-hand.txt'
     template = make_template(work)
