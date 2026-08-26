@@ -103,14 +103,20 @@ class Farmer:
             except (ValueError, IndexError):
                 continue
             self.current_jids.add(jid)
+            name = fields[1] if len(fields) > 1 else ''
             try:
                 # The last three fields only. The title comes first and may
                 # contain the separator itself, which would otherwise leave a
                 # running job unbound and get a second one launched over it.
-                six, cix, gix = map(int, fields[1].split(self.sep)[-3:])
-            except (ValueError, IndexError):
-                # Not one of our job names. It stays in current_jids so we do
-                # not relaunch over it, but no Clone is bound to it.
+                six, cix, gix = map(int, name.split(self.sep)[-3:])
+            except ValueError:
+                # No clone is bound to this job, so nothing stops the clone it
+                # belongs to launching a second one into the same generation
+                # directory. Say so; it is the last chance to notice.
+                print(f'WARNING: queued job {jid} is named {name!r}, which '
+                      f'does not end in {self.sep}seed{self.sep}clone'
+                      f'{self.sep}gen indices. No clone will be bound to it, '
+                      'and one may launch a second job on top of it.')
                 continue
             rep_dict[(six, cix, gix)] = jid
         self.jids_file.write_text(' '.join(map(str, sorted(self.current_jids))))

@@ -97,6 +97,17 @@ def main(n_clones=N_CLONES):
     for name in ('a.gro', 'topol.top', 'base.mdp'):
         (work / name).write_text('placeholder\n')
 
+    suite.section('a queued job whose name does not parse')
+    farmer, _ = captured(lambda: make_farmer(work))
+    farmer.scheduler_assoc_rep_cmd = "printf '77 someone-elses-job\\n'"
+    rep_dict, log = captured(farmer.reassociate_running_jobs)
+    suite.check('the job still counts as ours, so nothing relaunches over it',
+                farmer.current_jids == {77}, f'-> {farmer.current_jids}')
+    suite.check('no clone is bound to it', rep_dict == {}, f'-> {rep_dict}')
+    suite.check('boot names the job id and the name it could not parse',
+                'WARNING' in log and '77' in log
+                and 'someone-elses-job' in log)
+
     suite.section('a clone waiting for a free slot')
     farmer, _ = captured(lambda: make_farmer(
         work, seeds_first=False, active_clone_threshold=1))
