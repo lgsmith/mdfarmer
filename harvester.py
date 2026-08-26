@@ -367,10 +367,9 @@ def _harvest_mdtraj(traj_fn, structure_fn, subset_spec, dry_out, down_out,
 class _MdtrajWriter:
     """Writer that appends, which Trajectory.save() cannot do."""
 
-    def __init__(self, out_p, angstrom_per_nm=reimage.ANGSTROM_PER_NM):
+    def __init__(self, out_p):
         import mdtraj as md
         self.suffix = out_p.suffix.lower()
-        self.angstrom_per_nm = angstrom_per_nm
         if self.suffix == '.xtc':
             self.fh = md.formats.XTCTrajectoryFile(str(out_p), 'w')
         elif self.suffix == '.dcd':
@@ -387,10 +386,10 @@ class _MdtrajWriter:
             self.fh.write(traj.xyz, time=traj.time, step=step,
                           box=traj.unitcell_vectors)
         else:
-            self.fh.write(traj.xyz * self.angstrom_per_nm,
+            self.fh.write(traj.xyz * reimage.ANGSTROM_PER_NM,
                           cell_lengths=(None if traj.unitcell_lengths is None
                                         else traj.unitcell_lengths
-                                        * self.angstrom_per_nm),
+                                        * reimage.ANGSTROM_PER_NM),
                           cell_angles=traj.unitcell_angles)
 
     def close(self):
