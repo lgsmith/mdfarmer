@@ -3,6 +3,7 @@
 Needs no GROMACS: every check here is about orchestration bookkeeping, and the
 files only have to exist.
 """
+import json
 import sys
 
 import harness
@@ -113,6 +114,40 @@ def main(cpus=CPUS, n_members=N_MEMBERS, failing_node=FAILING_NODE,
     clone.check_start_gen(set(), overwrite=True)
     suite.check('a dead launch still charges the budget',
                 clone.restart_attempts == 3, f'-> {clone.restart_attempts}')
+
+    suite.section('a packed job always reports one outcome per member')
+    pack_dir = work / 'outcomes'
+    pack_dir.mkdir()
+    configs = []
+    for index in range(n_members):
+        gen_dir = pack_dir / f'member{index}'
+        gen_dir.mkdir()
+        config = clone_config(work, index)
+        # No traj_list, so publishing the outcome is the only thing that can
+        # save the member's result when the run itself raises.
+        config.pop('traj_list', None)
+        config_p = gen_dir / 'config.json'
+        config_p.write_text(json.dumps(config))
+        configs.append(config_p)
+    gp.write_pack_manifest(pack_dir, configs, cpus_per_task=cpus)
+    status = gp.gmx_pack_sim_block_json(pack_dir / 'pack.json')
+    suite.check('every member has an outcome even when every member fails',
+                len(status['members']) == n_members
+                and all(m is not None for m in status['members']),
+                f"-> {[None if m is None else m['status'] for m in status['members']]}")
+    suite.check('each outcome names its replica',
+                sorted(m['replica'] for m in status['members'])
+                == list(range(n_members)))
+
+    suite.section('the runtime key list is checked once, loudly')
+    try:
+        gp.gmx_pack_sim_block_json(pack_dir / 'pack.json',
+                                   runtime_only_keys=('fleet',))
+        suite.check('a mismatched key list stops the whole job', False,
+                    '-> no exception')
+    except RuntimeError as exc:
+        suite.check('a mismatched key list stops the whole job',
+                    'RUNTIME_ONLY_KEYS' in str(exc), f'-> {str(exc)[:50]}')
 
     suite.section('gen-seed differs across seeds as well as clones')
     seeds = {}
