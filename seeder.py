@@ -209,7 +209,7 @@ def _try_recover_gen(gen_path: Path, *,
                   f'to {target_nset} frames to match positions.')
             try:
                 tandem_actual = util.truncate_dcd_to_nframes(tandem_p,
-                                                             target_nset)
+                                                         target_nset)
             except Exception as exc:
                 print(f'_try_recover_gen: could not truncate {tandem_p}: '
                       f'{exc}; cascading.')
@@ -944,14 +944,26 @@ class ClonePack:
             # in its own gen dir, so a node scan rooted there finds nothing.
             clone.scheduler_log_dir = self.pack_dir
         self.dry_run = dry_run
+        # Indexes into self.clones that have exhausted their restart budget
+        # and will never run again. Kept out of self.clones itself, since
+        # member_cores and the pack's job name are positional over that list.
+        self.retired = set()
 
     @property
     def current_gen(self):
-        # The pack advances together, so the laggard defines where it is.
-        return min(c.current_gen for c in self.clones)
+        # The pack advances together, so the laggard among the members still
+        # live defines where it is. A retired member's frozen current_gen
+        # would otherwise pin the pack there forever.
+        live = [c.current_gen for i, c in enumerate(self.clones)
+                if i not in self.retired]
+        return min(live) if live else min(c.current_gen for c in self.clones)
 
     def get_tag(self):
-        return 'pack[' + ' | '.join(c.get_tag() for c in self.clones) + ']'
+        # Retired members are marked, so a pack that finished a member short
+        # does not read the same as one where every member succeeded.
+        return 'pack[' + ' | '.join(
+            c.get_tag() + (' RETIRED' if i in self.retired else '')
+            for i, c in enumerate(self.clones)) + ']'
 
     def __hash__(self):
         return hash(tuple(hash(c) for c in self.clones))
@@ -969,28 +981,62 @@ class ClonePack:
             print('Pack job', self.job_number, 'still running', self._job_name())
             return True
 
-        prepared, member_configs, member_indexes = [], [], []
-        for index, clone in enumerate(self.clones):
+        live_indexes = [i for i in range(len(self.clones))
+                        if i not in self.retired]
+        if not live_indexes:
+            print(f'{self.get_tag()}: every member retired; failing pack.')
+            return False
+
+        member_configs, member_indexes = [], []
+        tried = newly_finished = 0
+        for index in live_indexes:
+            clone = self.clones[index]
+            if clone.is_done:
+                continue
+            tried += 1
             try:
                 ok = clone.check_start_gen(scheduler_report,
                                            overwrite=overwrite, submit=False)
             except Exception as exc:
                 print(f'ERROR preparing pack member {clone.get_tag()}: '
                       f'{type(exc).__name__}: {exc}')
-                ok = False
-            prepared.append(ok)
-            if ok:
-                member_configs.append(clone.current_gen_dir / 'config.json')
-                member_indexes.append(index)
-        if not any(prepared):
+                continue
+            if not ok:
+                # check_start_gen only refuses once the restart budget for
+                # this generation is spent, and a member that never runs can
+                # never earn it back. Retire it so its frozen current_gen
+                # stops pinning the whole pack in place.
+                self.retired.add(index)
+                print(f'{clone.get_tag()}: exhausted its restart budget; '
+                      'retiring it from the pack.')
+                continue
+            if clone.is_done:
+                # That call finished this member's last generation; it has
+                # nothing left to submit, so leave it out of this launch.
+                newly_finished += 1
+                continue
+            member_configs.append(clone.current_gen_dir / 'config.json')
+            member_indexes.append(index)
+
+        still_live = [i for i in range(len(self.clones))
+                      if i not in self.retired]
+        if not still_live:
+            print(f'{self.get_tag()}: every member retired; failing pack.')
+            return False
+        if all(self.clones[i].is_done for i in still_live):
+            print(f'{self.get_tag()}: every live member finished its '
+                  'generations.')
+            return True
+        if not member_configs:
             print(f'{self.get_tag()}: no member could be prepared; failing pack.')
             return False
-        if not all(prepared):
+        unfinished = tried - newly_finished
+        if len(member_configs) < unfinished:
             # Relaunch the pack with the members that are still healthy rather
             # than shrinking it permanently: a shrunk pack leaves the card
             # underpacked for the rest of the campaign.
-            print(f'{self.get_tag()}: {prepared.count(False)} of '
-                  f'{len(prepared)} members could not be prepared; launching '
+            print(f'{self.get_tag()}: {unfinished - len(member_configs)} of '
+                  f'{unfinished} members could not be prepared; launching '
                   'the rest.')
 
         from . import gmx_pack
