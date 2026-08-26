@@ -366,6 +366,11 @@ class Farmer:
         self.job_name_fstring = self.sep.join(job_name_elements)
         self.current_jids = set()
         self.finished_clones = set()
+        if active_clone_threshold < 1:
+            raise ValueError(
+                f'active_clone_threshold={active_clone_threshold} leaves every '
+                'clone waiting for a slot that never opens. It must be at '
+                'least 1.')
         self.active_clone_threshold = active_clone_threshold
         self.active_clone_set = set()
         self.failed_clone_set = set()
@@ -547,10 +552,14 @@ class Farmer:
                     else:
                         self.mark_clone_failed(clone)
                         still_running.append(False)
+                # Every slot is taken, so this clone waits its turn. Nothing is
+                # wrong, and it is still part of the campaign.
                 else:
-                    print('WARNING:', clone.get_tag(),
-                          'is not accounted for by launch logic.')
+                    if not self.quiet:
+                        print(clone.get_tag(),
+                              'is waiting for a free slot.')
                     survivors.append(clone)
+                    still_running.append(True)
             self.priority_ordered_clones[queue_index] = survivors
         return still_running
 
