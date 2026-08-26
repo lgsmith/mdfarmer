@@ -17,7 +17,6 @@ Nothing here overwrites its input: the orchestrator counts frames in the raw
 trajectory to decide whether a generation has finished.
 """
 
-import shutil
 import subprocess as sp
 from pathlib import Path
 
@@ -636,6 +635,3 @@ def reimage_gen_dir(gen_dir, config=None, backend=BACKEND_AUTO,
         gmx_bin=gmx_bin, triclinic_rtol=triclinic_rtol, output_tag=output_tag)
 
 
-def have_gmx(gmx_bin=GMX_BIN):
-    """True when gmx_bin is runnable, so callers can pick a backend up front."""
-    return shutil.which(gmx_bin) is not None

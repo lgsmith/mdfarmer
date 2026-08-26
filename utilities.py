@@ -848,11 +848,6 @@ def dir_seeds_clones_gens(top_lvl: Path, seed_index, clone_index, gen_index, pad
     return p
 
 
-# All trajectory formats for which a reporter exists. Add grace in future.
-traj_suffixes = ['.dcd',
-                 '.xtc']
-
-
 default_steps = int(2.5e7)  # Given 0.004 ps timestep,
 # this is 100 ns of simulation.
 default_state_data_kwargs = dict(

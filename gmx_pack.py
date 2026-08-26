@@ -31,9 +31,6 @@ from pathlib import Path
 from . import gmx_simulate as gmx
 
 
-# Replicas per GPU. 2 is the measured sweet spot on Blackwell.
-REPS_PER_CARD = 2
-
 # mdrun pinning stride. 1 keeps a replica's threads on consecutive cores.
 PIN_STRIDE = 1
 
@@ -200,7 +197,7 @@ def report_mps_state(mps_control_bin=MPS_CONTROL_BIN,
 
 
 def write_pack_manifest(pack_dir, member_config_fns, *, cpus_per_task,
-                        reps_per_card=REPS_PER_CARD, member_cores=None,
+                        member_cores=None,
                         pack_manifest_name=PACK_MANIFEST_NAME):
     """Record which generation configs one packed job should advance.
 
@@ -216,7 +213,6 @@ def write_pack_manifest(pack_dir, member_config_fns, *, cpus_per_task,
     manifest = {
         'members': members,
         'cpus_per_task': int(cpus_per_task),
-        'reps_per_card': int(reps_per_card),
         'member_cores': member_cores,
     }
     path = Path(pack_dir) / pack_manifest_name

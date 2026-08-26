@@ -89,8 +89,7 @@ def main(cpus=CPUS, pack_cpus=PACK_CPUS, n_replicas=N_REPLICAS,
         config_p = gen_dir / 'config.json'
         config_p.write_text(json.dumps(config, indent=2))
         configs.append(config_p)
-    gp.write_pack_manifest(work, configs, cpus_per_task=cpus,
-                           reps_per_card=n_replicas)
+    gp.write_pack_manifest(work, configs, cpus_per_task=cpus)
     status = gp.gmx_pack_sim_block_json(work / 'pack.json')
     states = [member['status'] for member in status['members']]
     suite.check('every replica of a template-built pack completes',

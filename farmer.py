@@ -51,10 +51,6 @@ class Farmer:
         else:
             raise FileNotFoundError(p)
 
-    def check_path_config(self, key):
-        p = Path(self.config_template[key])
-        self.check_path(p)
-
     # move clone off the active list
     def mark_clone_failed(self, clone):
         self.failed_clone_set.add(clone)
@@ -122,7 +118,7 @@ class Farmer:
         self.run_script = run_script
         self.recover_fn = recover_fn
         self.progress_fn = progress_fn
-        if runner is gmx.gmx_generation:
+        if self.runner is gmx.gmx_generation:
             gmx_defaults = (('run_script', gmx.default_gmx_run_script),
                             ('recover_fn', gmx.gmx_try_recover_gen),
                             ('progress_fn', gmx.gmx_gen_progress))
@@ -134,7 +130,7 @@ class Farmer:
             if custom:
                 print(f'NOTE: runner=gmx_generation with custom {custom}; '
                       'make sure they implement the GROMACS contract.')
-        elif runner is sims.omm_generation:
+        elif self.runner is sims.omm_generation:
             gmx_pieces = (gmx.default_gmx_run_script, gmx.gmx_try_recover_gen,
                           gmx.gmx_gen_progress)
             for name in ('run_script', 'recover_fn', 'progress_fn'):
@@ -618,71 +614,3 @@ class Farmer:
                   f'{len(self.finished_clones)} finished: '
                   + ', '.join(c.get_tag() for c in self.failed_clone_set))
         return not self.failed_clone_set
-
-
-# class Adaptive(Farmer):
-#     __slots__ = ('current_gen', 'ranker', 'seeds', 'rank_jobscript')
-
-#     def __init__(self, n_seeds, n_clones, n_gens, config_template, seed_structure_fns, scheduler, scheduler_fstring,
-#                  scheduler_kws, scheduler_report_cmd, scheduler_assoc_rep_cmd, traj_list=None, quiet=False,
-#                  active_clone_threshold=50, dirname_pad=3, job_number_re='[1-9][0-9]*', sep='-', seeds_first=True,
-#                  job_name_elements=('{title}', '{seed_index}', '{clone_index}', '{gen_index}'), overwrite=False,
-#                  runner=sims.omm_generation, current_gen=None):
-
-#         super().__init__(n_seeds, n_clones, n_gens, config_template, seed_structure_fns, scheduler, scheduler_fstring,
-#                          scheduler_kws, scheduler_report_cmd, scheduler_assoc_rep_cmd, traj_list, quiet,
-#                          active_clone_threshold, dirname_pad, job_number_re, sep, seeds_first,
-#                          job_name_elements, overwrite, runner)
-
-#         if current_gen:
-#             self.current_gen = current_gen
-#         else:
-#             current_youngest_gen = self.n_gens
-#             for clone_list in self.priority_ordered_clones:
-#                 for clone in clone_list:
-#                     clone_gen = clone.config['gen_index']
-#                     if current_youngest_gen > clone_gen:
-#                         current_youngest_gen = clone_gen
-#             self.current_gen = current_youngest_gen
-
-#     def launch(self, sleep=None, update_jids=True):
-#         retlist = []  # note, this will be flat
-#         if update_jids:
-#             self.update_jids()
-#         for seed_index, clone_list in enumerate(self.priority_ordered_clones):
-#             for clone_index, clone in enumerate(clone_list):
-#                 if sleep:
-#                     time.sleep(sleep)
-
-#                 next_up_gen = clone.config['gen_index']
-#                 # Check if the clone is up to date with the current gen of adaptive sampling.
-#                 enough_gens = next_up_gen > self.current_gen
-#                 retlist.append(enough_gens)
-#                 if enough_gens:
-#                     self.finished_clones[
-#                         (seed_index, clone_index, next_up_gen)
-#                     ] = clone
-#                     clone_list.remove(clone)
-#                     try:
-#                         self.active_clone_set.remove(clone)
-#                     except KeyError:
-#                         print(
-#                             f'done_before_launch: {seed_index},{clone_index},{next_up_gen}')
-#                 elif clone in self.active_clone_set:
-#                     clone.check_start_gen(
-#                         self.current_jids, overwrite=self.overwrite
-#                     )
-#                 elif len(self.active_clone_set) < self.active_clone_threshold:
-#                     self.active_clone_set.add(clone)
-#                     clone.check_start_gen(
-#                         self.current_jids, overwrite=self.overwrite
-#                     )
-#         # if there are no clones in active clone list, after adding some and removing others, the gen is complete
-#         if len(self.active_clone_set) == 0:
-#             self.current_gen += 1
-#             self.rank_and_seed()
-
-#         # Add the number of gens to be run as an additional condition that must be true for clone-minder to return.
-#         retlist.append(self.current_gen > self.n_gens + 1)
-
-#         return retlist

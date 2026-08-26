@@ -548,10 +548,6 @@ class Clone:
             **run_script_kw,
         )
 
-    # Compare a value across self config and other config in other Clone.
-    def conf_value_eq(self, other: Clone, conf_key: str) -> bool:
-        return self.config[conf_key] == other.config[conf_key]
-
     # Two clones should be the same if their config has the same seed, clone, and title in it.
     # Customize by providing a set of keys to compare.
     def __hash__(self):
@@ -967,7 +963,7 @@ class ClonePack:
                         else [self.member_cores[i] for i in member_indexes])
         gmx_pack.write_pack_manifest(
             self.pack_dir, member_configs, cpus_per_task=self.cpus_per_task,
-            reps_per_card=len(member_configs), member_cores=member_cores,
+            member_cores=member_cores,
             pack_manifest_name=self.pack_manifest_name)
         (self.pack_dir / self.run_script_name).write_text(self.run_script)
         script_p = (self.pack_dir / self.scheduler).with_suffix('.sh')
