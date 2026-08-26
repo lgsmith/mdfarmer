@@ -279,7 +279,11 @@ def gmx_pack_sim_block_json(manifest_fn=PACK_MANIFEST_NAME,
     results = [None] * n_replicas
 
     def advance(index, config_fn):
-        outcome = {'config': str(config_fn), 'replica': index}
+        # Published before anything can raise, and updated in place, so the
+        # summary below always finds an outcome for every member.
+        outcome = {'config': str(config_fn), 'replica': index,
+                   'status': 'failed', 'detail': 'never reported'}
+        results[index] = outcome
         try:
             conf = json.loads(Path(config_fn).read_text())
             traj_list = Path(conf.pop('traj_list'))
@@ -313,7 +317,6 @@ def gmx_pack_sim_block_json(manifest_fn=PACK_MANIFEST_NAME,
             outcome.update(status='complete', traj=str(traj))
             with traj_list.open('a') as tl:
                 tl.write(str(traj) + '\n')
-        results[index] = outcome
 
     threads = [threading.Thread(target=advance, args=(i, fn), daemon=False,
                                 name=f'replica-{i}')
