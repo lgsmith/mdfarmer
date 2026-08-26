@@ -127,6 +127,12 @@ Generations chain with `gmx convert-tpr -nsteps` plus `mdrun -cpi`, not
 integrator parameters and the Nose-Hoover / Parrinello-Rahman coupling state
 carry across and the step and time counters stay globally continuous.
 
+Only generation 0 reads the base `.mdp`, and the runner controls a handful of
+its keys: `nsteps`, `init-step`, `nstxout-compressed`, `gen-vel`, `continuation`
+and the seeds. `nsteps` is the campaign-absolute step a generation must reach,
+so `init-step` is pinned to 0; a base `.mdp` that sets it gets a note on stdout
+and is overridden. Everything else is inherited verbatim.
+
 Every launch writes its own `prod.partNNNN.xtc`, merged with `gmx trjcat` when
 the generation finishes. Where two parts cover the same time trjcat keeps the
 **later** file's frames, so a part left behind by a relaunch that rewound to an
