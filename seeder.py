@@ -810,9 +810,7 @@ class Clone:
             self.restart_attempts = 0
 
         if self.remaining_steps <= 0:
-            # Generation finished.
-            self.restart_attempts = 0
-            self.config['steps'] = self.total_steps
+            # Generation finished. start_next resets this clone's counters.
             print('Preparing to move to next generation!')
             # do any automated traj postprocessing encoded by harvester
             if self.harvester and self.reaped_gen != self.config['gen_index']:
