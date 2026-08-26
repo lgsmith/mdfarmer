@@ -604,25 +604,37 @@ def _repair_from_symlink(traj_p, dry_p, down_p, sentinel_p, dry_top_p,
     dry_on_disk = util.get_traj_len(
         dry_p, dry_top_p if dry_top_p.is_file() else None)
     down_on_disk = util.get_traj_len(down_p, structure_fn)
+    matches = []
     for candidate in (frames_per_gen + 1, frames_per_gen):
         skip_first = resolve_seam(candidate, frames_per_gen, gen_index,
                                   seam=seam)
         n_dry, n_down = expected_counts(candidate, first_global_index,
                                         downsample_frq, skip_first)
-        if dry_on_disk == n_dry and down_on_disk == n_down:
-            record = dict(
-                status='repaired', backend=None, n_orig=candidate, n_dry=n_dry,
-                n_down=n_down, first_global_index=first_global_index,
-                frames_per_gen=frames_per_gen, gen_index=gen_index,
-                downsample_frq=downsample_frq, skip_first=skip_first,
-                dry=dry_p.name, downsample=down_p.name, original=traj_p.name,
-                unlinked=True)
-            sentinel_p.write_text(json.dumps(record, indent=2))
-            print(f'[harvest] {traj_p.parent}: a previous harvest completed but '
-                  f'never wrote {sentinel_p.name}; counts match the plan '
-                  f'({n_dry} dry, {n_down} downsampled), sentinel written.',
-                  flush=True)
-            return record
+        if (dry_on_disk, down_on_disk) == (n_dry, n_down):
+            matches.append((candidate, skip_first, n_dry, n_down))
+    if matches:
+        # After generation 0 both candidates produce the same two counts, so
+        # how many frames the deleted original held cannot be recovered from
+        # them. The outputs are right either way; ambiguous marks the fields
+        # of this record that are a guess.
+        candidate, skip_first, n_dry, n_down = matches[0]
+        ambiguous = len(matches) > 1
+        record = dict(
+            status='repaired', backend=None, n_orig=candidate, n_dry=n_dry,
+            n_down=n_down, first_global_index=first_global_index,
+            frames_per_gen=frames_per_gen, gen_index=gen_index,
+            downsample_frq=downsample_frq, skip_first=skip_first,
+            dry=dry_p.name, downsample=down_p.name, original=traj_p.name,
+            unlinked=True, ambiguous=ambiguous)
+        sentinel_p.write_text(json.dumps(record, indent=2))
+        print(f'[harvest] {traj_p.parent}: a previous harvest completed but '
+              f'never wrote {sentinel_p.name}; counts match the plan '
+              f'({n_dry} dry, {n_down} downsampled), sentinel written.'
+              + (f' Both {frames_per_gen} and {frames_per_gen + 1} original '
+                 f'frames fit those counts, so n_orig={candidate} and '
+                 f'skip_first={skip_first} are recorded as a guess '
+                 f'(ambiguous).' if ambiguous else ''), flush=True)
+        return record
     raise HarvestError(
         f'{traj_p} is a symlink, so the original is gone, but {dry_p.name} '
         f'({dry_on_disk} frames) and {down_p.name} ({down_on_disk} frames) do '
