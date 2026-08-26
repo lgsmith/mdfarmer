@@ -525,9 +525,17 @@ def _steps_per_gen(config, hconfig):
     frame index, and with it the downsample phase. Clone records the untouched
     value as steps_per_gen.
     """
-    for source, key in ((hconfig, 'steps_per_gen'), (config, 'steps_per_gen')):
-        if source.get(key) is not None:
-            return source[key]
+    from_run, from_harvester = config.get('steps_per_gen'), hconfig.get('steps_per_gen')
+    if None not in (from_run, from_harvester) and from_run != from_harvester:
+        raise HarvestError(
+            f'the run config says steps_per_gen={from_run} and the harvester '
+            f'config says {from_harvester}. They decide where this generation '
+            'sits in the whole trajectory, so guessing between them would put '
+            'the downsample phase in the wrong place.')
+    if from_run is not None:
+        return from_run          # written by Clone, and validated there
+    if from_harvester is not None:
+        return from_harvester
     print(f'[harvest] WARNING: neither the harvester config nor the run config '
           f'records steps_per_gen, falling back to steps={config["steps"]}. '
           f'That is the full generation length only if this generation ran in '
