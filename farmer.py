@@ -384,17 +384,18 @@ class Farmer:
         tdir = Path(self.config_template['traj_dir_top_level'])
         self.priority_ordered_clones = []
         if self.seeds_first:
-            outer_range = range(self.n_clones)
-            inner_range = range(self.n_seeds)
-            indexed = lambda outer, inner: (inner, outer)  # (seed, clone)
+            # One queue per clone index, holding every seed of it.
+            queue_keys = [[(seed_index, clone_index)
+                           for seed_index in range(self.n_seeds)]
+                          for clone_index in range(self.n_clones)]
         else:
-            outer_range = range(self.n_seeds)
-            inner_range = range(self.n_clones)
-            indexed = lambda outer, inner: (outer, inner)  # (seed, clone)
-        for outer in outer_range:
+            # One queue per seed, holding every clone of it.
+            queue_keys = [[(seed_index, clone_index)
+                           for clone_index in range(self.n_clones)]
+                          for seed_index in range(self.n_seeds)]
+        for keys in queue_keys:
             clone_queue = []
-            for inner in inner_range:
-                seed_index, clone_index = indexed(outer, inner)
+            for seed_index, clone_index in keys:
                 clone = self._setup_one_clone(
                     tdir, seed_index, clone_index, rep_dict)
                 if clone is not None:
