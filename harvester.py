@@ -177,43 +177,6 @@ def expected_counts(n_orig, first_global_index, downsample_frq, skip_first):
     return n_dry, n_down
 
 
-def source_frame_timing(traj_fn, n_orig):
-    """(step0, steps_per_frame, time0, time_per_frame), or None for a DCD.
-
-    Neither writer keeps the source's step and time on its own, so they are read
-    here and passed in explicitly. LOOS would otherwise number frames from zero
-    at 1 ps apart, and mdtraj would write the frame index as the step.
-    """
-    import numpy as np
-    import mdtraj as md
-
-    traj_p = Path(traj_fn)
-    if traj_p.suffix.lower() != '.xtc':
-        return None
-    with md.open(str(traj_p)) as fh:
-        _, time, step, _ = fh.read(min(2, n_orig))
-        if n_orig < 2:
-            return int(step[0]), 0, float(time[0]), 0.0
-        step0, time0 = int(step[0]), float(time[0])
-        steps_per_frame = int(step[1]) - step0
-        time_per_frame = float(time[1]) - time0
-        fh.seek(n_orig - 1)
-        _, last_time, last_step, _ = fh.read(1)
-    predicted_step = step0 + (n_orig - 1) * steps_per_frame
-    predicted_time = time0 + (n_orig - 1) * time_per_frame
-    if int(last_step[0]) != predicted_step or not np.isclose(
-            float(last_time[0]), predicted_time, rtol=1e-5,
-            atol=1e-5 * max(abs(predicted_time), 1.0)):
-        raise HarvestError(
-            f'{traj_p} is not evenly spaced: frames 0 and 1 are '
-            f'{steps_per_frame} steps / {time_per_frame} ps apart, which puts '
-            f'frame {n_orig - 1} at step {predicted_step} / {predicted_time} ps, '
-            f'but it is at step {int(last_step[0])} / {float(last_time[0])} ps. '
-            'Refusing to restamp frames from an assumption the trajectory '
-            'contradicts.')
-    return step0, steps_per_frame, time0, time_per_frame
-
-
 def select_backend(traj_fn, structure_fn=None, backend=BACKEND_AUTO,
                    triclinic_rtol=reimage.TRICLINIC_RTOL):
     """Return 'loos' for a rectangular box, 'mdtraj' for anything else."""
@@ -517,7 +480,7 @@ def harvest_generation(config_fn, harvester_config_fn,
           flush=True)
 
     kwargs = dict(dry_topology_name=dry_topology_name,
-                  timing=source_frame_timing(traj_p, n_orig))
+                  timing=util.frame_timing(traj_p, n_orig))
     if chosen == BACKEND_MDTRAJ:
         kwargs['iterload_chunk'] = iterload_chunk
     n_seen, n_dry, n_down = backends[chosen](

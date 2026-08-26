@@ -39,6 +39,7 @@ __all__ = ['fdir', 'dir_seeds_clones', 'dir_seeds_clones_gens', 'omm_generation'
            'default_straight_sampling_config_template',
            'default_straight_sampling_init_config',
            'merge_args_defaults_dict', 'calx_remaining_steps', 'get_traj_len',
+           'frame_timing',
            'gmx_simulate', 'gmx_generation', 'gmx_basic_sim_block_json',
            'gmx_try_recover_gen', 'gmx_gen_progress', 'gmx_config_template',
            'default_gmx_run_script', 'reimage',

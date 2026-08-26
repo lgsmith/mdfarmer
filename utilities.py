@@ -105,6 +105,46 @@ def get_traj_len(traj_fn, top_fn, dry_topology_name=DRY_TOPOLOGY_NAME):
     return 0
 
 
+def frame_timing(traj_fn, n_frames=None):
+    """(step0, steps_per_frame, time0, time_per_frame), or None for a DCD.
+
+    Neither LOOS nor mdtraj keeps a source's step and time on its own: LOOS
+    numbers frames from zero at 1 ps apart, and mdtraj writes the frame index as
+    the step. Anything that rewrites a trajectory has to read these and pass
+    them back in.
+
+    Given n_frames, the spacing read off frames 0 and 1 is checked against the
+    last frame, since extrapolating from two frames is only right if the source
+    is evenly spaced.
+    """
+    traj_p = Path(traj_fn)
+    if traj_p.suffix.lower() != '.xtc':
+        return None          # a DCD keeps its timing in the header
+    with _mdtraj.open(str(traj_p)) as fh:
+        available = len(fh)
+        _, time, step, _ = fh.read(min(2, available))
+        if available < 2:
+            return int(step[0]), 0, float(time[0]), 0.0
+        step0, time0 = int(step[0]), float(time[0])
+        steps_per_frame = int(step[1]) - step0
+        time_per_frame = float(time[1]) - time0
+        if n_frames is None:
+            return step0, steps_per_frame, time0, time_per_frame
+        fh.seek(n_frames - 1)
+        _, last_time, last_step, _ = fh.read(1)
+    predicted_step = step0 + (n_frames - 1) * steps_per_frame
+    predicted_time = time0 + (n_frames - 1) * time_per_frame
+    if int(last_step[0]) != predicted_step or abs(
+            float(last_time[0]) - predicted_time) > 1e-5 * max(
+                abs(predicted_time), 1.0):
+        raise ValueError(
+            f'{traj_p} is not evenly spaced: frames 0 and 1 are '
+            f'{steps_per_frame} steps apart, which puts frame {n_frames - 1} at '
+            f'step {predicted_step}, but it is at {int(last_step[0])}. Refusing '
+            'to restamp frames from an assumption the trajectory contradicts.')
+    return step0, steps_per_frame, time0, time_per_frame
+
+
 """
 The harvest itself lives in harvester.harvest_generation; these two names are
 what existing submit scripts call, and each pins a backend and hands off.

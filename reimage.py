@@ -23,6 +23,8 @@ from pathlib import Path
 
 import numpy as np
 
+from . import utilities as util
+
 
 # Largest off-diagonal box element, relative to the diagonal, still counted as
 # rectangular. GROMACS writes exact zeros, so this only clears float noise.
@@ -138,26 +140,6 @@ def length_scale(traj_fn, angstrom_per_nm=ANGSTROM_PER_NM):
     for a .dcd. Everything here compares against nanometre thresholds.
     """
     return 1.0 if Path(traj_fn).suffix.lower() == '.xtc' else 1 / angstrom_per_nm
-
-
-def frame_timing(traj_fn):
-    """(step0, steps_per_frame, time0, time_per_frame), or None for a DCD.
-
-    LOOS numbers frames from its own counters when it is not told otherwise,
-    which would put every written frame 1 ps apart and label it with its frame
-    index. Read the real numbers off the source and pass them in instead.
-    """
-    import mdtraj
-    traj_p = Path(traj_fn)
-    if traj_p.suffix.lower() != '.xtc':
-        return None
-    with mdtraj.open(str(traj_p)) as fh:
-        n_frames = len(fh)
-        _, time, step, _ = fh.read(min(2, n_frames))
-        if n_frames < 2:
-            return int(step[0]), 0, float(time[0]), 0.0
-        return (int(step[0]), int(step[1]) - int(step[0]),
-                float(time[0]), float(time[1]) - float(time[0]))
 
 
 def is_orthorhombic(box, triclinic_rtol=TRICLINIC_RTOL):
@@ -411,7 +393,7 @@ def reimage_with_loos(traj_fn, structure_fn, out_fn, top_fn=None,
                 f'center_selection {center_selection!r} matched no atoms')
 
     writer = _loos_writer(out_p)
-    timing = frame_timing(traj_p)
+    timing = util.frame_timing(traj_p)
     traj = pyloos.Trajectory(str(traj_p), model)
     n_written = 0
     for index, _ in enumerate(traj):
