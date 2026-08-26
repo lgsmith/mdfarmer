@@ -407,6 +407,14 @@ default_scheduler_log_names = {
     'lsf': 'lsf.out',
 }
 
+# Submit command -> the family the fstring tables are keyed by.
+scheduler_families = {
+    'sbatch': 'slurm',
+    'slurm': 'slurm',
+    'bsub': 'lsf',
+    'lsf': 'lsf',
+}
+
 
 def _format_exclude_slurm(nodes):
     if not nodes:
