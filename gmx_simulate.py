@@ -385,48 +385,57 @@ class MdrunFleet:
         return True
 
 
-def _run_mdrun(cmd, cwd, handle_preempt, poll_seconds=PREEMPT_POLL_SECONDS,
-               fleet=None, fleet_key=None):
-    """Run mdrun, passing on a preempt signal so it checkpoints before it dies.
-
-    With a fleet, the fleet owner watches the sentinel and this only registers
-    its process and reports whether a stop was signalled.
-    """
-    cwd = Path(cwd)
-    sentinel = cwd / PREEMPT_SENTINEL_NAME
-    if fleet is None and handle_preempt and sentinel.exists():
-        # Clear a stale sentinel from a previous preempted attempt in this gen
-        # dir. With a fleet the owner does this once, before any member starts.
-        sentinel.unlink()
-    print('[gmx mdrun]', ' '.join(map(str, cmd)), flush=True)
-    proc = sp.Popen([str(c) for c in cmd], cwd=str(cwd), text=True)
-    if fleet is not None:
-        fleet.register(fleet_key, proc)
+def _wait_in_fleet(proc, fleet, fleet_key):
+    """Wait for a packed mdrun. The fleet owner watches and signals; a member
+    only registers itself and reports whether a stop was called."""
+    fleet.register(fleet_key, proc)
     try:
-        while True:
-            try:
-                watching = handle_preempt or fleet is not None
-                rc = proc.wait(timeout=poll_seconds if watching else None)
-            except sp.TimeoutExpired:
-                if fleet is not None:
-                    # The fleet owner signals; just keep waiting for our exit.
-                    continue
-                if handle_preempt and sentinel.is_file():
-                    print('[gmx] preempt sentinel seen; SIGTERM -> mdrun '
-                          '(it will write a final checkpoint and stop).',
-                          flush=True)
-                    proc.send_signal(signal.SIGTERM)
-                    proc.wait()  # mdrun stops at next NS step and checkpoints
-                    raise Preempted(f'preempt sentinel at {sentinel}')
-                continue
-            break
+        rc = proc.wait()
     finally:
-        if fleet is not None:
-            fleet.unregister(fleet_key)
-    if fleet is not None and fleet.stopping:
+        fleet.unregister(fleet_key)
+    if fleet.stopping:
         # mdrun exits 0 after a clean SIGTERM stop, so the exit code alone
         # cannot distinguish "preempted" from "finished".
         raise Preempted(f'preempt sentinel at {fleet.sentinel}')
+    return rc
+
+
+def _wait_alone(proc, sentinel, poll_seconds=PREEMPT_POLL_SECONDS):
+    """Wait for a solo mdrun, watching for a sentinel. None means do not watch."""
+    if sentinel is None:
+        return proc.wait()
+    while True:
+        try:
+            return proc.wait(timeout=poll_seconds)
+        except sp.TimeoutExpired:
+            if not sentinel.is_file():
+                continue
+            print('[gmx] preempt sentinel seen; SIGTERM -> mdrun '
+                  '(it will write a final checkpoint and stop).', flush=True)
+            proc.send_signal(signal.SIGTERM)
+            proc.wait()          # mdrun stops at next NS step and checkpoints
+            raise Preempted(f'preempt sentinel at {sentinel}')
+
+
+def _run_mdrun(cmd, cwd, handle_preempt, poll_seconds=PREEMPT_POLL_SECONDS,
+               fleet=None, fleet_key=None,
+               sentinel_name=PREEMPT_SENTINEL_NAME):
+    """Run mdrun, passing on a preempt signal so it checkpoints before it dies."""
+    cwd = Path(cwd)
+    sentinel = None
+    if fleet is None and handle_preempt:
+        # A solo generation watches its own directory. Clear a stale sentinel
+        # from an earlier preempted attempt here; a pack's owner clears the
+        # pack's once, before any member starts.
+        sentinel = cwd / sentinel_name
+        if sentinel.exists():
+            sentinel.unlink()
+    print('[gmx mdrun]', ' '.join(map(str, cmd)), flush=True)
+    proc = sp.Popen([str(c) for c in cmd], cwd=str(cwd), text=True)
+    if fleet is not None:
+        rc = _wait_in_fleet(proc, fleet, fleet_key)
+    else:
+        rc = _wait_alone(proc, sentinel, poll_seconds=poll_seconds)
     if rc != 0:
         raise RuntimeError(f'gmx mdrun exited {rc}')
 
