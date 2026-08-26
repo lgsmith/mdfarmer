@@ -105,6 +105,18 @@ CHECKPOINT_MINUTES = 5
 # n_clones or two seeds draw the same initial velocities.
 GEN_SEED_STRIDE = 1000
 
+# Parameters gmx_pack injects into every gmx_generation call at runtime. A
+# config template records them too, so the file's copies must be dropped before
+# it is splatted -- otherwise the call gets two values for the same keyword.
+RUNTIME_ONLY_KEYS = ('fleet', 'fleet_key', 'grompp_lock')
+
+# Parameters a Clone fills in for each of its generations: four from
+# `Clone.from_disk` and `seed_fn` from `Clone.set_seed`. A driver builds its
+# template before any of them is known, so `gmx_config_template` supplies
+# placeholders; whatever it puts there is overwritten before a job reads it.
+CLONE_FILLED_KEYS = ('seed_index', 'clone_index', 'gen_index', 'seed_fn',
+                     'top_fn')
+
 # Seconds between preempt-sentinel polls while mdrun runs.
 PREEMPT_POLL_SECONDS = 5
 
@@ -662,6 +674,24 @@ def _previous_gen_tpr(top_level, seed_index, clone_index, gen_index,
             'its predecessor. An exact continuation needs the previous '
             "generation's tpr.")
     return prev_tpr
+
+
+def gmx_config_template(clone_filled_keys=CLONE_FILLED_KEYS,
+                        runtime_only_keys=RUNTIME_ONLY_KEYS, **overrides):
+    """A Farmer `config_template` recording the whole `gmx_generation` call.
+
+    Supplies placeholders for the parameters a Clone fills in per generation,
+    and omits the ones `gmx_pack` injects at runtime -- passing either through
+    to `gmx_generation` raises, so a driver would otherwise have to know both
+    lists. Everything else comes from `overrides` or the function's defaults.
+    """
+    placeholders = {key: (0 if key.endswith('_index') else '')
+                    for key in clone_filled_keys}
+    template = util.merge_args_defaults_dict(
+        gmx_generation, **{**placeholders, **overrides})
+    for key in runtime_only_keys:
+        template.pop(key, None)
+    return template
 
 
 def gmx_basic_sim_block_json(config):

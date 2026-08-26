@@ -12,7 +12,7 @@ from .seeder import *
 from . import gmx_simulate
 from .gmx_simulate import (gmx_generation, gmx_basic_sim_block_json,
                            gmx_try_recover_gen, gmx_gen_progress,
-                           default_gmx_run_script)
+                           gmx_config_template, default_gmx_run_script)
 # Reimaging is imported as a module, not splatted: it defines short names like
 # `box_vectors` and `bond_pairs` that would collide unhelpfully in the package
 # namespace, and callers read better as `reimage.reimage_trajectory(...)`.
@@ -40,7 +40,7 @@ __all__ = ['fdir', 'dir_seeds_clones', 'dir_seeds_clones_gens', 'omm_generation'
            'default_straight_sampling_init_config',
            'merge_args_defaults_dict', 'calx_remaining_steps', 'get_traj_len',
            'gmx_simulate', 'gmx_generation', 'gmx_basic_sim_block_json',
-           'gmx_try_recover_gen', 'gmx_gen_progress',
+           'gmx_try_recover_gen', 'gmx_gen_progress', 'gmx_config_template',
            'default_gmx_run_script', 'reimage',
            'gmx_pack', 'gmx_pack_sim_block_json', 'replica_mdrun_args',
            'write_pack_manifest', 'default_gmx_pack_run_script',

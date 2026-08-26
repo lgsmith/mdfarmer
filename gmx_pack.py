@@ -81,11 +81,8 @@ NTMPI = 1
 GMX_MPI_VERSION_KEY = 'MPI library:'
 GMX_THREAD_MPI_VALUE = 'thread_mpi'
 
-# Parameters gmx_pack injects into every gmx_generation call at runtime. A
-# config template built with merge_args_defaults_dict(gmx_generation, ...)
-# records them too, so the file's copies must be dropped before the config is
-# splatted -- otherwise the call gets two values for the same keyword.
-RUNTIME_ONLY_KEYS = ('fleet', 'fleet_key', 'grompp_lock')
+# Named by gmx_simulate, which owns the parameters.
+RUNTIME_ONLY_KEYS = gmx.RUNTIME_ONLY_KEYS
 
 # Seconds between preempt-sentinel polls while the pack runs.
 POLL_SECONDS = 5
