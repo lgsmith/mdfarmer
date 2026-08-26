@@ -97,6 +97,24 @@ def main(n_clones=N_CLONES):
     for name in ('a.gro', 'topol.top', 'base.mdp'):
         (work / name).write_text('placeholder\n')
 
+    suite.section('traj_list is resolved however it arrives')
+    relative = 'given-by-hand.txt'
+    template = make_template(work)
+    template.pop('traj_list')
+    farmer, _ = captured(lambda: make_farmer(work, template=template,
+                                             traj_list=relative))
+    suite.check('a relative traj_list argument is resolved against the cwd',
+                farmer.config_template['traj_list']
+                == str(Path(relative).resolve()),
+                f"-> {farmer.config_template['traj_list']}")
+    template = make_template(work)
+    template['traj_list'] = ''
+    farmer, _ = captured(lambda: make_farmer(work, template=template))
+    suite.check('an empty entry in the template falls back to traj_list.txt',
+                farmer.config_template['traj_list']
+                == str(Path('traj_list.txt').resolve()),
+                f"-> {farmer.config_template['traj_list']}")
+
     suite.section('a queued job whose name does not parse')
     farmer, _ = captured(lambda: make_farmer(work))
     farmer.scheduler_assoc_rep_cmd = "printf '77 someone-elses-job\\n'"

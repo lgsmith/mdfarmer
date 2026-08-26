@@ -402,15 +402,11 @@ class Farmer:
         self.active_clone_threshold = active_clone_threshold
         self.active_clone_set = set()
         self.failed_clone_set = set()
-        try:
-            traj_list = self.config_template['traj_list']
-            self.config_template['traj_list'] = str(Path(traj_list).resolve())
-        except KeyError:
-            if traj_list:
-                self.config_template['traj_list'] = traj_list
-            else:  # needs to be a fullpath to traj_list to append to, as string
-                self.config_template['traj_list'] = str(Path('traj_list.txt')
-                                                        .resolve())
+        # Every generation appends to this from its own gen directory, so it
+        # has to be one absolute path however it was given.
+        self.config_template['traj_list'] = str(Path(
+            self.config_template.get('traj_list') or traj_list
+            or 'traj_list.txt').resolve())
 
         rep_dict = self.reassociate_running_jobs()
 
