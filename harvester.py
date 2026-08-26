@@ -10,20 +10,18 @@ and, if both check out, replaces the original with a symlink to the dry stream.
 That last step is irreversible, so everything here is built around making it
 provably safe:
 
-**Counts, not file sizes.** The original guard was ``st_size > 0`` on both
-outputs. A harvest killed partway through the write loop -- preemption,
-walltime, OOM -- leaves both outputs nonzero and truncated, and the guard passes.
-Frames are counted in the source first, the expected output counts are computed
-from a single frame plan, and the written files are re-counted off disk before
-anything is unlinked.
+**Counts, not file sizes.** A harvest killed partway through the write loop
+-- preemption, walltime, OOM -- leaves both outputs nonzero and truncated, so
+``st_size > 0`` cannot decide whether one finished. Frames are counted in the
+source first, the expected output counts are computed from the frame plan, and
+the written files are re-counted off disk before anything is unlinked.
 
 **Idempotence.** After a successful harvest the original name is a symlink to
-the dry stream. Re-running the old code opened that symlink as input *and* the
-dry file as output -- same file, read and written at once, dry copy destroyed,
-original already gone. A requeueing scheduler makes re-runs routine, so a
-``.harvested`` sentinel carrying the counts is written last and short-circuits
-the whole thing; a symlinked input with no sentinel is recognised as a harvest
-that died in that window and is repaired rather than repeated.
+the dry stream, so a second pass would read the dry file and write it at the
+same time. A requeueing scheduler makes re-runs routine, so a ``.harvested``
+sentinel carrying the counts is written last and short-circuits the whole
+thing; a symlinked input with no sentinel is a harvest that died in that
+window, and is repaired rather than repeated.
 
 **Streaming.** Generations here run to ~1 microsecond. ``md.load`` is
 whole-trajectory: 240k frames of 10k atoms is 29 GB of coordinates before
@@ -31,11 +29,10 @@ imaging or slicing. The LOOS backend streams frame by frame; the mdtraj backend
 uses ``md.iterload``. Neither holds the trajectory.
 
 **Backend by box shape, decided by looking.** LOOS cannot represent a triclinic
-cell -- and does not raise, it silently keeps the diagonal (see ``reimage`` for
-the gory details) -- so the choice cannot be a try/except around the LOOS call;
-the exception would never fire on the case it exists to catch. The box is read
-off frame 0 and the off-diagonals decide: rectangular goes to LOOS, anything
-else to mdtraj.
+cell, and does not raise -- it keeps the diagonal (see ``reimage``). The choice
+therefore cannot be a try/except around the LOOS call, since nothing would be
+raised on the one case it exists to catch. The box is read off frame 0 and the
+off-diagonals decide: rectangular goes to LOOS, anything else to mdtraj.
 
 **One frame plan.** Which frames land in each stream is computed once, in
 ``frame_plan``, from the generation's *global* index -- so the downsample phase
@@ -53,16 +50,15 @@ from . import reimage
 
 
 # Written last, after both outputs are verified and the original is gone. Its
-# presence is what makes a harvest idempotent under a requeueing scheduler.
+# presence means the generation is harvested; a re-run stops on it.
 SENTINEL_NAME = '.harvested'
 
 # Output name prefixes, joined to the trajectory name with the config's `sep`.
 DRY_PREFIX = 'dry'
 DOWNSAMPLE_PREFIX = 'downsample'
 
-# Solute-only topology written beside the dry stream, so everything downstream
-# -- including get_traj_len's LOOS fallback, which would otherwise build the
-# model from the wet topology and choke on the atom count -- can read it.
+# Solute-only topology written beside the dry stream, so anything reading it
+# later -- get_traj_len's LOOS fallback included -- has a matching atom count.
 DRY_TOPOLOGY_NAME = 'dry-top.pdb'
 
 # Backend selectors for `harvest_generation`.
@@ -92,11 +88,8 @@ ANGSTROM_PER_NM = reimage.ANGSTROM_PER_NM
 
 
 class HarvestError(RuntimeError):
-    """Raised when a harvest cannot be completed safely.
-
-    Always raised *before* the original trajectory is removed, so a generation
-    that fails to harvest still holds everything it started with.
-    """
+    """Raised before the original trajectory is removed, so a generation that
+    fails to harvest still holds everything it started with."""
 
 
 class Harvester:
@@ -150,10 +143,9 @@ def check_commensurability(steps_per_gen, write_interval, downsample_frq):
     """Both spacing conditions, checked where a violation is still free to fix.
 
     ``steps_per_gen % write_interval == 0`` puts a generation's last written
-    frame exactly on the checkpoint the next generation restarts from. Miss it
-    and every seam silently drops the sliver of trajectory between the last
-    frame and the restart state -- invisible in the timestamps, real in the
-    sampling.
+    frame exactly on the checkpoint the next generation restarts from; without
+    it every seam drops the trajectory between the last frame and the restart
+    state, invisibly in the timestamps and really in the sampling.
 
     ``frames_per_gen % downsample_frq == 0`` keeps the downsampled stream evenly
     spaced across the concatenation. Generations are harvested independently, so
@@ -190,9 +182,8 @@ def resolve_seam(n_orig, frames_per_gen, gen_index, seam=SEAM_AUTO):
 
     Generation N+1 restarts from generation N's checkpoint; GROMACS writes a
     frame at that step, so the two files share a time point. Concatenating
-    without dropping one puts a repeated frame at every seam, which never fails
-    loudly -- it just biases lag times and kinetics, which is the entire point of
-    the dataset.
+    without dropping one repeats a frame at every seam, which biases lag times
+    and kinetics without ever failing loudly.
     """
     if seam == SEAM_KEEP:
         return False
@@ -252,22 +243,18 @@ def expected_counts(n_orig, first_global_index, downsample_frq, skip_first):
 def source_frame_timing(traj_fn, n_orig):
     """``(step0, steps_per_frame, time0, time_per_frame)`` read off the source.
 
-    Neither writer preserves this on its own, and the harvest deletes the
-    original, so getting it wrong destroys the time axis permanently rather
-    than merely inconveniently:
+    Both writers need this handed to them, and the harvest deletes the original,
+    so a wrong answer destroys the time axis rather than merely mislabelling it:
 
       * LOOS's XTCWriter numbers frames from its own counters -- ``dt_ = 1.0``,
         ``step_ = 0``, ``steps_per_frame_ = 1`` (``src/xtcwriter.hpp``) -- so
-        every harvested frame came out 1 ps apart and stamped with its frame
-        index instead of its MD step, whatever the trajectory actually held.
+        without an explicit step and time every frame lands 1 ps apart, stamped
+        with its frame index.
       * mdtraj carries ``time`` but fills ``step`` with the frame index unless
         told otherwise.
 
-    Both are fixed by reading the source's frame 0 and frame 1 and writing every
-    frame with an explicit step and time. The extrapolation is checked against
-    the *last* frame before it is used, because it is only valid if the source
-    is evenly spaced -- which a generation always is, but which is exactly the
-    assumption you want to hear about rather than trust.
+    The extrapolation from frames 0 and 1 is only valid if the source is evenly
+    spaced, so it is checked against the last frame before it is used.
 
     Returns None for a format that carries no per-frame timing (DCD keeps it in
     the header, and mdtraj does not surface it on read).
@@ -307,9 +294,8 @@ def select_backend(traj_fn, structure_fn=None, backend=BACKEND_AUTO,
     """Pick a backend by looking at the box, not by catching an exception.
 
     LOOS does not raise on a triclinic cell; it keeps the diagonal and carries
-    on. A try/except around the LOOS call would therefore never fire on the one
-    case it was written for, so the off-diagonals are read first and the choice
-    is made before either engine is touched.
+    on. Nothing would reach a try/except around the LOOS call, so the
+    off-diagonals are read first and the choice made before either engine runs.
     """
     if backend != BACKEND_AUTO:
         if backend not in (BACKEND_LOOS, BACKEND_MDTRAJ):
@@ -349,9 +335,8 @@ def indices_to_loos_selection(indices):
 
     Going through a selection string rather than assembling a group atom by atom
     is not stylistic: ``AtomicGroup::select`` shares the parent's
-    SharedPeriodicBox, and a hand-built group does not. A dry trajectory written
-    from a group with its own box gets a frozen (or absent) cell, which is
-    exactly the sort of thing found two years later.
+    SharedPeriodicBox, and a hand-built group does not -- it would write a
+    frozen or absent cell into the dry stream.
     """
     runs, start, previous = [], None, None
     for index in sorted(indices):
@@ -465,11 +450,9 @@ def _harvest_mdtraj(traj_fn, structure_fn, subset_spec, dry_out, down_out,
                     angstrom_per_nm=ANGSTROM_PER_NM):
     """Same plan, chunked. Handles the cells LOOS cannot represent.
 
-    ``md.iterload`` is what keeps this off the heap, but it introduces its own
-    trap: the downsample must be driven by a running global frame index, not by
-    slicing each chunk ``[::N]``. Per-chunk slicing resets the phase at every
-    chunk boundary -- the same bug as a per-generation phase reset, just finer
-    grained and harder to see.
+    ``md.iterload`` keeps this off the heap. The downsample must be driven by
+    the running global frame index rather than by slicing each chunk ``[::N]``,
+    which would reset the phase at every chunk boundary.
     """
     import numpy as np
     import mdtraj as md
@@ -526,8 +509,6 @@ class _MdtrajWriter:
     """Append-as-you-go writer, because Trajectory.save() cannot append.
 
     XTC carries nm and a 3x3 box; DCD carries Angstroms and lengths/angles.
-    Getting that wrong writes a trajectory scaled by ten, which looks fine until
-    someone measures something.
     """
 
     def __init__(self, out_p, angstrom_per_nm=ANGSTROM_PER_NM):
@@ -694,11 +675,10 @@ def harvest_generation(config_fn, harvester_config_fn,
 def _steps_per_gen(config, hconfig):
     """The full generation length, which is not always ``config['steps']``.
 
-    On a resumed generation ``config['steps']`` has been narrowed to the steps
-    still owed, so reading it would shorten frames_per_gen and put every
-    subsequent generation's global frame index -- and therefore the downsample
-    phase -- in the wrong place. `Clone.from_disk` records the untouched value
-    as ``steps_per_gen``; hand-built configs may predate it.
+    On a resumed generation ``config['steps']`` is the steps still owed, which
+    would shorten frames_per_gen and misplace every later generation's global
+    frame index, and with it the downsample phase. `Clone` records the untouched
+    value as ``steps_per_gen``.
     """
     for source, key in ((hconfig, 'steps_per_gen'), (config, 'steps_per_gen')):
         if source.get(key) is not None:
@@ -716,10 +696,9 @@ def _verify_counts(traj_p, dry_p, down_p, dry_top_p, structure_fn, n_orig,
                    n_seen, n_dry, n_down, n_dry_expected, n_down_expected):
     """Check written frames against the plan, on disk, before anything is lost.
 
-    Both the in-loop tallies and the files themselves are checked. The tallies
-    catch a plan/backend disagreement; re-reading the files catches a writer
-    that returned normally having flushed less than it was handed, which is what
-    a job killed inside the write loop looks like.
+    The in-loop tallies catch a plan/backend disagreement; re-reading the files
+    catches a writer that returned normally having flushed less than it was
+    handed, which is what a job killed inside the write loop looks like.
     """
     problems = []
     if n_seen != n_orig:
@@ -731,10 +710,9 @@ def _verify_counts(traj_p, dry_p, down_p, dry_top_p, structure_fn, n_orig,
     if n_down != n_down_expected:
         problems.append(
             f'wrote {n_down} downsampled frames, planned {n_down_expected}')
-    # Each stream gets the topology that actually describes it: the dry stream
-    # is the subset, the downsampled stream is still the whole system. Only the
-    # LOOS fallback consults them, but handing it the wrong one turns a healthy
-    # harvest into a spurious refusal.
+    # Each stream gets the topology that describes it: the dry stream is the
+    # subset, the downsampled stream is still the whole system. Only the LOOS
+    # fallback consults them, and the wrong one reads as a truncated harvest.
     dry_on_disk = util.get_traj_len(
         dry_p, dry_top_p if dry_top_p.is_file() else None)
     down_on_disk = util.get_traj_len(down_p, structure_fn)
@@ -757,9 +735,8 @@ def _repair_from_symlink(traj_p, dry_p, down_p, sentinel_p, dry_top_p,
                          first_global_index, downsample_frq, seam=SEAM_AUTO):
     """Finish a harvest that unlinked the original and then died.
 
-    The window is small but a requeueing scheduler will find it. The outputs
-    are checked against the same plan the original harvest would have used; if
-    they match, the sentinel that was never written gets written now.
+    The outputs are checked against the same plan the harvest would have used;
+    if they match, the missing sentinel is written now.
     """
     if not (dry_p.is_file() and down_p.is_file()):
         raise HarvestError(
@@ -804,9 +781,8 @@ def unharvested_gen_dirs(top_level, sentinel_name=SENTINEL_NAME,
                          config_name='config.json'):
     """Generation directories that ran but carry no harvest sentinel.
 
-    Harvest failures are deliberately swallowed by the tender -- losing a
-    harvest must not stop a campaign -- and the harvest job's own exit status is
-    never observed by anything. This is how you find out.
+    The tender swallows harvest failures so a lost harvest cannot stop a
+    campaign, and nothing observes the harvest job's exit status. This does.
     """
     top = Path(top_level)
     stale = []
@@ -838,9 +814,9 @@ def verify_dry_chain(gen_dirs, structure_fn=None, sentinel_name=SENTINEL_NAME,
                      dry_prefix=DRY_PREFIX, scan_chunk=reimage.SCAN_CHUNK):
     """Check the harvested stream of a clone is contiguous and unduplicated.
 
-    The seam convention never fails loudly, so it gets asserted: across N
-    harvested generations the dry stream must hold ``N * frames_per_gen + 1``
-    frames, and no two consecutive frames may carry the same time.
+    Across N harvested generations the dry stream holds
+    ``N * frames_per_gen + 1`` frames, and no two consecutive frames carry the
+    same time. Neither fails loudly on its own, hence the check.
     """
     import numpy as np
     import mdtraj as md

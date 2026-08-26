@@ -325,10 +325,9 @@ class Clone:
         self.job_number_re = re.compile(job_number_re)
         self.compare_keys = compare_keys
         self.harvester = harvester
-        # The harvest reads the full generation length out of config.json, and
-        # config['steps'] is not it -- on a resume that has been narrowed to the
-        # steps still owed. Pin the untouched value here so every construction
-        # path records it, not just from_disk.
+        # The harvest reads the full generation length from config.json, and
+        # config['steps'] is the steps still owed on a resume. Record the
+        # untouched value on every construction path.
         if config.get('steps_per_gen') is None:
             config['steps_per_gen'] = self.total_steps
         elif config['steps_per_gen'] != self.total_steps:
@@ -370,11 +369,9 @@ class Clone:
                   top_fn: str,
                   system_fn: str,
                   # The .gro/.pdb this seed's generation 0 is grompp'd from.
-                  # Shared-template-only meant a GROMACS Farmer with n_seeds > 1
-                  # built EVERY seed's gen 0 from seed 0's structure, while the
-                  # directory names and the copied seed file all said otherwise.
-                  # Nothing raised; the trajectories simply were not the systems
-                  # they claimed to be. None leaves the template's value alone.
+                  # Per-seed, because one shared template value can only be
+                  # right for one seed and nothing downstream would notice.
+                  # None leaves the template's value alone.
                   structure_fn: str = None,
                   # The Farmer's full config_template. Read-only here; we
                   # deepcopy before mutating.
@@ -834,21 +831,16 @@ class ClonePack:
         self.cpus_per_task = int(cpus_per_task)
         self.pack_manifest_name = pack_manifest_name
         self.job_number_re = re.compile(job_number_re)
-        # A pack's job name has to parse under the SAME scheme the Farmer uses
-        # to re-associate running jobs at boot: int() over
-        # name.split(sep)[-3:] for (seed, clone, gen). The old default,
-        # '{title}-pack-{seed_index}-{clone_index}', had no gen_index and
-        # hardcoded '-' whatever `sep` was, so it never parsed -- the rebuilt
-        # pack came back with job_number=None and the very first tick submitted
-        # a SECOND job into the pack directory of a job that was still running.
-        # Two mdruns sharing one -cpi/-cpo checkpoint and one part-number
-        # sequence is the single failure a checkpoint cannot recover from.
+        # The name must parse under the scheme Farmer re-associates by at
+        # boot: int() over name.split(sep)[-3:] for (seed, clone, gen). A name
+        # that does not parse leaves job_number None, and the next tick puts a
+        # second job in this pack directory -- two mdruns on one checkpoint and
+        # one part-number sequence, which no checkpoint recovers from.
         self.sep = clones[0].sep if sep is None else sep
         self.job_name_fstring = (job_name_fstring
                                  or self.sep.join(job_name_elements))
-        # Member 0's config is what renders that name, so member 0's
-        # re-associated job number IS the pack's. Adopting it here rather than
-        # leaving it to each driver is what actually closes the window.
+        # Member 0's config renders that name, so its re-associated job
+        # number is the pack's.
         if job_number is None:
             job_number = next((c.job_number for c in self.clones
                                if c.job_number is not None), None)

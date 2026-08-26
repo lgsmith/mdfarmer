@@ -61,20 +61,15 @@ PACK_STATUS_NAME = 'pack_status.json'
 PER_REPLICA_MDRUN_FLAGS = {'-ntomp': 1, '-pin': 1, '-pinoffset': 1,
                            '-pinstride': 1, '-ntmpi': 1, '-nt': 1}
 
-# Thread-MPI ranks per replica. Stripping -ntmpi without emitting a replacement
-# lets mdrun choose its own decomposition from every core it can SEE rather than
-# the ones this replica was given: measured, a 2-replica pack with -ntomp 8 on a
-# 32-core box came up "On 4 MPI ranks, each using 8 OpenMP threads" -- 32 threads
-# for one replica of a pack allocated 16 cores between them, and the pinning
-# offsets then describe nothing. One GPU per member means one rank is right.
+# Thread-MPI ranks per replica. Without it a thread-MPI mdrun picks its own
+# decomposition from every core it can SEE rather than the ones this replica was
+# given -- several ranks of -ntomp threads each, and pinning offsets that then
+# describe nothing. One GPU per member means one rank.
 #
-# It can only be EMITTED on a thread-MPI build, though. A real-MPI build takes
-# its rank count from mpirun and rejects the flag outright ("Setting the number
-# of thread-MPI ranks is only supported with thread-MPI"), which would turn this
-# fix into a fatal error on every site that runs a gmx_mpi. Such a build already
-# gets one rank per replica anyway, because the pack launches mdrun directly
-# rather than under mpirun -- so the flag is both unusable and unnecessary
-# there. `gmx_supports_ntmpi` decides which case this is, once per job.
+# Only a thread-MPI build accepts the flag; a real-MPI build takes its rank
+# count from mpirun and makes it fatal. Such a build already gets one rank per
+# replica, since the pack launches mdrun directly rather than under mpirun, so
+# `gmx_supports_ntmpi` decides once per job whether to emit it at all.
 #
 # '-nt' is stripped for a related reason: it fixes TOTAL threads, so it cannot
 # vary per replica and goes fatal the moment two members differ in size.
@@ -86,13 +81,9 @@ GMX_MPI_VERSION_KEY = 'MPI library:'
 GMX_THREAD_MPI_VALUE = 'thread_mpi'
 
 # Parameters gmx_pack injects into every gmx_generation call at runtime. A
-# driver that builds its config template with
-# merge_args_defaults_dict(gmx_generation, ...) -- the pattern this repo's own
-# README recommends, because it makes config.json a complete record of the call
-# -- writes these into the file as well. Splatting the file's copy alongside the
-# injected one is "got multiple values for keyword argument", and it kills every
-# replica on the first packed job. The solo entry point injects nothing, which
-# is why the asymmetry survived review: the packed path had never been run.
+# config template built with merge_args_defaults_dict(gmx_generation, ...)
+# records them too, so the file's copies must be dropped before the config is
+# splatted -- otherwise the call gets two values for the same keyword.
 RUNTIME_ONLY_KEYS = ('fleet', 'fleet_key', 'grompp_lock')
 
 # Seconds between preempt-sentinel polls while the pack runs.
@@ -160,10 +151,8 @@ def gmx_supports_ntmpi(gmx_bin=gmx.GMX_BIN,
     """True when this GROMACS is a thread-MPI build, so -ntmpi is legal.
 
     `gmx -version` reports either ``MPI library: thread_mpi`` or ``MPI library:
-    MPI (...)``. Only the first accepts -ntmpi; the second makes it fatal. On a
-    binary that cannot be probed at all, returns False -- not emitting the flag
-    costs a correct-by-construction rank count on thread-MPI, while emitting it
-    wrongly kills the job.
+    MPI (...)``. Only the first accepts -ntmpi; the second makes it fatal, so an
+    unprobeable binary returns False.
     """
     try:
         result = sp.run([gmx_bin, '-version'], capture_output=True, text=True,
@@ -288,10 +277,8 @@ def gmx_pack_sim_block_json(manifest_fn=PACK_MANIFEST_NAME,
         try:
             conf = json.loads(Path(config_fn).read_text())
             traj_list = Path(conf.pop('traj_list'))
-            # Drop the file's copies of exactly the keys we are about to
-            # inject. Deriving the drop list from the injected dict rather than
-            # naming it twice is what stops a future runtime parameter from
-            # quietly reintroducing the collision.
+            # Drop the file's copies of exactly the keys being injected,
+            # derived from the injected dict so the two cannot drift apart.
             runtime_kwargs = dict(fleet=fleet, fleet_key=index,
                                   grompp_lock=grompp_lock)
             if set(runtime_kwargs) != set(runtime_only_keys):

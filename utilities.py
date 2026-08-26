@@ -82,11 +82,10 @@ def get_traj_len(traj_fn, top_fn, dry_topology_name=DRY_TOPOLOGY_NAME):
     need it, which is what makes this work for GROMACS runs whose `top_fn` is a
     `.top`.
 
-    The fallback tries the harvester's solute-only topology as well, because
-    after a harvest the trajectory name is a symlink to a *stripped* copy: LOOS
-    built from the wet `top_fn` would hit an atom-count mismatch, get swallowed
-    by the broad except below, and report 0 frames -- from which the tender
-    concludes the generation never ran.
+    The fallback tries the harvester's solute-only topology as well: after a
+    harvest the trajectory name is a symlink to a stripped copy, and LOOS built
+    from the wet `top_fn` would hit an atom-count mismatch, be swallowed by the
+    broad except below, and report 0 frames -- which reads as "never ran".
     """
     traj_p = Path(traj_fn)
     if not traj_p.is_file() or traj_p.stat().st_size == 0:
@@ -117,9 +116,7 @@ def get_traj_len(traj_fn, top_fn, dry_topology_name=DRY_TOPOLOGY_NAME):
 
 """
 The harvest itself lives in `harvester.harvest_generation`; these two names are
-kept because they are what existing submit scripts call. Both now pin a backend
-and hand off, so an old script gets the frame-count guard, the sentinel and the
-seam handling without being rewritten.
+what existing submit scripts call, and each pins a backend and hands off.
 
 hconfig keys:
  - `'harvester_subset'`: selection string for the solute (LOOS syntax by
@@ -275,13 +272,11 @@ basic_scheduler_fstrings_mps = {
                 echo "NODE: $SLURMD_NODENAME"
                 echo "GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | paste -sd, -)"
 
-                # Refuse to be the second job in this pack directory. Job-name
-                # re-association can still miss -- a job that finishes its
-                # generation's steps before the tender's next tick comes back
-                # under a different gen_index -- and for a pack both jobs would
-                # share one pack.json, one checkpoint and one part-number
-                # sequence. That is the one failure -cpi cannot undo, so it gets
-                # a lock as well as a name. Held on fd 9 for the job's lifetime.
+                # Refuse to be the second job in this pack directory: both
+                # would share one pack.json, one checkpoint and one part-number
+                # sequence, which -cpi cannot undo. Job-name re-association can
+                # still miss a live job whose generation has moved on, so the
+                # lock backs it up. Held on fd 9 for the job's lifetime.
                 exec 9>pack.lock
                 if ! flock -n 9; then
                     echo "PACK LOCK: another job already holds $(pwd)/pack.lock; exiting rather than putting a second mdrun on this checkpoint."
@@ -744,16 +739,13 @@ def calx_remaining_steps(traj_fn, top_fn, total_steps, write_interval):
 def merge_args_defaults_dict(function, **kwargs):
     """A config dict recording the full call: every parameter and its value.
 
-    Two things are deliberately not in the result, because both used to arrive
-    in config.json and neither survives json.dumps:
+    Two things stay out of the result, since both would carry the sentinel
+    `inspect._empty` -- a class, which json.dumps cannot write:
 
-    * ``**kwargs``-style catch-alls (``gmx_generation`` has ``**_unused``).
-      A VAR_KEYWORD parameter has no default -- it collects leftovers -- so it
-      came through as the sentinel `inspect._empty`, which is a *class*.
+    * ``**kwargs``-style catch-alls (``gmx_generation`` has ``**_unused``),
+      which have no default because they collect leftovers;
     * parameters with no default that the caller did not supply. Those are
-      required arguments, and leaving `inspect._empty` in the dict turned a
-      missing-argument mistake into "Object of type type is not JSON
-      serializable" several steps later. They are named in the error instead.
+      required arguments, and are named in a TypeError instead.
     """
     sig = inspect.signature(function)
     variadic = (inspect.Parameter.VAR_KEYWORD, inspect.Parameter.VAR_POSITIONAL)
@@ -854,8 +846,7 @@ default_straight_sampling_init_config = dict(
 #  make two trajs--one stripped of solvent, the _other_ downsampled by some integer factor but not dried.
 # `harvest_generation` picks its backend from the box on the trajectory, so the
 # same script is right for a rectangular cell (LOOS, streaming) and a triclinic
-# one (mdtraj, chunked). It is idempotent: a requeued harvest job that already
-# ran is a no-op, not a second pass over its own output.
+# one (mdtraj, chunked). A requeued harvest job that already ran is a no-op.
 default_harvest_shellscript = inspect.cleandoc("""#!/bin/bash
                 #BSUB -J harvest
                 #BSUB -o harvest.out

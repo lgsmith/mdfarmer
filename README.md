@@ -247,11 +247,11 @@ for. The off-diagonals are read off frame 0 and the choice is made before either
 engine is touched. Neither path holds the trajectory in memory: a 1 µs
 generation at 10 ps sampling is ~29 GB of coordinates.
 
-**Frames are counted, not sized.** The old guard was `st_size > 0` on both
-outputs, which a harvest killed mid-write passes — and then the original is
-deleted. Now the source is counted first, the output counts are *computed* from
-the frame plan, and the written files are re-counted off disk. Any mismatch
-raises and leaves the original alone.
+**Frames are counted, not sized.** A harvest killed mid-write leaves both
+outputs nonzero and truncated, so size cannot decide whether one finished. The
+source is counted first, the output counts are *computed* from the frame plan,
+and the written files are re-counted off disk. Any mismatch raises and leaves
+the original alone.
 
 **It is idempotent.** A `.harvested` sentinel carrying the counts is written
 last; a re-run short-circuits on it. A generation whose original is already a
@@ -282,14 +282,14 @@ is driven by a *global* frame index so it does not reset at each boundary. The
 OpenMM reporters do not write that frame; the convention is detected from the
 frame count rather than assumed.
 
-**The time axis is carried through.** Worth knowing if you have older harvested
-data: LOOS's `XTCWriter` numbers frames from its own counters (`dt_ = 1.0`,
-`step_ = 0`, `steps_per_frame_ = 1`), so it used to stamp every harvested frame
-1 ps apart and label it with its frame index instead of its MD step — and since
-the harvest deletes the original, that destroyed the real time axis rather than
-merely mislabelling it. mdtraj kept `time` but filled `step` with the frame
-index. Both backends now read the source's step and time and write them
-explicitly, verified against the source's last frame.
+**The time axis is carried through.** LOOS's `XTCWriter` numbers frames from
+its own counters (`dt_ = 1.0`, `step_ = 0`, `steps_per_frame_ = 1`) and mdtraj
+fills `step` with the frame index, so both backends read the source's step and
+time and write them explicitly, verified against the source's last frame.
+
+> Trajectories harvested before this was in place carry a fabricated time axis —
+> 1 ps per frame, stamped with the frame index. Recompute from the generation's
+> `write_interval` and `dt`; the coordinates are fine.
 
 Two things to check on a campaign after the fact:
 
