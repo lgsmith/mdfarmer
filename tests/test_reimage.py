@@ -14,6 +14,14 @@ WRITE_INTERVAL = 100
 ANGSTROM_PER_NM = 10.0
 
 
+def _refuses(call, *args):
+    try:
+        call(*args)
+    except ValueError:
+        return True
+    return False
+
+
 def main(steps=STEPS, write_interval=WRITE_INTERVAL,
          angstrom_per_nm=ANGSTROM_PER_NM, gmx_bin=harness.GMX_BIN):
     import mdtraj as md
@@ -71,6 +79,15 @@ def main(steps=STEPS, write_interval=WRITE_INTERVAL,
           f'as .dcd', flush=True)
     suite.check('a .dcd is not falsely flagged as one long bond per bond',
                 n_dcd == n_xtc, f'-> {n_dcd} vs {n_xtc}')
+    suite.section('the topology is reachable wherever its force field lives')
+    out_inc, _ = reimage.reimage_with_loos(
+        traj, structure_fn=str(structure), out_fn=str(work / 'inc.xtc'),
+        top_fn=str(topology), include_dir=str(gmx_top), verify=True)
+    suite.check('include_dir reaches molecule_ranges and the bond check',
+                out_inc.is_file())
+    suite.check('gromacs_topology refuses anything but a .top',
+                _refuses(reimage.gromacs_topology, str(structure)))
+
     suite.section('molecules come back whole, never imaged atom by atom')
     # GROMACS writes whatever the integrator holds, so its own output already
     # has molecules cut across box faces.
