@@ -716,7 +716,14 @@ def is_state_xml_usable(p: Path) -> bool:
 
 def state_xml_step_count(p: Path) -> int:
     import xml.etree.ElementTree as ET
-    root = ET.parse(p).getroot()
+    try:
+        root = ET.parse(p).getroot()
+    except ET.ParseError as exc:
+        # The caller cascades to an older generation on ValueError. ParseError
+        # is a SyntaxError, so raising it as it comes escapes that guard and the
+        # clone is dropped for the rest of the run instead.
+        raise ValueError(f'state.xml at {p} is not parseable XML, so the step '
+                         f'it stopped at cannot be read: {exc}') from exc
     sc = root.attrib.get('stepCount')
     if sc is None:
         raise ValueError(f'state.xml at {p} has no stepCount attribute '

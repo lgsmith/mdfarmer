@@ -54,9 +54,32 @@ def check_topology_reader(suite, readers=None):
                 f'-> {said.getvalue().strip()!r}')
 
 
+def check_state_xml_step_count(suite, work):
+    suite.section('the step a state.xml stopped at')
+    good = work / 'good-state.xml'
+    good.write_text('<State stepCount="1200" time="4.8"></State>')
+    suite.check('a well-formed state gives its step count',
+                util.state_xml_step_count(good) == 1200)
+
+    # A state.xml written by a job the scheduler killed mid-write.
+    truncated = work / 'truncated-state.xml'
+    truncated.write_text('<State stepCount="1200" tim')
+    exc = raises(util.state_xml_step_count, truncated)
+    suite.check('an unparseable state.xml raises the ValueError the caller '
+                'cascades on', isinstance(exc, ValueError),
+                f'-> {type(exc).__name__}')
+
+    old = work / 'old-state.xml'
+    old.write_text('<State time="4.8"></State>')
+    suite.check('a state with no stepCount also raises ValueError',
+                isinstance(raises(util.state_xml_step_count, old), ValueError))
+
+
 def main():
     suite = Suite('utilities_guards')
+    work = harness.workdir('utilities_guards')
     check_topology_reader(suite)
+    check_state_xml_step_count(suite, work)
     return suite.report()
 
 
