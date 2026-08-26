@@ -1,47 +1,20 @@
-"""Reimage trajectories so molecules are not broken by periodic boundaries.
+"""Put molecules back together after periodic boundaries have split them.
 
-GROMACS writes whatever coordinates the integrator holds. Depending on rank
-count, update-group size and molecule size, molecules in the raw ``.xtc`` may be
-split across a periodic boundary (or may simply have wandered outside the box).
-Either way, any per-molecule geometry computed on the raw trajectory -- radius of
-gyration, RMSD, contacts, a picture -- is wrong. This module makes molecules
-whole again.
+GROMACS writes whatever coordinates the integrator is holding, so a molecule can
+come out cut in half across a box face. Anything you then measure per molecule
+is wrong: radius of gyration, RMSD, contacts, a picture.
 
-Two backends, because the right tool depends on the unit cell:
+Two backends. LOOS handles rectangular boxes and is refused anything else, since
+its periodic box is three numbers and it keeps only the diagonal of a triclinic
+one without complaining. Anything else goes to gmx trjconv, which does triclinic
+correctly. reimage_trajectory reads the box and picks for you.
 
-  * ``'loos'`` -- LOOS, for **orthorhombic** ("box") cells only. LOOS's periodic
-    box is a ``GCoord``: three numbers (``src/PeriodicBox.hpp``). It has no
-    triclinic representation at all, and its readers silently keep only the
-    diagonal of a triclinic box -- ``xtc.cpp`` builds the box from elements
-    0/4/8 of the 3x3 and discards the rest, and ``gro.cpp`` parses only the
-    first three fields of the nine-field box line. Fed a rhombic dodecahedron,
-    LOOS reports a rectangular cell, raises nothing, and every minimum-image
-    calculation downstream is quietly wrong. So this backend *refuses* to run on
-    a non-orthorhombic cell rather than producing plausible garbage.
+Which atoms make up a molecule always comes from the GROMACS topology, never
+from LOOS. A .gro carries no bonds, and LOOS treats a model with no bonds as one
+single molecule, so reimaging would quietly become one system-wide shift.
 
-  * ``'trjconv'`` -- shells out to ``gmx trjconv -pbc mol -ur compact``, which
-    handles triclinic cells correctly. This is the right backend for
-    dodecahedral / truncated-octahedral / general triclinic boxes.
-
-``reimage_trajectory`` picks between them from the actual box read off the
-trajectory, so the common case needs no decision from the caller.
-
-Molecule membership never comes from LOOS. A GROMACS ``.gro`` carries no bonds,
-and a bondless LOOS model makes ``splitByMolecule()`` return **one group holding
-the entire system** (``AtomicGroup.cpp``, "If no connectivity, just return the
-entire group") -- reimaging then degenerates into a single system-wide
-translation that looks like it worked. Bond connectivity alone is not enough
-either: a TIP4P-ice virtual site is bonded to nothing, so connected components
-over bonds strand every ``MW`` in its own "molecule" and fling virtual sites
-across the box. Instead, molecule blocks are read from the GROMACS topology via
-``openmm.app.GromacsTopFile``, whose chains reproduce the ``[ molecules ]``
-section exactly (verified on a 4-site-water + ion system: sizes {304: 1, 4:
-3240, 1: 1}, tiling the atom index range with no gaps).
-
-Nothing here ever writes over its input. The orchestrator counts frames in the
-raw trajectory to decide whether a generation is finished, so clobbering it --
-or replacing it with a symlink to a stripped copy -- would corrupt the restart
-bookkeeping of a run that is still in flight.
+Nothing here overwrites its input: the orchestrator counts frames in the raw
+trajectory to decide whether a generation has finished.
 """
 
 import shutil
@@ -51,9 +24,8 @@ from pathlib import Path
 import numpy as np
 
 
-# A box is treated as triclinic when any off-diagonal element of the 3x3 box
-# matrix exceeds this, relative to the largest diagonal element. GROMACS writes
-# exact zeros for a rectangular cell, so this only has to clear float noise.
+# Largest off-diagonal box element, relative to the diagonal, still counted as
+# rectangular. GROMACS writes exact zeros, so this only clears float noise.
 TRICLINIC_RTOL = 1e-6
 
 # Backend selectors for `reimage_trajectory`.
@@ -61,10 +33,8 @@ BACKEND_AUTO = 'auto'
 BACKEND_LOOS = 'loos'
 BACKEND_TRJCONV = 'trjconv'
 
-# `gmx trjconv` flags. '-pbc mol' puts each molecule's centre of mass in the box
-# and makes the molecule whole (it needs a .tpr for molecule definitions);
-# '-ur compact' is what makes a dodecahedral / octahedral cell come out as the
-# compact unit cell rather than the triclinic parallelepiped.
+# trjconv flags. '-pbc mol' makes each molecule whole and puts its centre of
+# mass in the box; '-ur compact' gives a dodecahedron its compact shape.
 TRJCONV_PBC = 'mol'
 TRJCONV_UR = 'compact'
 
@@ -94,11 +64,8 @@ class BoxTypeError(ValueError):
 
 
 def _read_gro_box_vectors(structure_fn):
-    """Parse the final line of a .gro file into a 3x3 box matrix (nm).
-
-    The GROMACS .gro box line is ``v1x v2y v3z [v1y v1z v2x v2z v3x v3y]`` --
-    three fields for a rectangular cell, nine for a triclinic one.
-    """
+    """Parse the last line of a .gro file into a 3x3 box matrix, in nm."""
+    # The box line is v1x v2y v3z, plus six more fields when triclinic.
     last = None
     with open(structure_fn) as f:
         for line in f:
@@ -122,14 +89,10 @@ def _read_gro_box_vectors(structure_fn):
 
 def box_vectors(traj_fn=None, structure_fn=None,
                 angstrom_per_nm=ANGSTROM_PER_NM):
-    """Return the 3x3 box matrix (nm) for a trajectory, falling back to a
-    structure file.
+    """The 3x3 box in nm, from the trajectory if there is one, else the structure.
 
-    The trajectory is authoritative -- under a barostat the cell drifts away
-    from whatever the starting structure recorded -- so the first frame is read
-    when a trajectory is given. mdtraj is used because it reads the full 3x3;
-    LOOS deliberately is not, since it would hand back the diagonal of a
-    triclinic cell without complaint and defeat the whole point of this check.
+    The trajectory wins because a barostat moves the cell away from whatever the
+    starting structure recorded. Read with mdtraj, which gives the full 3x3.
     """
     if traj_fn is not None:
         vectors = _box_from_first_frame(
@@ -144,13 +107,9 @@ def box_vectors(traj_fn=None, structure_fn=None,
 
 
 def _box_from_first_frame(traj_p, angstrom_per_nm=ANGSTROM_PER_NM):
-    """3x3 box (nm) from a trajectory's first frame, or None if it carries none.
-
-    The raw mdtraj readers return different tuples per format and in different
-    units, so dispatch explicitly rather than guessing from array shapes: XTC
-    gives ``(xyz, time, step, box)`` with the box already a 3x3 in nm, while DCD
-    gives ``(xyz, cell_lengths, cell_angles)`` with lengths in Angstroms.
-    """
+    """3x3 box in nm from a trajectory's first frame, or None if it has none."""
+    # Each format is handled by name, not by guessing at array shapes: XTC gives
+    # a 3x3 in nm, DCD gives lengths and angles in Angstroms.
     import mdtraj
     from mdtraj.utils import lengths_and_angles_to_box_vectors
     suffix = traj_p.suffix.lower()
@@ -183,14 +142,11 @@ def is_orthorhombic(box, triclinic_rtol=TRICLINIC_RTOL):
 
 
 def molecule_ranges(top_fn, include_dir=None):
-    """Return ``[(start, stop), ...]`` atom index ranges, one per molecule.
+    """[(start, stop), ...] atom index ranges, one per molecule in the topology.
 
-    Read from the GROMACS topology through ``openmm.app.GromacsTopFile``: its
-    chains are one-per-molecule-instance and reproduce the ``[ molecules ]``
-    section, including molecules whose atoms carry no bonds at all (bare ions,
-    4-site-water virtual sites). Ranges are returned sorted and are verified to
-    tile ``[0, n_atoms)`` without gaps or overlaps, which is the invariant the
-    LOOS backend relies on.
+    Read through openmm.app.GromacsTopFile, whose chains match the [ molecules ]
+    section even for molecules with no bonds, such as bare ions. Checked to
+    cover every atom exactly once, which the LOOS backend relies on.
     """
     from openmm import app
     top_p = Path(top_fn).resolve()
@@ -234,12 +190,9 @@ def molecule_ranges(top_fn, include_dir=None):
 
 
 def bond_pairs(top_fn, include_dir=None):
-    """``(n_bonds, 2)`` array of bonded atom index pairs from a GROMACS topology.
-
-    Connectivity comes from the topology rather than from a distance cutoff on
-    the first frame: inferring bonds geometrically is exactly backwards when the
-    thing you are trying to detect is a frame whose geometry is wrong.
-    """
+    """(n_bonds, 2) array of bonded atom index pairs, read from the topology."""
+    # Not guessed from distances in the first frame: the thing being looked for
+    # is a frame whose geometry is wrong, so its distances cannot be trusted.
     from openmm import app
     top_p = Path(top_fn).resolve()
     kwargs = {} if include_dir is None else {'includeDir': str(include_dir)}
@@ -255,23 +208,17 @@ def bond_pairs(top_fn, include_dir=None):
 
 def check_bond_lengths(traj_fn, top_fn=None, pairs=None, max_bond=MAX_BOND,
                        stride=1, scan_chunk=SCAN_CHUNK, stop_early=True):
-    """Find bonded pairs stretched further than a chemical bond can reach.
+    """Find bonds longer than a chemical bond can be, one per split molecule.
 
-    This is the physical invariant that says whether a trajectory is imaged
-    correctly, and it is deliberately independent of *which* tool did the
-    imaging -- a reimaging pass agreeing with some other reimaging pass proves
-    only that both made the same choice. A molecule split across a periodic
-    boundary shows up here as a bond roughly one box-length long.
+    This is what actually says whether a trajectory is imaged correctly, and it
+    does not care which tool did the imaging. A molecule cut across a boundary
+    shows up as a bond about one box length long.
 
-    Distances are computed **without** the minimum-image convention, on purpose:
-    a PBC-aware distance is short for a split molecule by construction, which is
-    precisely the defect being hunted. (Same reasoning as LOOS's
-    ``long-bond-finder``, whose 2.5 Angstrom default `max_bond` this matches.)
-
-    Returns ``(n_violations, violations)`` where `violations` is a list of
-    ``(frame_index, atom_i, atom_j, length_nm)``. With `stop_early` the scan
-    returns on the first bad frame, which is much faster for a pass/fail gate.
+    Returns (n_violations, [(frame, atom_i, atom_j, length_nm), ...]).
+    stop_early returns on the first bad frame, for a quick pass/fail.
     """
+    # Distances ignore the minimum image convention on purpose: it would make a
+    # split molecule's bonds short, hiding the very thing being looked for.
     import mdtraj
     traj_p = Path(traj_fn)
     if pairs is None:
@@ -311,31 +258,21 @@ def check_anchor_distances(traj_fn, ranges, structure_fn=None,
                            scan_chunk=SCAN_CHUNK):
     """How far the furthest atom sits from its own molecule's first atom.
 
-    This measures exactly the assumption LOOS's ``mergeImage()`` makes. It
-    minimum-images every atom of a molecule against that molecule's *first*
-    atom, so it is correct only while no atom is more than half a box edge from
-    that anchor. Past that, an atom that is legitimately far from the anchor
-    gets wrapped to the wrong image and the molecule is quietly mangled -- with
-    no error, and often with bond lengths that still look fine because the
-    *bonded* neighbours moved together.
+    LOOS's mergeImage() measures every atom of a molecule against that
+    molecule's first atom, so it is right only while no atom is more than half a
+    box edge away. This says whether that holds, which is a question about the
+    LOOS backend rather than about the trajectory: a molecule is allowed to be
+    bigger than half the box, but then trjconv has to do the reimaging.
 
-    Note this is not a correctness check on the trajectory: a molecule may
-    legitimately be larger than half the box. It is a check on whether the LOOS
-    backend is inside its safe regime for that trajectory. When it is not, use
-    the trjconv backend, which walks the bond graph instead of anchoring.
-
-    It also catches atoms carrying no bonds at all -- a TIP4P-ice ``MW`` virtual
-    site stranded a box-length from its own water passes every bond check there
-    is, because it has no bonds to be long, but its anchor distance is enormous.
+    It also catches an unbonded atom stranded far from its molecule, which every
+    bond-length check misses because it has no bonds to be long.
     """
     import mdtraj
     traj_p = Path(traj_fn)
     starts = np.array([start for start, _ in ranges])
     box = box_vectors(traj_fn=traj_p, structure_fn=structure_fn)
-    # reimageByAtom() wraps each Cartesian component independently, so the
-    # limit is per axis against that axis' own edge -- not the vector norm
-    # against the shortest edge, which would flag molecules that are actually
-    # fine in a box with unequal edges.
+    # Checked per axis, since LOOS wraps each component on its own. A vector
+    # norm against the shortest edge would flag molecules that are really fine.
     edges = np.abs(np.diag(box))
     limits = edges / 2.0
 
@@ -377,20 +314,14 @@ def reimage_with_loos(traj_fn, structure_fn, out_fn, top_fn=None,
                       max_bond=MAX_BOND,
                       triclinic_rtol=TRICLINIC_RTOL,
                       output_tag=OUTPUT_TAG):
-    """Make molecules whole and wrap them into the primary image, with LOOS.
+    """Make molecules whole and wrap them back into the box, with LOOS.
 
-    Orthorhombic cells only -- see the module docstring for why a triclinic cell
-    raises instead of being silently mishandled.
+    Rectangular boxes only. `ranges` are the atom index ranges of each molecule,
+    read from `top_fn` if not given, and are added to the LOOS model as bonds so
+    that splitByMolecule() returns real molecules whose groups share the
+    parent's box. A group built by hand instead reports no box at all.
 
-    `ranges` are ``(start, stop)`` atom index ranges, one per molecule; if not
-    given they are read from `top_fn`. They are injected into the LOOS model as
-    bonds, which is what makes ``splitByMolecule()`` return real molecules whose
-    subgroups share -- and therefore track -- the parent's per-frame periodic
-    box. Groups assembled by hand instead do *not* inherit the box: they report
-    ``isPeriodic() == False`` with a sentinel 99999 cell, and reimaging against
-    that is silently wrong.
-
-    Per frame: ``mergeImage()`` on each molecule (unbreak it), then ``reimage()``
+    Per frame: mergeImage() on each molecule (unbreak it), then reimage()
     (wrap its centroid into the cell). That order matters -- ``reimage()`` alone
     wraps a broken molecule by its meaningless centroid and leaves it broken.
     """
@@ -425,9 +356,8 @@ def reimage_with_loos(traj_fn, structure_fn, out_fn, top_fn=None,
             f'{structure_fn} has {len(model)} atoms but the topology describes '
             f'{ranges[-1][1]}; they are not the same system.')
 
-    # Star-bond each molecule so splitByMolecule() recovers exactly these
-    # groups. A star is enough: nothing here walks the bond graph, it only needs
-    # the connected components to match the molecule blocks.
+    # Bond every atom of a molecule to its first atom, so splitByMolecule()
+    # finds exactly these groups. Nothing here walks the bonds themselves.
     for start, stop in ranges:
         first = model[start]
         for i in range(start + 1, stop):
@@ -458,9 +388,8 @@ def reimage_with_loos(traj_fn, structure_fn, out_fn, top_fn=None,
         for molecule in molecules:
             molecule.mergeImage()
         if center is not None:
-            # Anchor on a single atom before taking any centroid: the centroid
-            # of a selection that is itself split across the boundary points
-            # somewhere meaningless.
+            # Move to one atom first: the centroid of a selection that is
+            # itself split across the boundary points nowhere useful.
             model.translate(-center[0].coords())
             for molecule in molecules:
                 molecule.reimage()
@@ -479,13 +408,8 @@ def reimage_with_loos(traj_fn, structure_fn, out_fn, top_fn=None,
 
 def _verify_reimaged(out_p, top_fn=None, ranges=None, structure_fn=None,
                      max_bond=MAX_BOND):
-    """Check a freshly-reimaged trajectory against the physical invariant.
-
-    Reimaging by atom has many quiet failure modes, so the backend does not get
-    to assume it succeeded. A bond stretched past `max_bond` means the output is
-    wrong, and it is far better to hear that here than to find it in an
-    analysis three weeks later.
-    """
+    """Check a just-reimaged trajectory's bond lengths, since it may have failed
+    quietly. A bond longer than max_bond means the output is wrong."""
     if top_fn is not None:
         n_bad, violations = check_bond_lengths(
             out_p, top_fn=top_fn, max_bond=max_bond, stop_early=True)
@@ -542,18 +466,11 @@ def reimage_with_trjconv(traj_fn, tpr_fn, out_fn, gmx_bin=GMX_BIN,
                          output_group=TRJCONV_OUTPUT_GROUP,
                          center_group=None, index_fn=None,
                          skip_first_frame=False, output_tag=OUTPUT_TAG):
-    """Make molecules whole with ``gmx trjconv``, for any cell including triclinic.
+    """Make molecules whole with gmx trjconv, for any box including triclinic.
 
-    ``-pbc mol -ur compact`` is the combination GROMACS's own help recommends
-    for a triclinic cell; ``-pbc mol`` needs the ``.tpr`` because that is where
-    molecule definitions live (a ``.gro`` would silently give ``-pbc atom``
-    behaviour for molecule purposes). ``-fit`` is deliberately not offered here:
-    GROMACS documents that it cannot be combined with ``-pbc`` in one pass, and
-    doing both at once silently produces the wrong answer -- fit afterwards, in
-    a second call.
-
-    trjconv reads its group selection from stdin, so the groups are piped rather
-    than typed: `center_group` first when centring, then `output_group`.
+    -pbc mol needs the .tpr, which is where molecule definitions live. There is
+    deliberately no -fit option: GROMACS cannot combine it with -pbc in one pass
+    and gives a wrong answer if asked to, so fit in a second call.
     """
     traj_p, out_p = Path(traj_fn), Path(out_fn)
     if out_p.resolve() == traj_p.resolve():
@@ -628,14 +545,11 @@ def reimage_trajectory(traj_fn, out_fn=None, structure_fn=None, top_fn=None,
                        index_fn=None, skip_first_frame=False,
                        gmx_bin=GMX_BIN, triclinic_rtol=TRICLINIC_RTOL,
                        output_tag=OUTPUT_TAG, pbc=TRJCONV_PBC, ur=TRJCONV_UR):
-    """Reimage `traj_fn`, choosing the backend from the trajectory's own box.
+    """Reimage a trajectory, choosing the backend from its own box.
 
-    With ``backend='auto'`` an orthorhombic cell goes to LOOS and anything else
-    to ``gmx trjconv``, which is the split the two tools' capabilities actually
-    dictate. Pass ``backend='trjconv'`` to force GROMACS even for a rectangular
-    box (e.g. when no ``.top`` is available, or to match a colleague's pipeline).
-
-    Returns the output path. Never modifies `traj_fn`.
+    'auto' sends a rectangular box to LOOS and anything else to gmx trjconv.
+    Force 'trjconv' when there is no .top, or to match someone else's pipeline.
+    Returns the output path, and never touches the input.
     """
     traj_p = Path(traj_fn)
     if out_fn is None:
@@ -674,16 +588,12 @@ def reimage_gen_dir(gen_dir, config=None, backend=BACKEND_AUTO,
                     center_selection=None, center_group=None,
                     skip_first_frame=None, gmx_bin=GMX_BIN,
                     output_tag=OUTPUT_TAG, triclinic_rtol=TRICLINIC_RTOL):
-    """Reimage one mdfarmer generation directory in place-adjacent fashion.
+    """Reimage one generation directory, writing beside the raw trajectory.
 
-    Reads ``config.json`` from `gen_dir` for the trajectory name, the topology
-    and the starting structure, and writes ``<traj_name><output_tag><suffix>``
-    beside the raw trajectory. The raw trajectory is left untouched so a
-    generation that is still being resumed keeps its frame accounting intact.
-
-    `skip_first_frame` defaults to "drop it for every generation after the
-    first": GROMACS writes an output frame at step 0 of every run, so generation
-    N>0 opens with an exact duplicate of generation N-1's final frame.
+    Reads config.json for the trajectory name, topology and structure. The raw
+    trajectory is left alone so a generation still being resumed keeps its frame
+    count. skip_first_frame defaults to dropping it for every generation after
+    the first, since GROMACS repeats the previous generation's last frame.
     """
     import json
     gen_p = Path(gen_dir)
