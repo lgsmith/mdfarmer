@@ -606,8 +606,19 @@ def gmx_generation(traj_dir_top_level: str,
                  '-noappend', *mdrun_args]
         if resume_from is not None:
             mdrun += ['-cpi', str(resume_from)]
-        _run_mdrun(mdrun, gen_dir, handle_preempt,
-                   fleet=fleet, fleet_key=fleet_key)
+        try:
+            _run_mdrun(mdrun, gen_dir, handle_preempt,
+                       fleet=fleet, fleet_key=fleet_key)
+        except Preempted:
+            # Record the progress the stopped run did make, or the orchestrator
+            # reads this generation as never having started and charges it a
+            # restart for work it actually did.
+            if is_checkpoint(own_cpt):
+                write_gen_status(
+                    gen_dir, target_step=target_step, complete=False,
+                    reached_step=checkpoint_step(own_cpt, gmx_bin=gmx_bin),
+                    gen_status_name=gen_status_name)
+            raise
         reached = checkpoint_step(own_cpt, gmx_bin=gmx_bin)
 
     # ------------------------------- assess ---------------------------------
