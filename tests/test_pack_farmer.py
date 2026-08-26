@@ -47,7 +47,7 @@ def make_farmer(work, n_seeds=N_SEEDS, n_clones=N_CLONES, cpus=CPUS,
                            cpus=cpus, run_script_name='run.py'),
         scheduler_report_cmd='true', scheduler_assoc_rep_cmd='true',
         sep='_', dirname_pad=2, runner=gs.gmx_generation, dry_run=True,
-        overwrite=True, **kwargs)
+        overwrite=True, jids_file=work / 'jids.txt', **kwargs)
 
 
 def packs_of(farmer):

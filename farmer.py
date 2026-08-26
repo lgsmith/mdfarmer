@@ -146,6 +146,10 @@ class Farmer:
                  active_clone_threshold=50,
                  dirname_pad=3,
                  job_number_re='[1-9][0-9]*',
+                 # Where the live job ids are mirrored. None puts
+                 # '<title>-jids.txt' in the launch directory, which collides
+                 # if two Farmers share a title and a working directory.
+                 jids_file=None,
                  # Consecutive dead launches a generation may take before its
                  # clone is abandoned. A generation spanning many walltime
                  # blocks wants more headroom than one that is a single job.
@@ -342,7 +346,9 @@ class Farmer:
         self.dirname_pad = dirname_pad
         self.config_template['dirname_pad'] = self.dirname_pad
         self.quiet = quiet
-        self.jids_file = Path(f'{config_template["title"]}-jids.txt')
+        self.jids_file = Path(
+            jids_file if jids_file is not None
+            else f'{config_template["title"]}-jids.txt')
         # important to pass this down through the clones
         self.job_name_fstring = self.sep.join(job_name_elements)
         self.current_jids = set()
