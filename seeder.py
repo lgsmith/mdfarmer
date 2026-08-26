@@ -855,18 +855,24 @@ class ClonePack:
                  pack_manifest_name='pack.json',
                  run_script_name='run.py',
                  member_cores=None,
+                 # Members with unequal steps per generation are refused,
+                 # because the job holds the card until its slowest finishes.
+                 # True when every launch ends at -maxh rather than at a step
+                 # target -- then no member ever waits for another.
+                 wallclock_matched=False,
                  sep=None,
                  job_name_elements=('{title}', '{seed_index}',
                                     '{clone_index}', '{gen_index}')):
         if not clones:
             raise ValueError('a ClonePack needs at least one Clone')
         steps = {c.total_steps for c in clones}
-        if len(steps) != 1:
+        if len(steps) != 1 and not wallclock_matched:
             raise ValueError(
-                f'pack members must all run the same number of steps per '
-                f'generation (got {sorted(steps)}); a shorter member would '
-                'leave the card idle waiting for the longer one, and variable '
-                'generation lengths complicate the contiguity bookkeeping.')
+                f'pack members run {sorted(steps)} steps per generation. Equal '
+                'steps keep the card busy: the job holds it until its slowest '
+                'member finishes, so a shorter member leaves it idle. Pass '
+                'wallclock_matched=True if every launch ends at -maxh instead '
+                'of at a step target, which is when no member waits on another.')
         self.clones = list(clones)
         self.pack_dir = Path(pack_dir)
         self.pack_dir.mkdir(parents=True, exist_ok=True)
