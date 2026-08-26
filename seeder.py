@@ -545,9 +545,10 @@ class Clone:
         # when config['steps'] has been narrowed to a remainder.
         config['steps_per_gen'] = steps_per_gen
 
-        # Only override Clone's default run_script when one was supplied, so
-        # OpenMM callers keep the default and GROMACS callers get their runner.
-        run_script_kw = {} if run_script is None else {'run_script': run_script}
+        # OpenMM callers pass nothing and get the OpenMM runner; GROMACS
+        # callers pass their own.
+        if run_script is None:
+            run_script = default_run_script
         return cls(
             config,
             scheduler,
@@ -567,7 +568,7 @@ class Clone:
             progress_fn=progress_fn,
             last_gen_index=last_gen_index,
             dry_run=dry_run,
-            **run_script_kw,
+            run_script=run_script,
         )
 
     # Two clones should be the same if their config has the same seed, clone, and title in it.
