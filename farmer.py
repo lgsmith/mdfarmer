@@ -20,7 +20,8 @@ class Farmer:
                  'node_blocklist', 'run_script', 'recover_fn', 'progress_fn',
                  'restarts_per_gen', 'pack_size', 'pack_grouping',
                  'pack_cpus_per_task', 'pack_scheduler_fstring',
-                 'pack_run_script', 'pack_member_cores')
+                 'pack_run_script', 'pack_member_cores',
+                 'seed_config_overrides')
 
     # Refresh the set of job ids the scheduler says are ours and alive.
     #
@@ -97,6 +98,8 @@ class Farmer:
                 top_fn=self.top_fns[seed_index],
                 system_fn=self.system_fns[seed_index],
                 structure_fn=self.seed_state_fns[seed_index],
+                config_overrides=(None if self.seed_config_overrides is None
+                                  else self.seed_config_overrides[seed_index]),
                 config_template=self.config_template,
                 scheduler=self.scheduler,
                 scheduler_fstring=self.scheduler_fstring,
@@ -159,6 +162,9 @@ class Farmer:
                  pack_scheduler_fstring=None,
                  pack_run_script=None,
                  pack_member_cores=None,
+                 # One dict per seed, applied over config_template in
+                 # from_disk. len(seed_config_overrides) == n_seeds.
+                 seed_config_overrides=None,
                  sep='-',
                  seeds_first=True,
                  job_name_elements=(
@@ -206,6 +212,12 @@ class Farmer:
         self.pack_scheduler_fstring = pack_scheduler_fstring
         self.pack_run_script = pack_run_script
         self.pack_member_cores = pack_member_cores
+        if seed_config_overrides is not None and \
+                len(seed_config_overrides) != n_seeds:
+            raise ValueError(
+                f'seed_config_overrides has {len(seed_config_overrides)} '
+                f'entries for {n_seeds} seeds')
+        self.seed_config_overrides = seed_config_overrides
         # gen-seed is base + stride * seed_index + clone_index, so a stride at
         # or below n_clones makes two seeds draw the same initial velocities.
         gen_seed_stride = config_template.get('gen_seed_stride',

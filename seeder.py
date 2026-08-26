@@ -28,6 +28,14 @@ class ConfigError(ValueError):
     """
 
 
+# Config entries `Clone.from_disk` computes for each clone from the disk state.
+# A per-seed override naming one of these would be silently overwritten, so it
+# is refused instead.
+CLONE_DERIVED_CONFIG_KEYS = frozenset((
+    'seed_index', 'clone_index', 'gen_index', 'steps', 'steps_per_gen',
+    'append', 'new_velocities', 'seed_fn', 'top_fn', 'system_fn'))
+
+
 # Sort key that orders gen directories numerically. Anything that isn't
 # '<prefix><sep><digits>' sorts to the end, keyed by name so the order is still
 # deterministic.
@@ -395,6 +403,12 @@ class Clone:
                   # right for one seed and nothing downstream would notice.
                   # None leaves the template's value alone.
                   structure_fn: str = None,
+                  # Per-seed config entries applied over the shared template --
+                  # the arm-specific half of a heterogeneous pack, where members
+                  # differ in mdrun_args (`-update cpu` vs `-update gpu`) or
+                  # write_interval. May not name a key from_disk derives per
+                  # clone; see CLONE_DERIVED_CONFIG_KEYS.
+                  config_overrides: dict = None,
                   # The Farmer's full config_template. Read-only here; we
                   # deepcopy before mutating.
                   config_template: dict,
@@ -481,6 +495,13 @@ class Clone:
         config['top_fn'] = top_fn
         if structure_fn is not None:
             config['structure_fn'] = structure_fn
+        if config_overrides:
+            clashing = sorted(set(config_overrides) & CLONE_DERIVED_CONFIG_KEYS)
+            if clashing:
+                raise ConfigError(
+                    f'config_overrides may not set {clashing}: from_disk '
+                    'derives those per clone and would overwrite them.')
+            config.update(config_overrides)
         # Keep the StateDataReporter progress display consistent with the
         # actual run length so % complete isn't misleading on a resume.
         if isinstance(config.get('state_data_kwargs'), dict):
