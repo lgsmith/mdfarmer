@@ -241,7 +241,7 @@ class Clone:
         'scheduler_kws', 'restarts_per_gen', 'restart_attempts', 'run_script',
         'harvester', 'remaining_steps', 'run_script_name', 'total_steps',
         'preemption_checker', 'node_blocklist', 'progress_fn',
-        'scheduler_log_dir', 'last_gen_index')
+        'scheduler_log_dir', 'last_gen_index', 'reaped_gen')
 
     # This should mostly be used by the init function, and by adaptive sampling scripts.
 
@@ -379,6 +379,9 @@ class Clone:
                     raise ConfigError(str(exc)) from exc
         self.preemption_checker = preemption_checker
         self.node_blocklist = node_blocklist
+        # The generation whose harvest has already been submitted, so a
+        # generation that is checked in on again does not get a second one.
+        self.reaped_gen = None
         self.progress_fn = progress_fn
         self.last_gen_index = last_gen_index
         self.run_script = run_script
@@ -806,8 +809,12 @@ class Clone:
             self.config['steps'] = self.total_steps
             print('Preparing to move to next generation!')
             # do any automated traj postprocessing encoded by harvester
-            if self.harvester:
+            if self.harvester and self.reaped_gen != self.config['gen_index']:
                 print('running harvester!')
+                # Recorded before the attempt: a pack member whose start_next
+                # raises is checked in on again next tick, and one harvest is
+                # all this generation gets either way.
+                self.reaped_gen = self.config['gen_index']
                 try:
                     self.harvester.reap(
                         self.current_gen_dir, dry_run=self.dry_run)

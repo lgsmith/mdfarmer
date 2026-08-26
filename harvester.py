@@ -82,7 +82,14 @@ class Harvester:
         harvest_script_p.write_text(harvest_script)
         return harvest_script_p
 
-    def reap(self, current_dir, dry_run=False):
+    def reap(self, current_dir, dry_run=False, sentinel_name=SENTINEL_NAME):
+        current_dir = Path(current_dir)
+        if (current_dir / sentinel_name).is_file():
+            # A second harvest job would read and write the same files as the
+            # first, at the same time.
+            print(f'{current_dir} already carries {sentinel_name}; not '
+                  f'submitting another harvest.')
+            return None
         harvest_script_p = self.prep_and_write_inputs(current_dir)
         if dry_run:
             return None
