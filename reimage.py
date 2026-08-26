@@ -42,6 +42,9 @@ TRJCONV_UR = 'compact'
 # Default GROMACS binary. Sites that build an MPI-only GROMACS have gmx_mpi.
 GMX_BIN = 'gmx'
 
+# What the runner calls a generation's tpr, when its config does not say.
+TPR_NAME = 'prod.tpr'
+
 # Appended to the input stem to name the output, e.g. prod.xtc -> prod-whole.xtc.
 OUTPUT_TAG = '-whole'
 
@@ -151,6 +154,25 @@ def is_orthorhombic(box, triclinic_rtol=TRICLINIC_RTOL):
     return bool(np.abs(off_diagonal).max() <= triclinic_rtol * scale)
 
 
+def gromacs_topology(top_fn, include_dir=None):
+    """The openmm Topology for a GROMACS .top.
+
+    Its chains match the [ molecules ] section, including molecules whose atoms
+    carry no bonds, which is what makes them usable as molecule blocks.
+    """
+    from openmm import app
+    top_p = Path(top_fn).resolve()
+    if top_p.suffix != '.top':
+        raise ValueError(
+            f'expected a GROMACS .top, got {top_p.name}. The topology is the '
+            'only place molecule blocks are recorded; a .gro carries no '
+            'connectivity.')
+    # A .top's #include lines resolve relative to the process cwd, so a force
+    # field that lives elsewhere needs include_dir.
+    kwargs = {} if include_dir is None else {'includeDir': str(include_dir)}
+    return app.GromacsTopFile(str(top_p), **kwargs).topology
+
+
 def molecule_ranges(top_fn, include_dir=None):
     """[(start, stop), ...] atom index ranges, one per molecule in the topology.
 
@@ -158,17 +180,8 @@ def molecule_ranges(top_fn, include_dir=None):
     section even for molecules with no bonds, such as bare ions. Checked to
     cover every atom exactly once, which the LOOS backend relies on.
     """
-    from openmm import app
     top_p = Path(top_fn).resolve()
-    if top_p.suffix != '.top':
-        raise ValueError(
-            f'molecule_ranges needs a GROMACS .top, got {top_p.name}. The '
-            'topology is the only place molecule blocks are recorded; a .gro '
-            'carries no connectivity.')
-    kwargs = {} if include_dir is None else {'includeDir': str(include_dir)}
-    # A .top's #include lines resolve relative to the process cwd,
-    # so parse from the topology's own directory.
-    topology = app.GromacsTopFile(str(top_p), **kwargs).topology
+    topology = gromacs_topology(top_p, include_dir=include_dir)
 
     ranges = []
     for chain in topology.chains():
@@ -203,10 +216,8 @@ def bond_pairs(top_fn, include_dir=None):
     """(n_bonds, 2) array of bonded atom index pairs, read from the topology."""
     # Not guessed from distances in the first frame: the thing being looked for
     # is a frame whose geometry is wrong, so its distances cannot be trusted.
-    from openmm import app
     top_p = Path(top_fn).resolve()
-    kwargs = {} if include_dir is None else {'includeDir': str(include_dir)}
-    topology = app.GromacsTopFile(str(top_p), **kwargs).topology
+    topology = gromacs_topology(top_p, include_dir=include_dir)
     pairs = np.array([[a.index, b.index] for a, b in topology.bonds()],
                      dtype=int)
     if not len(pairs):
@@ -321,7 +332,7 @@ def check_anchor_distances(traj_fn, ranges, structure_fn=None,
 
 
 def reimage_with_loos(traj_fn, structure_fn, out_fn, top_fn=None,
-                      ranges=None, center_selection=None,
+                      ranges=None, include_dir=None, center_selection=None,
                       skip_first_frame=False, verify=True,
                       max_bond=MAX_BOND,
                       triclinic_rtol=TRICLINIC_RTOL,
@@ -360,7 +371,7 @@ def reimage_with_loos(traj_fn, structure_fn, out_fn, top_fn=None,
     if ranges is None:
         if top_fn is None:
             raise ValueError('reimage_with_loos needs either ranges or top_fn')
-        ranges = molecule_ranges(top_fn)
+        ranges = molecule_ranges(top_fn, include_dir=include_dir)
 
     model = loos.createSystem(str(structure_fn))
     if len(model) != ranges[-1][1]:
@@ -419,18 +430,20 @@ def reimage_with_loos(traj_fn, structure_fn, out_fn, top_fn=None,
     del writer
 
     if verify:
-        _verify_reimaged(out_p, top_fn=top_fn, ranges=ranges,
+        _verify_reimaged(out_p, top_fn=top_fn, include_dir=include_dir,
+                         ranges=ranges,
                          structure_fn=structure_fn, max_bond=max_bond)
     return out_p, n_written
 
 
-def _verify_reimaged(out_p, top_fn=None, ranges=None, structure_fn=None,
-                     max_bond=MAX_BOND):
+def _verify_reimaged(out_p, top_fn=None, include_dir=None, ranges=None,
+                     structure_fn=None, max_bond=MAX_BOND):
     """Check a just-reimaged trajectory's bond lengths, since it may have failed
     quietly. A bond longer than max_bond means the output is wrong."""
     if top_fn is not None:
         n_bad, violations = check_bond_lengths(
-            out_p, top_fn=top_fn, max_bond=max_bond, stop_early=True)
+            out_p, pairs=bond_pairs(top_fn, include_dir=include_dir),
+            max_bond=max_bond, stop_early=True)
         if n_bad:
             frame, i, j, length = violations[0]
             hint = ''
@@ -558,7 +571,7 @@ def _frame_spacing(traj_p):
 
 
 def reimage_trajectory(traj_fn, out_fn=None, structure_fn=None, top_fn=None,
-                       tpr_fn=None, backend=BACKEND_AUTO,
+                       tpr_fn=None, backend=BACKEND_AUTO, include_dir=None,
                        center_selection=None, center_group=None,
                        index_fn=None, skip_first_frame=False,
                        gmx_bin=GMX_BIN, triclinic_rtol=TRICLINIC_RTOL,
@@ -588,7 +601,7 @@ def reimage_trajectory(traj_fn, out_fn=None, structure_fn=None, top_fn=None,
     if backend == BACKEND_LOOS:
         out_p, _ = reimage_with_loos(
             traj_p, structure_fn, out_fn, top_fn=top_fn,
-            center_selection=center_selection,
+            include_dir=include_dir, center_selection=center_selection,
             skip_first_frame=skip_first_frame,
             triclinic_rtol=triclinic_rtol, output_tag=output_tag)
         return out_p
@@ -603,9 +616,10 @@ def reimage_trajectory(traj_fn, out_fn=None, structure_fn=None, top_fn=None,
 
 
 def reimage_gen_dir(gen_dir, config=None, backend=BACKEND_AUTO,
-                    center_selection=None, center_group=None,
+                    include_dir=None, center_selection=None, center_group=None,
                     skip_first_frame=None, gmx_bin=GMX_BIN,
-                    output_tag=OUTPUT_TAG, triclinic_rtol=TRICLINIC_RTOL):
+                    output_tag=OUTPUT_TAG, triclinic_rtol=TRICLINIC_RTOL,
+                    tpr_name=TPR_NAME):
     """Reimage one generation directory, writing beside the raw trajectory.
 
     Reads config.json for the trajectory name, topology and structure. The raw
@@ -624,13 +638,14 @@ def reimage_gen_dir(gen_dir, config=None, backend=BACKEND_AUTO,
     if skip_first_frame is None:
         skip_first_frame = config.get('gen_index', 0) > 0
 
-    tpr_p = gen_p / 'prod.tpr'
+    tpr_p = gen_p / config.get('tpr_name', tpr_name)
     return reimage_trajectory(
         traj_p,
         structure_fn=config.get('structure_fn'),
         top_fn=config.get('top_fn'),
         tpr_fn=tpr_p if tpr_p.is_file() else None,
-        backend=backend, center_selection=center_selection,
+        backend=backend, include_dir=include_dir,
+        center_selection=center_selection,
         center_group=center_group, skip_first_frame=skip_first_frame,
         gmx_bin=gmx_bin, triclinic_rtol=triclinic_rtol, output_tag=output_tag)
 
