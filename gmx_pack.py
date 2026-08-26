@@ -34,6 +34,7 @@ sentinel is watched once and SIGTERM is fanned out to all K mdruns (see
 trajectory contiguity.
 """
 
+import itertools
 import json
 import os
 import subprocess as sp
@@ -102,30 +103,55 @@ runner('pack.json')
 """
 
 
+def member_core_layout(cpus_per_task, n_replicas, member_cores=None):
+    """``[(cores, offset), ...]``: one contiguous, non-overlapping core block
+    per replica.
+
+    `member_cores` gives each member its own width, for a pack whose members
+    have different core knees -- pairing a `-update cpu` arm that scales to 12
+    cores with a `-update gpu` arm that plateaus at 4 wastes cores under an even
+    split, and starves the arm that could have used them. Absent, the split is
+    even.
+    """
+    cpus_per_task = int(cpus_per_task)
+    if n_replicas < 1:
+        raise ValueError(f'n_replicas must be >= 1, got {n_replicas}')
+    if member_cores is None:
+        cores = [cpus_per_task // n_replicas] * n_replicas
+    else:
+        cores = [int(c) for c in member_cores]
+        if len(cores) != n_replicas:
+            raise ValueError(
+                f'member_cores has {len(cores)} entries for {n_replicas} '
+                'replicas')
+    if min(cores) < 1:
+        raise ValueError(
+            f'{cpus_per_task} cpus cannot be split as {cores} across '
+            f'{n_replicas} replicas; ask for at least {n_replicas} '
+            'cpus-per-task.')
+    if sum(cores) > cpus_per_task:
+        raise ValueError(
+            f'{cores} sums to {sum(cores)} threads, over the {cpus_per_task} '
+            'cpus this job holds')
+    offsets = list(itertools.accumulate(cores, initial=0))[:-1]
+    return list(zip(cores, offsets))
+
+
 def replica_mdrun_args(base_args, replica_index, n_replicas, cpus_per_task,
-                       pin_stride=PIN_STRIDE, ntmpi=NTMPI,
+                       pin_stride=PIN_STRIDE, ntmpi=NTMPI, member_cores=None,
                        per_replica_flags=PER_REPLICA_MDRUN_FLAGS):
     """This replica's mdrun flags: shared template minus pinning, plus its own.
 
-    ``-ntomp cpus/K -pin on -pinoffset i*ntomp -pinstride 1`` gives replica i a
-    private, contiguous block of cores. Raises rather than overcommitting: K
+    ``-ntomp <cores> -pin on -pinoffset <offset> -pinstride 1`` gives replica i
+    a private, contiguous block of cores. Raises rather than overcommitting: K
     replicas each taking more cores than the allocation holds is exactly the
     silent slowdown this function exists to prevent.
     """
-    if n_replicas < 1:
-        raise ValueError(f'n_replicas must be >= 1, got {n_replicas}')
     if not 0 <= replica_index < n_replicas:
         raise ValueError(
             f'replica_index {replica_index} out of range for {n_replicas} replicas')
-    cpus_per_task = int(cpus_per_task)
-    ntomp = cpus_per_task // n_replicas
-    if ntomp < 1:
-        raise ValueError(
-            f'{cpus_per_task} cpus cannot be split across {n_replicas} '
-            f'replicas; ask for at least {n_replicas} cpus-per-task.')
-    if ntomp * n_replicas > cpus_per_task:
-        raise ValueError(
-            f'{n_replicas} x {ntomp} threads exceeds {cpus_per_task} cpus')
+    ntomp, offset = member_core_layout(
+        cpus_per_task, n_replicas, member_cores=member_cores)[replica_index]
 
     stripped = []
     args = list(base_args or ())
@@ -141,7 +167,7 @@ def replica_mdrun_args(base_args, replica_index, n_replicas, cpus_per_task,
     rank_args = [] if ntmpi is None else ['-ntmpi', str(ntmpi)]
     return stripped + rank_args + [
         '-ntomp', str(ntomp), '-pin', 'on',
-        '-pinoffset', str(replica_index * ntomp),
+        '-pinoffset', str(offset),
         '-pinstride', str(pin_stride)]
 
 
@@ -204,13 +230,24 @@ def report_mps_state(mps_control_bin=MPS_CONTROL_BIN,
 
 
 def write_pack_manifest(pack_dir, member_config_fns, *, cpus_per_task,
-                        reps_per_card=REPS_PER_CARD,
+                        reps_per_card=REPS_PER_CARD, member_cores=None,
                         pack_manifest_name=PACK_MANIFEST_NAME):
-    """Record which generation configs one packed job should advance."""
+    """Record which generation configs one packed job should advance.
+
+    `member_cores` is one core count per member, in the same order; None splits
+    the allocation evenly. Validated here so a bad split fails at submission
+    rather than inside the job.
+    """
+    members = [str(Path(p).resolve()) for p in member_config_fns]
+    if member_cores is not None:
+        member_cores = [int(c) for c in member_cores]
+        member_core_layout(cpus_per_task, len(members),
+                           member_cores=member_cores)
     manifest = {
-        'members': [str(Path(p).resolve()) for p in member_config_fns],
+        'members': members,
         'cpus_per_task': int(cpus_per_task),
         'reps_per_card': int(reps_per_card),
+        'member_cores': member_cores,
     }
     path = Path(pack_dir) / pack_manifest_name
     tmp = path.with_name(path.name + '.tmp')
@@ -262,8 +299,12 @@ def gmx_pack_sim_block_json(manifest_fn=PACK_MANIFEST_NAME,
               flush=True)
         ntmpi = None
 
-    print(f'[pack] {n_replicas} replicas, {cpus_per_task} cpus '
-          f'({cpus_per_task // n_replicas} threads each)', flush=True)
+    member_cores = manifest.get('member_cores')
+    layout = member_core_layout(cpus_per_task, n_replicas,
+                                member_cores=member_cores)
+    print(f'[pack] {n_replicas} replicas, {cpus_per_task} cpus, '
+          f'cores(offset) ' + ' '.join(f'{c}({o})' for c, o in layout),
+          flush=True)
     mps_state = report_mps_state()
 
     fleet = gmx.MdrunFleet(pack_dir / gmx.PREEMPT_SENTINEL_NAME,
@@ -290,7 +331,8 @@ def gmx_pack_sim_block_json(manifest_fn=PACK_MANIFEST_NAME,
                 conf.pop(key, None)
             conf['mdrun_args'] = replica_mdrun_args(
                 conf.get('mdrun_args'), index, n_replicas, cpus_per_task,
-                pin_stride=pin_stride, ntmpi=ntmpi)
+                pin_stride=pin_stride, ntmpi=ntmpi,
+                member_cores=member_cores)
             traj = gmx.gmx_generation(**runtime_kwargs, **conf)
         except gmx.Preempted as exc:
             outcome.update(status='preempted', detail=str(exc))
