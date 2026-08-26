@@ -115,6 +115,10 @@ class Farmer:
                 progress_fn=self.progress_fn,
                 dry_run=self.dry_run,
             )
+        except seeder.ConfigError:
+            # Not this clone's problem: it is the configuration, and every
+            # clone it touches will hit it. Boot loudly rather than short.
+            raise
         except Exception as exc:
             print(f'Skipping clone seed={seed_index} clone={clone_index} '
                   f'during setup: {type(exc).__name__}: {exc}')

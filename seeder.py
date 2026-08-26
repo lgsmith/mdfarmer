@@ -16,6 +16,18 @@ runner('config.json')
 """
 
 
+class ConfigError(ValueError):
+    """A mistake in the Farmer's configuration rather than in one clone's disk
+    state.
+
+    Clone setup otherwise swallows failures so one corrupt generation directory
+    cannot stop an orchestrator minding hundreds of others. A config error is
+    not per-clone -- it applies to every clone it touches -- so it propagates
+    instead, rather than booting a campaign quietly short of the seeds asked
+    for.
+    """
+
+
 # Sort key that orders gen directories numerically. Anything that isn't
 # '<prefix><sep><digits>' sorts to the end, keyed by name so the order is still
 # deterministic.
@@ -333,7 +345,7 @@ class Clone:
         if config.get('steps_per_gen') is None:
             config['steps_per_gen'] = self.total_steps
         elif config['steps_per_gen'] != self.total_steps:
-            raise ValueError(
+            raise ConfigError(
                 f"config['steps_per_gen']={config['steps_per_gen']} disagrees "
                 f'with steps_per_gen={self.total_steps}; the harvest would '
                 'place this clone\'s frames at the wrong global index.')
@@ -345,8 +357,12 @@ class Clone:
             downsample_frq = (getattr(harvester, 'run_config', None)
                               or {}).get('downsample_frq')
             if downsample_frq:
-                harvest.check_commensurability(
-                    self.total_steps, config['write_interval'], downsample_frq)
+                try:
+                    harvest.check_commensurability(
+                        self.total_steps, config['write_interval'],
+                        downsample_frq)
+                except ValueError as exc:
+                    raise ConfigError(str(exc)) from exc
         self.preemption_checker = preemption_checker
         self.node_blocklist = node_blocklist
         self.progress_fn = progress_fn
