@@ -5,6 +5,7 @@ from pathlib import Path
 from . import seeder
 from . import simulate as sims
 from . import gmx_simulate as gmx
+from . import gmx_pack
 import time
 
 
@@ -17,7 +18,9 @@ class Farmer:
                  'scheduler_report_cmd', 'scheduler_fstring', 'scheduler_kws',
                  'scheduler_assoc_rep_cmd', 'system_fns', 'top_fns',
                  'node_blocklist', 'run_script', 'recover_fn', 'progress_fn',
-                 'restarts_per_gen')
+                 'restarts_per_gen', 'pack_size', 'pack_grouping',
+                 'pack_cpus_per_task', 'pack_scheduler_fstring',
+                 'pack_run_script', 'pack_member_cores')
 
     # Refresh the set of job ids the scheduler says are ours and alive.
     #
@@ -140,6 +143,18 @@ class Farmer:
                  # clone is abandoned. A generation spanning many walltime
                  # blocks wants more headroom than one that is a single job.
                  restarts_per_gen=3,
+                 # MPS packing. `pack_size` members share one job and one GPU;
+                 # None leaves every clone submitting on its own. `pack_grouping`
+                 # is callable(flat_clones) -> list[list[Clone]] for a policy
+                 # other than consecutive runs -- pairing two arms on a card,
+                 # say. `pack_member_cores` is a list or callable(group) -> list
+                 # giving each member its own core width.
+                 pack_size=None,
+                 pack_grouping=None,
+                 pack_cpus_per_task=None,
+                 pack_scheduler_fstring=None,
+                 pack_run_script=None,
+                 pack_member_cores=None,
                  sep='-',
                  seeds_first=True,
                  job_name_elements=(
@@ -181,6 +196,12 @@ class Farmer:
         self.n_seeds = n_seeds
         self.n_clones = n_clones
         self.restarts_per_gen = restarts_per_gen
+        self.pack_size = pack_size
+        self.pack_grouping = pack_grouping
+        self.pack_cpus_per_task = pack_cpus_per_task
+        self.pack_scheduler_fstring = pack_scheduler_fstring
+        self.pack_run_script = pack_run_script
+        self.pack_member_cores = pack_member_cores
         # gen-seed is base + stride * seed_index + clone_index, so a stride at
         # or below n_clones makes two seeds draw the same initial velocities.
         gen_seed_stride = config_template.get('gen_seed_stride',
@@ -380,6 +401,79 @@ class Farmer:
                 if clone is not None:
                     clone_queue.append(clone)
             self.priority_ordered_clones.append(clone_queue)
+        if self.pack_size or self.pack_grouping:
+            self.build_packs(tdir)
+
+    def group_clones(self, clones):
+        """Partition every built Clone into pack-sized groups.
+
+        `pack_grouping` supplies the policy; without one the flat priority
+        order is cut into consecutive runs of `pack_size`. Either way every
+        clone must land in exactly one group -- a clone silently left out of
+        the plan would never be submitted, and one in two packs would get two
+        jobs in its generation directory.
+        """
+        if self.pack_grouping is not None:
+            groups = [list(g) for g in self.pack_grouping(clones)]
+        else:
+            groups = [clones[i:i + self.pack_size]
+                      for i in range(0, len(clones), self.pack_size)]
+
+        def key(clone):
+            return (clone.config['seed_index'], clone.config['clone_index'])
+
+        packed = [key(c) for group in groups for c in group]
+        duplicated = sorted({k for k in packed if packed.count(k) > 1})
+        if duplicated:
+            raise ValueError(f'seed/clone {duplicated} appear in two packs')
+        missing = sorted(set(map(key, clones)) - set(packed))
+        if missing:
+            raise ValueError(f'clones built but never packed: {missing}')
+        if self.pack_size:
+            wrong = [len(g) for g in groups if len(g) != self.pack_size]
+            if wrong:
+                raise ValueError(
+                    f'pack_size={self.pack_size} but groups of size {wrong} '
+                    'were produced')
+        return groups
+
+    def build_packs(self, tdir):
+        """Replace the clone queues with ClonePacks, one queue per pack.
+
+        A pack answers every call `launch` makes on a Clone, so the tending
+        loop is unchanged. `active_clone_set` is rebuilt because
+        `_setup_one_clone` populated it with the individual Clones.
+        """
+        family = util.scheduler_families.get(self.scheduler, self.scheduler)
+        fstring = (self.pack_scheduler_fstring
+                   or util.basic_scheduler_fstrings_mps[family])
+        run_script = self.pack_run_script or gmx_pack.default_gmx_pack_run_script
+        cpus = self.pack_cpus_per_task or self.scheduler_kws.get('cpus')
+        if not cpus:
+            raise ValueError(
+                'packing needs pack_cpus_per_task, or a "cpus" entry in '
+                'scheduler_kws for the pack template to fill in')
+        flat = [c for queue in self.priority_ordered_clones for c in queue]
+        packs = []
+        for group in self.group_clones(flat):
+            tag = self.sep.join(
+                f's{c.config["seed_index"]:0{self.dirname_pad}d}'
+                f'c{c.config["clone_index"]:0{self.dirname_pad}d}'
+                for c in group)
+            member_cores = self.pack_member_cores
+            if callable(member_cores):
+                member_cores = member_cores(group)
+            packs.append(seeder.ClonePack(
+                group, Path(tdir) / 'packs' / f'pack{self.sep}{tag}',
+                self.scheduler, fstring, self.scheduler_kws,
+                run_script=run_script, cpus_per_task=cpus,
+                member_cores=member_cores, sep=self.sep,
+                job_number_re=self.job_number_re,
+                dry_run=self.dry_run))
+        self.priority_ordered_clones = [[pack] for pack in packs]
+        self.active_clone_set = {pack for pack in packs
+                                 if pack.job_number is not None}
+        return packs
 
     # check_start_gen touches the filesystem, the scheduler and (for GROMACS)
     # the gmx binary, any of which can raise. Before this, a single raised
