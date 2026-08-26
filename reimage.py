@@ -315,10 +315,9 @@ def check_anchor_distances(traj_fn, ranges, structure_fn=None,
             here = float(usage.flat[flat])
             if here > worst:
                 worst = here
-                n_atoms, n_axes = usage.shape[1], usage.shape[2]
-                worst_frame = frame_index + flat // (n_atoms * n_axes)
-                worst_atom = (flat // n_axes) % n_atoms
-                worst_axis = flat % n_axes
+                local_frame, worst_atom, worst_axis = (
+                    int(i) for i in np.unravel_index(flat, usage.shape))
+                worst_frame = frame_index + local_frame
             frame_index += xyz.shape[0]
     return {'worst_half_box_fraction': worst,
             'max_anchor_offset': worst * float(limits[worst_axis])
