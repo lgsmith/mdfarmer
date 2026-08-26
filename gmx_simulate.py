@@ -288,17 +288,17 @@ def concat_parts(gen_dir, out_fn, deffnm=DEFFNM, traj_suffix='.xtc',
         raise FileNotFoundError(
             f'no {deffnm}.partNNNN{traj_suffix} files in {gen_dir} to merge')
     out_p = Path(out_fn)
-    if len(parts) == 1:
-        # Nothing to merge; copy rather than rename so a re-run of this step is
-        # idempotent and the part stays as the provenance record.
-        shutil.copy(parts[0], out_p)
-        return out_p
-    # Written to a temp name and renamed, so nothing ever reads a half-merged
+    # Built under a temp name and renamed, so nothing ever reads a half-written
     # trajectory. The temp name keeps the suffix, since gmx reads the format
     # from the extension.
     tmp_p = out_p.with_name(f'{out_p.stem}.trjcat-tmp{out_p.suffix}')
-    _run([gmx_bin, 'trjcat', '-f', *[str(p) for p in parts], '-o', str(tmp_p)],
-         gen_dir)
+    if len(parts) == 1:
+        # Nothing to merge; copy rather than rename so a re-run of this step is
+        # idempotent and the part stays as the provenance record.
+        shutil.copy(parts[0], tmp_p)
+    else:
+        _run([gmx_bin, 'trjcat', '-f', *[str(p) for p in parts],
+              '-o', str(tmp_p)], gen_dir)
     tmp_p.replace(out_p)
     return out_p
 
