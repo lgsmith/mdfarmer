@@ -100,6 +100,11 @@ DEFFNM = 'prod'
 # is how much work a hard kill can cost; a shorter period costs almost nothing.
 CHECKPOINT_MINUTES = 5
 
+# Spacing between seeds in the gen-seed sequence. gen-seed is
+# base + GEN_SEED_STRIDE * seed_index + clone_index, so this must exceed
+# n_clones or two seeds draw the same initial velocities.
+GEN_SEED_STRIDE = 1000
+
 # Seconds between preempt-sentinel polls while mdrun runs.
 PREEMPT_POLL_SECONDS = 5
 
@@ -147,7 +152,7 @@ LEGACY_MDP_KEYS = {
 
 def write_gen_mdp(base_mdp, out_mdp, *, nsteps, nstxout_compressed,
                   gen_vel, continuation, gen_seed=None, gen_temp=None,
-                  legacy_mdp_keys=LEGACY_MDP_KEYS):
+                  ld_seed=None, legacy_mdp_keys=LEGACY_MDP_KEYS):
     """Copy base_mdp to out_mdp, overriding only the per-gen control keys.
 
     Only generation 0 needs this: later generations inherit their parameters
@@ -160,6 +165,12 @@ def write_gen_mdp(base_mdp, out_mdp, *, nsteps, nstxout_compressed,
         'gen-vel': 'yes' if gen_vel else 'no',
         'continuation': 'yes' if continuation else 'no',
     }
+    # ld-seed is not gated on gen_vel: it drives a stochastic thermostat for
+    # the whole run, not just the initial velocities. GROMACS keys its draws on
+    # (seed, step, atom), so one value per replica stays decorrelated across a
+    # continuation. Left alone when None, which keeps an mdp's `ld-seed = -1`.
+    if ld_seed is not None:
+        overrides['ld-seed'] = str(int(ld_seed))
     if gen_vel:
         if gen_seed is not None:
             overrides['gen-seed'] = str(int(gen_seed))
@@ -440,7 +451,15 @@ def gmx_generation(traj_dir_top_level: str,
                    write_interval: int = 50000,
                    temperature=None,            # gen-temp for gen-0 velocities (K)
                    new_velocities: bool = False,  # True only on gen 0
-                   gen_seed_base: int = 1,       # gen-seed = base + clone_index
+                   gen_seed_base: int = 1,
+                   # gen-seed = base + stride * seed_index + clone_index. The
+                   # stride keeps seeds apart: without it (seed 0, clone 0) and
+                   # (seed 1, clone 0) draw identical velocities. Must exceed
+                   # n_clones, which Farmer checks.
+                   gen_seed_stride: int = GEN_SEED_STRIDE,
+                   # Written to ld-seed when set, making a stochastic thermostat
+                   # reproducible. None keeps whatever the mdp holds.
+                   ld_seed: int = None,
                    maxh: float = 23.5,           # mdrun -maxh backstop
                    checkpoint_minutes: float = CHECKPOINT_MINUTES,
                    gmx_bin: str = GMX_BIN,
@@ -502,6 +521,7 @@ def gmx_generation(traj_dir_top_level: str,
             write_interval=write_interval, mdp_fn=mdp_fn, system_fn=system_fn,
             structure_fn=structure_fn, top_fn=top_fn, ndx_fn=ndx_fn,
             temperature=temperature, gen_seed_base=gen_seed_base,
+            gen_seed_stride=gen_seed_stride, ld_seed=ld_seed,
             clone_index=clone_index, seed_index=seed_index,
             traj_dir_top_level=traj_dir_top_level, dirname_pad=dirname_pad,
             sep=sep, tpr_name=tpr_name, gmx_bin=gmx_bin,
@@ -575,7 +595,8 @@ def gmx_generation(traj_dir_top_level: str,
 
 def _build_gen_tpr(*, tpr, gen_dir, gen_index, new_velocities, target_step,
                    write_interval, mdp_fn, system_fn, structure_fn, top_fn,
-                   ndx_fn, temperature, gen_seed_base, clone_index, seed_index,
+                   ndx_fn, temperature, gen_seed_base, gen_seed_stride,
+                   ld_seed, clone_index, seed_index,
                    traj_dir_top_level, dirname_pad, sep, tpr_name, gmx_bin,
                    grompp_maxwarn, grompp_lock=None):
     """Build this generation's tpr, holding `grompp_lock` if one was supplied.
@@ -605,7 +626,10 @@ def _build_gen_tpr(*, tpr, gen_dir, gen_index, new_velocities, target_step,
                           nsteps=target_step,
                           nstxout_compressed=write_interval,
                           gen_vel=True, continuation=False,
-                          gen_seed=gen_seed_base + clone_index,
+                          gen_seed=(gen_seed_base
+                                    + gen_seed_stride * seed_index
+                                    + clone_index),
+                          ld_seed=ld_seed,
                           gen_temp=temperature)
             grompp = [gmx_bin, 'grompp', '-f', gen_mdp,
                       '-c', str(Path(structure_fn).resolve()),

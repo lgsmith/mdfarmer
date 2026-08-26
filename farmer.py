@@ -174,6 +174,14 @@ class Farmer:
                  ):
         self.n_seeds = n_seeds
         self.n_clones = n_clones
+        # gen-seed is base + stride * seed_index + clone_index, so a stride at
+        # or below n_clones makes two seeds draw the same initial velocities.
+        gen_seed_stride = config_template.get('gen_seed_stride',
+                                              gmx.GEN_SEED_STRIDE)
+        if n_seeds > 1 and n_clones > gen_seed_stride:
+            raise ValueError(
+                f'gen_seed_stride={gen_seed_stride} is not larger than '
+                f'n_clones={n_clones}; seeds would share velocity seeds.')
         self.n_gens = n_gens
         self.overwrite = overwrite
         self.config_template = config_template
@@ -183,11 +191,10 @@ class Farmer:
                            for p in system_fns]
         self.top_fns = [str(self.check_path(Path(p)).resolve())
                         for p in top_fns]
-        # Engine selection. `runner` used to be stored and never read -- the
-        # engine was actually chosen by the run_script TEXT written into each
-        # gen dir, so passing runner=gmx_generation and forgetting run_script
-        # silently ran OpenMM. Now runner picks the matching defaults, and a
-        # mismatched hand-supplied set is refused rather than half-applied.
+        # Engine selection. `runner` picks the matching run_script, recover_fn
+        # and progress_fn; a hand-supplied set that disagrees with it is
+        # refused rather than half-applied, since the engine that actually runs
+        # is the one named in the run_script TEXT written to each gen dir.
         self.runner = runner
         self.run_script = run_script
         self.recover_fn = recover_fn
