@@ -51,9 +51,6 @@ SEAM_KEEP = 'keep'
 SYNTAX_LOOS = 'loos'
 SYNTAX_MDTRAJ = 'mdtraj'
 
-# LOOS reads and writes Angstroms; GROMACS .gro/.xtc are nm.
-ANGSTROM_PER_NM = reimage.ANGSTROM_PER_NM
-
 
 class HarvestError(RuntimeError):
     """Raised before the original is removed, so a failed harvest loses nothing."""
@@ -307,8 +304,7 @@ def _harvest_loos(traj_fn, structure_fn, subset_spec, dry_out, down_out,
 def _harvest_mdtraj(traj_fn, structure_fn, subset_spec, dry_out, down_out,
                     first_global_index, downsample_frq, skip_first,
                     timing=None, dry_topology_name=DRY_TOPOLOGY_NAME,
-                    iterload_chunk=ITERLOAD_CHUNK,
-                    angstrom_per_nm=ANGSTROM_PER_NM):
+                    iterload_chunk=ITERLOAD_CHUNK):
     """Same, in chunks, for the boxes LOOS cannot represent."""
     # The downsample follows the running frame index, not a [::N] slice of each
     # chunk, which would restart the phase at every chunk boundary.
@@ -317,8 +313,8 @@ def _harvest_mdtraj(traj_fn, structure_fn, subset_spec, dry_out, down_out,
 
     model = md.load(str(structure_fn))
     indices = None if subset_spec is None else subset_spec['indices']
-    dry_writer = _MdtrajWriter(Path(dry_out), angstrom_per_nm=angstrom_per_nm)
-    down_writer = _MdtrajWriter(Path(down_out), angstrom_per_nm=angstrom_per_nm)
+    dry_writer = _MdtrajWriter(Path(dry_out))
+    down_writer = _MdtrajWriter(Path(down_out))
     n_orig = n_dry = n_down = 0
     try:
         for chunk in md.iterload(str(traj_fn), top=model.top,
@@ -366,7 +362,7 @@ def _harvest_mdtraj(traj_fn, structure_fn, subset_spec, dry_out, down_out,
 class _MdtrajWriter:
     """Writer that appends, which Trajectory.save() cannot do."""
 
-    def __init__(self, out_p, angstrom_per_nm=ANGSTROM_PER_NM):
+    def __init__(self, out_p, angstrom_per_nm=reimage.ANGSTROM_PER_NM):
         import mdtraj as md
         self.suffix = out_p.suffix.lower()
         self.angstrom_per_nm = angstrom_per_nm
