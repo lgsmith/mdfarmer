@@ -281,6 +281,8 @@ class Clone:
                  ):
         # REQUIRED ARGS below here
         self.config = config  # dict keys and values must be json serializable.
+        # Before set_seed, whose error paths report self.get_tag().
+        self.compare_keys = compare_keys
         if steps_per_gen is None:
             self.total_steps = config['steps']
         else:
@@ -323,7 +325,6 @@ class Clone:
             self.job_name_fstring = self.sep.join(job_name_elements)
         self.dirname_pad = dirname_pad
         self.job_number_re = re.compile(job_number_re)
-        self.compare_keys = compare_keys
         self.harvester = harvester
         # The harvest reads the full generation length from config.json, and
         # config['steps'] is the steps still owed on a resume. Record the
