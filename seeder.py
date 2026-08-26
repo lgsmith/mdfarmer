@@ -706,12 +706,22 @@ class Clone:
                 print('  stdout:', result.stdout)
                 print('  stderr:', result.stderr)
                 return False
-            scheduler_output = result.stdout
             # NOTE: this assumes that some text is printed when a job is started,
             # and that within that text the first number matching job_number_re
             # is the Job number.
-            self.job_number = int(
-                self.job_number_re.search(scheduler_output).group(0))
+            match = self.job_number_re.search(result.stdout)
+            if match is None:
+                # The job IS running; only its id is lost. Say so, so it can be
+                # found and cancelled rather than left to write into a
+                # directory the tender has given up on.
+                print(f'{self.scheduler} SUBMITTED a job for {self.get_tag()} '
+                      f'in {self.current_gen_dir}, but no job number could be '
+                      f'read from its output. That job is RUNNING AND '
+                      f'UNTRACKED: find and cancel it by hand.')
+                print('  stdout:', result.stdout)
+                print('  stderr:', result.stderr)
+                return False
+            self.job_number = int(match.group(0))
             print('Started:', self.get_tag())
         return should_launch
 
@@ -1069,7 +1079,13 @@ class ClonePack:
             return False
         match = self.job_number_re.search(result.stdout)
         if match is None:
-            print(f'could not parse a job number from {result.stdout!r}')
+            # As for a solo clone: the pack's job is running, untracked.
+            print(f'{self.scheduler} SUBMITTED the job for {self.get_tag()} in '
+                  f'{self.pack_dir}, but no job number could be read from its '
+                  f'output. That job is RUNNING AND UNTRACKED: find and cancel '
+                  f'it by hand.')
+            print('  stdout:', result.stdout)
+            print('  stderr:', result.stderr)
             return False
         self.job_number = int(match.group(0))
         # Every member answers to the pack's job id, so the Farmer's
