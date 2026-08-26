@@ -138,6 +138,15 @@ file, falling back to `structure_fn`. That is what lets seeds differ in
 topology, and what lets an adaptive scheme reseed from a configuration it
 picked rather than from the structure the campaign started with.
 
+`n_gens` is a count, and generations are numbered from 0, so `n_gens=9` runs
+generations 0 through 8. A clone retires once it has finished the last of them.
+
+> Upgrading a campaign that ran before this was true: it may hold a generation
+> numbered `n_gens` or higher, which the older code submitted by mistake. The
+> tender now retires such a clone immediately and stops minding that job. It
+> does not cancel it — mdfarmer never runs `scancel` — so check for those
+> directories before you restart, and harvest or cancel them yourself.
+
 ### Packing replicas onto one GPU
 
 Where Slurm exposes only a `gpu` gres — no `mps`, no `shard` — it cannot
