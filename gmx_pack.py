@@ -104,11 +104,9 @@ def member_core_layout(cpus_per_task, n_replicas, member_cores=None):
     """``[(cores, offset), ...]``: one contiguous, non-overlapping core block
     per replica.
 
-    `member_cores` gives each member its own width, for a pack whose members
-    have different core knees -- pairing a `-update cpu` arm that scales to 12
-    cores with a `-update gpu` arm that plateaus at 4 wastes cores under an even
-    split, and starves the arm that could have used them. Absent, the split is
-    even.
+    `member_cores` sets each member's width independently, for a pack whose
+    members have different core knees. Absent, the allocation is split evenly,
+    which is what a pack of one condition wants.
     """
     cpus_per_task = int(cpus_per_task)
     if n_replicas < 1:

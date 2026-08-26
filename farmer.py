@@ -153,9 +153,9 @@ class Farmer:
                  # MPS packing. `pack_size` members share one job and one GPU;
                  # None leaves every clone submitting on its own. `pack_grouping`
                  # is callable(flat_clones) -> list[list[Clone]] for a policy
-                 # other than consecutive runs -- pairing two arms on a card,
-                 # say. `pack_member_cores` is a list or callable(group) -> list
-                 # giving each member its own core width.
+                 # other than consecutive runs. `pack_member_cores` is a list or
+                 # callable(group) -> list giving each member its own core
+                 # width, for members with different core knees.
                  pack_size=None,
                  pack_grouping=None,
                  pack_cpus_per_task=None,

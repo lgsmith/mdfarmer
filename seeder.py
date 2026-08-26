@@ -403,11 +403,12 @@ class Clone:
                   # right for one seed and nothing downstream would notice.
                   # None leaves the template's value alone.
                   structure_fn: str = None,
-                  # Per-seed config entries applied over the shared template --
-                  # the arm-specific half of a heterogeneous pack, where members
-                  # differ in mdrun_args (`-update cpu` vs `-update gpu`) or
-                  # write_interval. May not name a key from_disk derives per
-                  # clone; see CLONE_DERIVED_CONFIG_KEYS.
+                  # Per-seed config entries applied over the shared
+                  # template, for seeds that differ in more than their files --
+                  # mdrun_args (`-update cpu` where virtual sites forbid a GPU
+                  # update, `-update gpu` where they do not) or write_interval.
+                  # May not name a key from_disk derives per clone; see
+                  # CLONE_DERIVED_CONFIG_KEYS.
                   config_overrides: dict = None,
                   # The Farmer's full config_template. Read-only here; we
                   # deepcopy before mutating.
