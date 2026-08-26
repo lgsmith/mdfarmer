@@ -67,6 +67,10 @@ CHECKPOINT_MINUTES = 5
 # n_clones or two seeds draw the same initial velocities.
 GEN_SEED_STRIDE = 1000
 
+# Structure formats grompp -c will read. A generation that continues another is
+# seeded with a checkpoint instead, which is why the suffix has to be checked.
+GROMPP_STRUCTURE_SUFFIXES = ('.gro', '.g96', '.pdb', '.brk', '.ent')
+
 # Parameters gmx_pack injects into every gmx_generation call at runtime. A
 # config template records them too, so the file's copies must be dropped before
 # it is splatted, or the call gets two values for the same keyword.
@@ -382,9 +386,9 @@ def gmx_generation(traj_dir_top_level: str,
                    title: str,
                    # gen 0: path to the starting .gro; gen N: path to the seed
                    # state.cpt (copied into this gen dir by Clone).
-                   # seed_fn and append are here to match the OpenMM runner's
-                   # arguments, and are not read: Clone has already copied the
-                   # seed in under restart_name, and mdrun always -noappends.
+                   # What this generation starts from: a checkpoint when it
+                   # continues another, a structure when it starts fresh. Only
+                   # append is unread, since mdrun always -noappends.
                    seed_fn: str,
                    # constant starting structure (.gro) for grompp -c at gen 0.
                    structure_fn: str = None,
@@ -472,7 +476,8 @@ def gmx_generation(traj_dir_top_level: str,
             tpr=tpr, gen_dir=gen_dir, gen_index=gen_index,
             new_velocities=new_velocities, target_step=target_step,
             write_interval=write_interval, mdp_fn=mdp_fn, system_fn=system_fn,
-            structure_fn=structure_fn, top_fn=top_fn, ndx_fn=ndx_fn,
+            structure_fn=structure_fn, seed_fn=seed_fn, top_fn=top_fn,
+            ndx_fn=ndx_fn,
             temperature=temperature, gen_seed_base=gen_seed_base,
             gen_seed_stride=gen_seed_stride, ld_seed=ld_seed,
             clone_index=clone_index, seed_index=seed_index,
@@ -541,11 +546,13 @@ def gmx_generation(traj_dir_top_level: str,
 
 
 def _build_gen_tpr(*, tpr, gen_dir, gen_index, new_velocities, target_step,
-                   write_interval, mdp_fn, system_fn, structure_fn, top_fn,
+                   write_interval, mdp_fn, system_fn, structure_fn, seed_fn,
+                   top_fn,
                    ndx_fn, temperature, gen_seed_base, gen_seed_stride,
                    ld_seed, clone_index, seed_index,
                    traj_dir_top_level, dirname_pad, sep, tpr_name, gmx_bin,
-                   grompp_maxwarn, grompp_lock=None):
+                   grompp_maxwarn, grompp_lock=None,
+                   grompp_structure_suffixes=GROMPP_STRUCTURE_SUFFIXES):
     """Build this generation's tpr, holding grompp_lock if one was given.
 
     Generation 0 is grompp'd from the .mdp with fresh velocities. Later ones are
@@ -563,9 +570,17 @@ def _build_gen_tpr(*, tpr, gen_dir, gen_index, new_velocities, target_step,
                 raise ValueError(
                     'gmx_generation needs an .mdp via mdp_fn (or system_fn) to '
                     'build generation 0.')
-            if structure_fn is None:
+            # grompp -c takes this generation's own starting structure, which
+            # is seed_fn whenever the generation starts fresh. Using it rather
+            # than structure_fn is what lets seeds differ in topology, and lets
+            # an adaptive scheme reseed from a configuration it picked.
+            start_fn = seed_fn if (
+                seed_fn and Path(seed_fn).suffix.lower()
+                in grompp_structure_suffixes) else structure_fn
+            if start_fn is None:
                 raise ValueError(
-                    'gmx_generation needs structure_fn (the .gro for grompp -c).')
+                    'gmx_generation needs a structure for grompp -c, as either '
+                    'seed_fn or structure_fn.')
             gen_mdp = gen_dir / 'gen.mdp'
             write_gen_mdp(str(Path(mdp_fn).resolve()), str(gen_mdp),
                           nsteps=target_step,
@@ -577,7 +592,7 @@ def _build_gen_tpr(*, tpr, gen_dir, gen_index, new_velocities, target_step,
                           ld_seed=ld_seed,
                           gen_temp=temperature)
             grompp = [gmx_bin, 'grompp', '-f', gen_mdp,
-                      '-c', str(Path(structure_fn).resolve()),
+                      '-c', str(Path(start_fn).resolve()),
                       '-p', str(Path(top_fn).resolve()),
                       '-o', tpr, '-po', gen_dir / 'mdout.mdp',
                       '-maxwarn', grompp_maxwarn]
