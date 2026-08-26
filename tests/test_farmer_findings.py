@@ -36,8 +36,8 @@ def make_template(work, steps_per_gen=STEPS_PER_GEN,
 
 
 def make_farmer(work, template=None, n_seeds=N_SEEDS, n_clones=N_CLONES,
-                n_gens=N_GENS, cpus=CPUS, **kwargs):
-    return fm.Farmer(
+                n_gens=N_GENS, cpus=CPUS, cls=None, **kwargs):
+    return (fm.Farmer if cls is None else cls)(
         n_seeds=n_seeds, n_clones=n_clones, n_gens=n_gens,
         config_template=make_template(work) if template is None else template,
         seed_structure_fns=[str(work / 'a.gro')] * n_seeds,
@@ -81,6 +81,19 @@ def tend(farmer, clone):
     farmer.failed_clone_set = set()
     farmer.submit_failures = {}
     return farmer
+
+
+class HalfBuildingFarmer(fm.Farmer):
+    """A Farmer whose odd-numbered clones all fail to build."""
+
+    __slots__ = ()
+
+    def _setup_one_clone(self, tdir, seed_index, clone_index, rep_dict):
+        if clone_index % 2:
+            print(f'Skipping clone seed={seed_index} clone={clone_index}')
+            return None
+        return super()._setup_one_clone(tdir, seed_index, clone_index,
+                                        rep_dict)
 
 
 def captured(call):
@@ -129,6 +142,21 @@ def main(n_clones=N_CLONES):
                 farmer.config_template['traj_list']
                 == str(Path('traj_list.txt').resolve()),
                 f"-> {farmer.config_template['traj_list']}")
+
+    suite.section('clones that could not be set up are counted, not just listed')
+    n_clones_short = 4
+    farmer, log = captured(lambda: make_farmer(
+        work, n_clones=n_clones_short, cls=HalfBuildingFarmer))
+    built = sum(len(queue) for queue in farmer.priority_ordered_clones)
+    suite.check('only half the clones were built',
+                built == n_clones_short // 2, f'-> {built}')
+    suite.check('boot says how many of how many are missing',
+                f'{n_clones_short - built} of {n_clones_short} clones' in log)
+    suite.check('the campaign still boots on what it has',
+                any(farmer.priority_ordered_clones))
+    farmer, log = captured(lambda: make_farmer(work))
+    suite.check('a campaign that builds every clone says nothing',
+                'could not be set up' not in log)
 
     suite.section('a queued job whose name does not parse')
     farmer, _ = captured(lambda: make_farmer(work))

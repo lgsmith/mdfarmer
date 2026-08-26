@@ -444,6 +444,15 @@ class Farmer:
                 if clone is not None:
                     clone_queue.append(clone)
             self.priority_ordered_clones.append(clone_queue)
+        # Per-clone setup failures are printed one by one and are easy to miss
+        # in a long boot log. Count them while the queues still hold clones,
+        # since packing replaces them with packs.
+        asked_for = self.n_seeds * self.n_clones
+        built = sum(len(queue) for queue in self.priority_ordered_clones)
+        if built < asked_for:
+            print(f'WARNING: {asked_for - built} of {asked_for} clones could '
+                  'not be set up; this campaign will be that much smaller '
+                  'than asked for.')
         if self.pack_size or self.pack_grouping:
             self.build_packs(tdir)
 
