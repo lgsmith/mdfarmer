@@ -634,14 +634,19 @@ def unharvested_gen_dirs(top_level, sentinel_name=SENTINEL_NAME,
 
 
 def _frame_times(traj_p, scan_chunk=reimage.SCAN_CHUNK):
-    """Every frame's time, without ever holding the coordinates."""
+    """Every frame's time, without ever holding the coordinates.
+
+    None for a DCD, whose second field is cell lengths and which carries no
+    per-frame time at all.
+    """
     import numpy as np
     import mdtraj as md
+    if Path(traj_p).suffix.lower() != '.xtc':
+        return None
     times = []
     with md.open(str(traj_p)) as fh:
         while True:
-            frame = fh.read(scan_chunk)
-            time = np.asarray(frame[1])
+            time = np.asarray(fh.read(scan_chunk)[1])
             if not time.size:
                 break
             times.append(time)
