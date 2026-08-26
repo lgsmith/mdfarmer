@@ -108,13 +108,9 @@ def _try_recover_gen(gen_path: Path, *,
         # No traj yet for this gen. Start it now from this state.
         return gen_index, seed_fn, total_steps, False
 
-    # Frame accounting differs by format. Only DCD exposes a header we can read
-    # (and rewrite) directly; for XTC -- which is the config template's DEFAULT
-    # traj_suffix -- we count frames and cannot truncate, so a trajectory that
-    # has run ahead of its checkpoint has to be redone rather than trimmed.
-    # Demanding a DCD header unconditionally made every .xtc generation look
-    # unrecoverable, cascading each clone all the way back to gen 0 and
-    # overwriting trajectories that were perfectly good.
+    # Only DCD has a header we can read and rewrite. An XTC has to be counted
+    # instead, and cannot be trimmed, so an XTC that ran past its checkpoint is
+    # redone rather than cut back.
     is_dcd = traj_suffix == '.dcd'
     if is_dcd:
         try:
@@ -150,10 +146,9 @@ def _try_recover_gen(gen_path: Path, *,
         # intact; advance and let the next gen seed from it.
         return gen_index + 1, seed_fn, total_steps, False
     if target_nset < nset and not is_dcd:
-        # Trajectory ahead of the checkpoint, and this format cannot be trimmed
-        # in place. Advancing anyway would leave frames past the checkpoint that
-        # the next generation re-simulates from an earlier point -- a backward
-        # jump in the concatenated trajectory. Redo the generation instead.
+        # Trajectory past its checkpoint, in a format we cannot trim. Going
+        # on would leave frames the next generation re-simulates, which reads
+        # as time running backwards. Redo it instead.
         print(f'_try_recover_gen: {traj_p} has {nset} frames but state.xml is '
               f'at frame {target_nset}, and {traj_suffix} cannot be truncated; '
               f'cascading so this gen is redone rather than left discontiguous.')
@@ -291,12 +286,9 @@ class Clone:
                  # or start_next will reset gens to the shortened count. If
                  # None, fall back to config['steps'] for backwards compat.
                  steps_per_gen=None,
-                 # Callable(gen_dir, **context) -> steps still owed by that
-                 # generation. None uses the frame-count inference, which is
-                 # right for the OpenMM reporters. GROMACS passes
-                 # gmx_simulate.gmx_gen_progress, which reads the step the
-                 # runner recorded -- frame counting is off by one write
-                 # interval there, because gmx writes a frame at step 0.
+                 # Callable(gen_dir, **context) giving the steps a generation
+                 # still owes. None counts frames, which is right for OpenMM.
+                 # GROMACS passes gmx_simulate.gmx_gen_progress instead.
                  progress_fn=None,
                  dry_run=False
                  ):
@@ -357,10 +349,9 @@ class Clone:
                 f"config['steps_per_gen']={config['steps_per_gen']} disagrees "
                 f'with steps_per_gen={self.total_steps}; the harvest would '
                 'place this clone\'s frames at the wrong global index.')
-        # Config time is the only free moment to catch a generation length that
-        # is not a whole number of write intervals, or a frame count that is not
-        # a whole number of downsample periods. Both break the spacing of the
-        # harvested streams at every seam, and neither ever fails loudly.
+        # Catch a bad generation length now, while it is still free to fix.
+        # Both spacings break the harvested trajectories at every seam, and
+        # neither ever fails loudly.
         if harvester is not None:
             downsample_frq = (getattr(harvester, 'run_config', None)
                               or {}).get('downsample_frq')
@@ -398,17 +389,14 @@ class Clone:
                   # Resolved, validated top and system paths for this seed.
                   top_fn: str,
                   system_fn: str,
-                  # The .gro/.pdb this seed's generation 0 is grompp'd from.
-                  # Per-seed, because one shared template value can only be
-                  # right for one seed and nothing downstream would notice.
-                  # None leaves the template's value alone.
+                  # The .gro or .pdb this seed's generation 0 starts from.
+                  # Per seed, since one shared value can only suit one of them.
+                  # None keeps whatever the template says.
                   structure_fn: str = None,
-                  # Per-seed config entries applied over the shared
-                  # template, for seeds that differ in more than their files --
-                  # mdrun_args (`-update cpu` where virtual sites forbid a GPU
-                  # update, `-update gpu` where they do not) or write_interval.
-                  # May not name a key from_disk derives per clone; see
-                  # CLONE_DERIVED_CONFIG_KEYS.
+                  # Config entries laid over the shared template for this
+                  # seed, for seeds that differ in more than their files, such
+                  # as in mdrun_args or write_interval. May not name a key
+                  # from_disk works out per clone.
                   config_overrides: dict = None,
                   # The Farmer's full config_template. Read-only here; we
                   # deepcopy before mutating.
@@ -445,12 +433,9 @@ class Clone:
         clone_dir = util.dir_seeds_clones(
             tdir, seed_index, clone_index, dirname_pad, sep=sep, mkdir=False)
         if clone_dir.is_dir():
-            # Sorted by the gen NUMBER, not the directory name: a lexicographic
-            # sort agrees with numeric order only while every index has the same
-            # width, so at dirname_pad=3 'gen-999' sorts after 'gen-1000' and
-            # recovery walks back from the wrong generation. Names that don't
-            # parse (stray files, harvest output) sort last and are skipped by
-            # the recover function's own config.json check.
+            # Sorted by generation number, not by name: sorting by name only
+            # agrees once every index is the same width, so gen-999 would come
+            # after gen-1000. Names that do not parse sort last.
             gen_paths = sorted(clone_dir.iterdir(),
                                key=lambda p: _gen_sort_key(p, sep))
         else:
@@ -618,13 +603,10 @@ class Clone:
         # If we've made a fresh directory this should copy the
         # previous seed into the new directory.
         self.check_copy_set_restart_seed()
-        # config.json is ALWAYS rewritten from the in-memory config, which is the
-        # authority on what this launch should do. Keeping a stale file when
-        # overwrite=False (the Farmer default) meant a resume computed the right
-        # `steps`, `append` and `seed_fn`, wrote none of them, and the job read
-        # the first attempt's config instead -- so a partially-run generation
-        # relaunched as if from scratch. Written via a temp file so a reader (or
-        # a job starting concurrently) never sees a half-written config.
+        # config.json is always rewritten, even when overwrite is False: the
+        # config in memory is what this launch should do, and a stale file on
+        # disk would relaunch a half-finished generation from scratch. Written
+        # to a temp name first, so nothing reads it half-written.
         config_p = self.current_gen_dir / 'config.json'
         tmp_p = config_p.with_name(config_p.name + '.tmp')
         with tmp_p.open('w') as f:
@@ -707,10 +689,9 @@ class Clone:
         self.remaining_steps = self.total_steps
         # then with respect to the number of steps to write to the config.json
         self.config['steps'] = self.total_steps
-        # A new generation is never a resume. append was set True the first time
-        # THIS generation was continued mid-flight, and leaving it set leaked
-        # into the next generation, which then launched as if it were resuming a
-        # partial run it had never started.
+        # A new generation is never a resume. Leaving append set would carry
+        # into it from the generation before, which then starts as though
+        # continuing a partial run it never began.
         self.config['append'] = False
         # because we want to start next, increment the gen before building
         self.config['gen_index'] += 1
@@ -719,10 +700,8 @@ class Clone:
                                               submit=submit)
         return attempted_launch
 
-    # How many steps this generation still owes. Engine-specific when a
-    # progress_fn was supplied (GROMACS reads the step the runner recorded);
-    # otherwise inferred from the trajectory's frame count, which is what the
-    # OpenMM reporters make true.
+    # How many steps this generation still owes. progress_fn answers if one
+    # was given; otherwise it is counted from the trajectory's frames.
     def gen_remaining_steps(self):
         if self.progress_fn is not None:
             return self.progress_fn(
@@ -758,12 +737,10 @@ class Clone:
 
         previous_remaining = self.remaining_steps
         self.remaining_steps = self.gen_remaining_steps()
-        # A launch that moved the generation forward is not a "restart" in the
-        # sense the budget polices -- it is how a generation longer than one
-        # walltime allocation gets finished. Progress also CLEARS the budget:
-        # it counts consecutive dead launches, so a generation spanning many
-        # walltime blocks is not abandoned for three isolated bad nodes spread
-        # across its life.
+        # A launch that got somewhere is not a restart: it is how a
+        # generation longer than one allocation finishes. Progress also clears
+        # the budget, which therefore counts launches that died in a row, not
+        # bad nodes spread over a generation's whole life.
         if self.remaining_steps < previous_remaining:
             count_as_restart = False
             self.restart_attempts = 0
@@ -787,11 +764,9 @@ class Clone:
             return self.start_next(overwrite=overwrite, submit=submit)
 
         if self.remaining_steps >= self.total_steps:
-            # Nothing ran. Last chance to scan the failing job's scheduler log
-            # for a node-local cause before the next submission overwrites
-            # slurm.out / lsf.out. If a fatal-on-node pattern matched, the
-            # registry adds the node to scheduler_kws['exclude_nodes'] so
-            # plow_harrow_plant renders a directive that steers off it.
+            # Nothing ran. Read the scheduler log for a node-local cause
+            # before the next submission overwrites it. A match adds the node
+            # to exclude_nodes, which steers later jobs off it.
             if self.node_blocklist is not None:
                 self.node_blocklist.scan_and_record(
                     self.scheduler_log_dir or self.current_gen_dir,
@@ -856,10 +831,9 @@ class ClonePack:
                  pack_manifest_name='pack.json',
                  run_script_name='run.py',
                  member_cores=None,
-                 # Members with unequal steps per generation are refused,
-                 # because the job holds the card until its slowest finishes.
-                 # True when every launch ends at -maxh rather than at a step
-                 # target -- then no member ever waits for another.
+                 # Members with unequal steps are refused, since the job
+                 # holds the card until its slowest finishes. True when every
+                 # launch ends on walltime, where none of them waits.
                  wallclock_matched=False,
                  sep=None,
                  job_name_elements=('{title}', '{seed_index}',
@@ -879,11 +853,9 @@ class ClonePack:
         self.pack_dir.mkdir(parents=True, exist_ok=True)
         self.scheduler = scheduler
         self.scheduler_fstring = inspect.cleandoc(scheduler_fstring)
-        # Held by reference, not copied: BadNodeRegistry writes new
-        # exclusions into the Farmer's dict, and a pack built once at boot
-        # would otherwise keep submitting to a node the Farmer has blocked.
-        # Pack-specific keys are overlaid at format time so this stays
-        # read-only.
+        # Held by reference, not copied, so that nodes blocked later still
+        # reach this pack. The pack's own keys are laid over it at submit
+        # time, which keeps this dict read-only here.
         self.scheduler_kws = scheduler_kws
         self.pack_scheduler_kws = {'cpus': int(cpus_per_task),
                                    'run_script_name': run_script_name}
@@ -900,11 +872,9 @@ class ClonePack:
         self.member_cores = member_cores
         self.pack_manifest_name = pack_manifest_name
         self.job_number_re = re.compile(job_number_re)
-        # The name must parse under the scheme Farmer re-associates by at
-        # boot: int() over name.split(sep)[-3:] for (seed, clone, gen). A name
-        # that does not parse leaves job_number None, and the next tick puts a
-        # second job in this pack directory -- two mdruns on one checkpoint and
-        # one part-number sequence, which no checkpoint recovers from.
+        # The name has to parse the way Farmer re-associates jobs at boot,
+        # as seed, clone and gen numbers. One that does not leaves job_number
+        # unset, and the next tick starts a second job in this directory.
         self.sep = clones[0].sep if sep is None else sep
         self.job_name_fstring = (job_name_fstring
                                  or self.sep.join(job_name_elements))

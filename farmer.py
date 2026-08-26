@@ -24,14 +24,10 @@ class Farmer:
                  'seed_config_overrides')
 
     # Refresh the set of job ids the scheduler says are ours and alive.
-    #
-    # Returns False when the query could not be trusted, in which case
-    # current_jids is left ALONE. That distinction is the whole point: the
-    # report command is a pipeline ending in awk, so a squeue that times out or
-    # errors still exits 0 through the pipe and prints nothing. Treating that
-    # empty output as "no jobs are running" made the Farmer relaunch every live
-    # clone, putting two mdruns in one generation directory. pipefail makes the
-    # pipeline inherit squeue's failure instead.
+    # Returns False when the answer could not be trusted, leaving current_jids
+    # alone. The report command is a pipeline, so a squeue that fails still
+    # exits 0 and prints nothing, and reading that as "no jobs running" would
+    # relaunch every live clone. pipefail makes the pipeline fail instead.
     def update_jids(self):
         try:
             jids_string = sp.check_output(
@@ -154,12 +150,11 @@ class Farmer:
                  # clone is abandoned. A generation spanning many walltime
                  # blocks wants more headroom than one that is a single job.
                  restarts_per_gen=3,
-                 # MPS packing. `pack_size` members share one job and one GPU;
-                 # None leaves every clone submitting on its own. `pack_grouping`
-                 # is callable(flat_clones) -> list[list[Clone]] for a policy
-                 # other than consecutive runs. `pack_member_cores` is a list or
-                 # callable(group) -> list giving each member its own core
-                 # width, for members with different core knees.
+                 # MPS packing. pack_size members share one job and one GPU;
+                 # None lets every clone submit on its own. pack_grouping,
+                 # callable(clones) -> list of lists, chooses who goes with
+                 # whom. pack_member_cores, a list or callable(group) -> list,
+                 # gives each member its own number of cores.
                  pack_size=None,
                  pack_grouping=None,
                  pack_cpus_per_task=None,
@@ -239,10 +234,9 @@ class Farmer:
                            for p in system_fns]
         self.top_fns = [str(self.check_path(Path(p)).resolve())
                         for p in top_fns]
-        # Engine selection. `runner` picks the matching run_script, recover_fn
-        # and progress_fn; a hand-supplied set that disagrees with it is
-        # refused rather than half-applied, since the engine that actually runs
-        # is the one named in the run_script TEXT written to each gen dir.
+        # runner picks the matching run_script, recover_fn and progress_fn. A
+        # hand-supplied set that disagrees is refused rather than half applied,
+        # since the engine that runs is the one named in the run script.
         self.runner = runner
         self.run_script = run_script
         self.recover_fn = recover_fn
@@ -389,12 +383,9 @@ class Farmer:
                 continue
             self.current_jids.add(jid)
             try:
-                # The last THREE fields, not everything after the first: the
-                # title sits in front and may itself contain the separator
-                # (a title like 'trpcage-native-277' with sep='-' produced five
-                # fields, the unpack raised, and the running job was never bound
-                # to its Clone -- so the Farmer launched a second job into the
-                # live generation directory).
+                # The last three fields only. The title comes first and may
+                # contain the separator itself, which would otherwise leave a
+                # running job unbound and get a second one launched over it.
                 six, cix, gix = map(int, ls[1].split(self.sep)[-3:])
                 rep_dict[(six, cix, gix)] = jid
             except (ValueError, IndexError):
@@ -497,10 +488,9 @@ class Farmer:
                                  if pack.job_number is not None}
         return packs
 
-    # check_start_gen touches the filesystem, the scheduler and (for GROMACS)
-    # the gmx binary, any of which can raise. Before this, a single raised
-    # exception anywhere in the tending loop killed the whole multi-week
-    # orchestrator process and left every running job unminded.
+    # check_start_gen touches the filesystem, the scheduler and the gmx
+    # binary, any of which can raise. One raise must not kill a tender that has
+    # been minding a campaign for weeks.
     def _safe_check_start_gen(self, clone):
         try:
             return clone.check_start_gen(
@@ -544,10 +534,8 @@ class Farmer:
                     # If clone is in active set, it may have just finished a generation.
                     elif clone in self.active_clone_set:
                         print('clone is in active clone list')
-                        # Try to start another. One clone's bad disk state,
-                        # unreadable checkpoint or failed submission must not
-                        # take down an orchestrator that is minding hundreds of
-                        # others for weeks -- fail just this clone.
+                        # Try to start another. A bad checkpoint or a failed
+                        # submission fails this clone, not the whole campaign.
                         did_start = self._safe_check_start_gen(clone)
                         if did_start:
                             still_running.append(True)
@@ -585,10 +573,9 @@ class Farmer:
     def start_tending_fields(self, update_interval=120):
         if not self.priority_ordered_clones or not any(
                 self.priority_ordered_clones):
-            # Every clone failed to build. _setup_one_clone deliberately
-            # isolates per-clone setup failures, but "all of them failed" must
-            # not read as "the campaign is done" -- that returned success having
-            # launched nothing at all.
+            # Every clone failed to build. Setup failures are isolated per
+            # clone on purpose, but all of them failing is not the campaign
+            # finishing, and must not report success having launched nothing.
             raise RuntimeError(
                 'No clones could be set up; nothing to tend. Check the '
                 'per-clone setup errors printed above (missing structure, '
@@ -608,10 +595,9 @@ class Farmer:
                     f'Brake file detected: {brake_file_p.resolve()} Stopping submission loop.')
                 return False
             time.sleep(update_interval)
-            # The loop itself must outlive anything transient -- a scheduler
-            # hiccup, an NFS stall, a harvester blowing up. Losing the tender
-            # mid-campaign leaves every running job unminded and every finished
-            # generation unadvanced, which is the expensive failure here.
+            # The loop has to outlive anything passing: a scheduler hiccup,
+            # a stalled filesystem, a harvest blowing up. Losing the tender
+            # leaves every running job unminded, which is what costs.
             try:
                 still_running = self.launch(sleep=None)
             except Exception as exc:
