@@ -446,11 +446,7 @@ def gmx_generation(traj_dir_top_level: str,
                    clone_index: int,
                    gen_index: int,
                    title: str,
-                   # gen 0: path to the starting .gro; gen N: path to the seed
-                   # state.cpt (copied into this gen dir by Clone).
-                   # What this generation starts from: a checkpoint when it
-                   # continues another, a structure when it starts fresh. Only
-                   # append is unread, since mdrun always -noappends.
+                   # gen 0: the starting .gro; gen N: the seed state.cpt.
                    seed_fn: str,
                    # constant starting structure (.gro) for grompp -c at gen 0.
                    structure_fn: str = None,
@@ -458,37 +454,31 @@ def gmx_generation(traj_dir_top_level: str,
                    mdp_fn: str = None,
                    # Farmer sets config['system_fn'] per seed; repurposed as the .mdp.
                    system_fn: str = None,
-                   append: bool = False,
+                   append: bool = False,  # unread; mdrun always -noappends
                    dirname_pad: int = 2,
                    sep: str = '-',
                    traj_name: str = 'prod',
                    traj_suffix: str = '.xtc',
                    restart_name: str = 'state.cpt',
-                   # Full generation length. config['steps'] shrinks to the
-                   # remainder on a resume, but the tpr's nsteps has to be the
-                   # total from the start of the run.
+                   # A resume shrinks this to the remainder still owed.
                    steps: int = 500000,
+                   # Full generation length; what the tpr's nsteps counts to.
                    steps_per_gen: int = None,
-                   # xtc stride; steps must be a whole number of these or the
-                   # last frame of a generation does not land on its final step.
+                   # xtc stride; steps must be a whole number of these.
                    write_interval: int = 50000,
                    temperature=None,            # gen-temp for gen-0 velocities (K)
                    new_velocities: bool = False,  # True only on gen 0
                    gen_seed_base: int = 1,
-                   # gen-seed = base + stride * seed + clone, so two seeds
-                   # cannot draw the same velocities. Farmer checks the stride
-                   # is bigger than n_clones.
+                   # Overrides GEN_SEED_STRIDE; Farmer checks it > n_clones.
                    gen_seed_stride: int = GEN_SEED_STRIDE,
-                   # Written to ld-seed when set, making a stochastic thermostat
-                   # reproducible. None keeps whatever the mdp holds.
+                   # ld-seed when set; None keeps whatever the mdp holds.
                    ld_seed: int = None,
                    maxh: float = 23.5,           # mdrun -maxh backstop
                    checkpoint_minutes: float = CHECKPOINT_MINUTES,
                    gmx_bin: str = GMX_BIN,
                    ndx_fn: str = None,
                    grompp_maxwarn: int = 2,
-                   # mdrun hardware flags. -update cpu is MANDATORY with TIP4P-ice
-                   # virtual sites.
+                   # -update cpu is MANDATORY with TIP4P-ice virtual sites.
                    mdrun_args=('-nb', 'gpu', '-bonded', 'gpu', '-pme', 'gpu',
                                '-update', 'cpu', '-pin', 'on', '-nstlist', '200'),
                    handle_preempt: bool = False,
@@ -496,12 +486,10 @@ def gmx_generation(traj_dir_top_level: str,
                    tpr_name: str = TPR_NAME,
                    seed_cpt_name: str = SEED_CPT_NAME,
                    gen_status_name: str = GEN_STATUS_NAME,
-                   # Shared stop-signal when several generations run in one
-                   # job (MPS packing); None for a solo generation.
+                   # Shared stop signal when generations are packed in one job.
                    fleet=None,
                    fleet_key=None,
-                   # Held while the tpr is built. grompp is cheap but K of them
-                   # at once just contend for cores at job startup.
+                   # Held while the tpr is built, so K grompps do not contend.
                    grompp_lock=None,
                    **_unused):
     """Run generation gen_index to completion and return its merged trajectory.
