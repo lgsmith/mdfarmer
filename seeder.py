@@ -536,18 +536,20 @@ class Clone:
             run_script=run_script,
         )
 
-    # Two clones should be the same if their config has the same seed, clone, and title in it.
-    # Customize by providing a set of keys to compare.
     def __hash__(self):
+        """Hash the config entries named by compare_keys, seed and clone here."""
         return hash(tuple(self.config[k] for k in self.compare_keys))
 
-    # Use has to define equality;
-    # Note if the two clones are using different compare keys this will nearly always be false
     def __eq__(self, other: Clone) -> bool:
+        """Equal when the hashes match.
+
+        Two clones compared on different compare_keys will nearly always
+        differ, whatever else they have in common.
+        """
         return hash(self) == hash(other)
 
-    # Return a string representing key features of this clone
     def get_tag(self):
+        """Return a string of the config entries that identify this clone."""
         return ' '.join((f'{k}: {self.config[k]}'
                          for k in self.compare_keys))
 
@@ -573,26 +575,26 @@ class Clone:
             shutil.copy(seed_p, cg_seed_p)
             self.set_seed(cg_seed_p)
 
-    # Returns True if the scheduler reports this clone's last job was
-    # preempted (so the upcoming restart shouldn't count against the
-    # per-gen restart_attempts budget).
     def was_preempted(self):
+        """True if the scheduler reports this clone's last job was preempted.
+
+        The restart that follows one does not count against restarts_per_gen.
+        """
         if self.preemption_checker is None:
             return False
         if self.job_number is None:
             return False
         return self.preemption_checker(self.job_number)
 
-    # note this gets the gen index from config then builds the dir for that gen
-    # So, if you want to start a new generation, you have to increment/change
-    # self.config['gen_index'] before calling this.
-    # Tries to set up directory, and checks if we've gone over the number of restart limits
-    # Returns a bool based on success (True) or failure (False) of these efforts.
-    # If count_as_restart is False (e.g. last job was preempted), skip the
-    # restart_attempts increment so the budget isn't burned by preemption.
     def plow_harrow_plant(self, overwrite=False, count_as_restart=True):
-        # If we're running subsequent generations, we want to restart from prev.
-        # positions and velocities.
+        """Make this generation's directory and write the files a launch needs.
+
+        The generation comes from config['gen_index'], so a caller starting a
+        new one has to increment that first. Returns False once this generation
+        has used up restarts_per_gen. count_as_restart False, as after a
+        preemption, skips the restart_attempts increment.
+        """
+        # Subsequent gens restart from the previous positions and velocities.
         if self.config['gen_index'] != 0:
             self.config['new_velocities'] = False
 
@@ -605,13 +607,10 @@ class Clone:
             sep=self.config['sep'],
             mkdir=True
         )
-        # If we've made a fresh directory this should copy the
-        # previous seed into the new directory.
+        # A fresh directory needs the previous seed copied into it.
         self.check_copy_set_restart_seed()
-        # config.json is always rewritten, even when overwrite is False: the
-        # config in memory is what this launch should do, and a stale file on
-        # disk would relaunch a half-finished generation from scratch. Written
-        # to a temp name first, so nothing reads it half-written.
+        # Rewritten even when overwrite is False: a stale config on disk would
+        # relaunch a half-finished gen from scratch. Temp name, so no torn read.
         config_p = self.current_gen_dir / 'config.json'
         tmp_p = config_p.with_name(config_p.name + '.tmp')
         with tmp_p.open('w') as f:
@@ -656,32 +655,25 @@ class Clone:
         if should_launch and not self.dry_run:
             print('launching', self.get_tag())
             # SIMULATION RUNS HERE. OUTPUT SCANNED FOR JOB NUMBER.
-            # sp.run with capture_output=True (not check_output) so stderr is
-            # captured and surfaced — check_output leaves err.stderr=None,
-            # which made the previous failure print uninformative.
+            # capture_output, not check_output, so stderr can be surfaced.
             with self.scheduler_script_p.open() as f:
                 result = sp.run(
                     self.scheduler, stdin=f, cwd=self.current_gen_dir,
                     text=True, capture_output=True)
             if result.returncode != 0:
-                # Submission failed (bad QOS, account, scheduler hiccup,
-                # malformed script). Return False so the Farmer marks this
-                # clone failed via mark_clone_failed and keeps tending the
-                # rest, rather than letting one bad sbatch kill the
-                # orchestrator.
+                # Submission failed: bad QOS, account, scheduler hiccup or
+                # script. Fail this clone rather than the whole orchestrator.
                 print(f'{self.scheduler} call for {self.get_tag()} returned '
                       f'exit code {result.returncode}')
                 print('  stdout:', result.stdout)
                 print('  stderr:', result.stderr)
                 return False
-            # NOTE: this assumes that some text is printed when a job is started,
-            # and that within that text the first number matching job_number_re
-            # is the Job number.
+            # Assumes the scheduler prints something on submission, whose first
+            # job_number_re match is the job number.
             match = self.job_number_re.search(result.stdout)
             if match is None:
-                # The job IS running; only its id is lost. Say so, so it can be
-                # found and cancelled rather than left to write into a
-                # directory the tender has given up on.
+                # The job is running; only its id is lost. Say so, so it can be
+                # cancelled rather than left writing into an abandoned dir.
                 print(f'{self.scheduler} SUBMITTED a job for {self.get_tag()} '
                       f'in {self.current_gen_dir}, but no job number could be '
                       f'read from its output. That job is RUNNING AND '
@@ -694,45 +686,48 @@ class Clone:
         return should_launch
 
     def start_next(self, overwrite=False, submit=True):
-        # Set seed to be current restart file, but full path so it will be found in next gen dir.
+        """Advance this clone one generation and launch it."""
+        # An absolute path, so the restart file is found from the next gen dir.
         new_seed = self.current_gen_dir/self.config['restart_name']
         self.set_seed(new_seed.resolve())
-        # reset number of restart attempts
         self.restart_attempts = 0
-        # reset number of steps to take
-        # first for accounting inside the clone
+        # The full step count again, for the clone's own accounting...
         self.remaining_steps = self.total_steps
-        # then with respect to the number of steps to write to the config.json
+        # ...and for what gets written to config.json.
         self.config['steps'] = self.total_steps
-        # A new generation is never a resume. Leaving append set would carry
-        # into it from the generation before, which then starts as though
-        # continuing a partial run it never began.
+        # A new generation is never a resume; an append carried over from the
+        # last one starts it as though continuing a run it never began.
         self.config['append'] = False
-        # because we want to start next, increment the gen before building
+        # Increment before building, since the point is to start the next one.
         self.config['gen_index'] += 1
         attempted_launch = self.start_current(overwrite=overwrite,
                                               submit=submit)
         return attempted_launch
 
-    # The generation this clone would run next. Read from the config rather
-    # than tracked alongside it, so a caller that moves config['gen_index'] --
-    # which is how an adaptive-sampling script redirects a clone -- cannot
-    # leave the two disagreeing.
     @property
     def current_gen(self):
+        """The generation this clone would run next.
+
+        Read from the config rather than tracked alongside it, so an adaptive
+        sampling script that redirects a clone by moving config['gen_index']
+        cannot leave the two disagreeing.
+        """
         return self.config['gen_index']
 
-    # True once this clone has finished its last configured generation and
-    # will never start another. False when last_gen_index is None, since
-    # there is then no limit to have reached.
     @property
     def is_done(self):
+        """True once this clone has finished its last configured generation.
+
+        Always False when last_gen_index is None: there is then no limit.
+        """
         return (self.last_gen_index is not None
                 and self.current_gen > self.last_gen_index)
 
-    # How many steps this generation still owes. progress_fn answers if one
-    # was given; otherwise it is counted from the trajectory's frames.
     def gen_remaining_steps(self):
+        """How many steps this generation still owes.
+
+        progress_fn answers if one was given, otherwise frames are counted.
+        """
         if self.progress_fn is not None:
             return self.progress_fn(
                 self.current_gen_dir,
