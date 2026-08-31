@@ -278,7 +278,7 @@ class Farmer:
                  pack_run_script=None,
                  # A list, or callable(group) -> list, of cores per member.
                  pack_member_cores=None,
-                 # One dict per seed, laid over config_template. Length n_seeds.
+                 # One dict per seed, laid over config_template. n_seeds long.
                  seed_config_overrides=None,
                  sep='-',
                  seeds_first=True,
@@ -299,7 +299,7 @@ class Farmer:
                  handle_preempt=False,
                  # Where learned bad nodes are written, and reloaded from.
                  bad_node_persist='bad_nodes.txt',
-                 # Log substrings marking a node-local failure. None -> default.
+                 # Log substrings marking a node-local failure, or the default.
                  bad_node_patterns=None,
                  ):
         self.n_seeds = n_seeds
@@ -320,8 +320,7 @@ class Farmer:
                 f'seed_config_overrides has {len(seed_config_overrides)} '
                 f'entries for {n_seeds} seeds')
         self.seed_config_overrides = seed_config_overrides
-        # gen-seed is base + stride * seed_index + clone_index, so a stride at
-        # or below n_clones makes two seeds draw the same initial velocities.
+        # gen-seed is base + stride * seed_index + clone_index.
         gen_seed_stride = config_template.get('gen_seed_stride',
                                               gmx.GEN_SEED_STRIDE)
         if n_seeds > 1 and n_clones > gen_seed_stride:
@@ -331,8 +330,7 @@ class Farmer:
         self.n_gens = n_gens
         self.overwrite = overwrite
         self.config_template = config_template
-        # Resolve and validate top / system paths once up front so per-clone
-        # setup doesn't repeat the work and a bad file fails loudly at boot.
+        # Resolve and check once here, so a bad file fails loudly at boot.
         self.system_fns = [str(self.check_path(Path(p)).resolve())
                            for p in system_fns]
         self.top_fns = [str(self.check_path(Path(p)).resolve())
@@ -342,18 +340,11 @@ class Farmer:
         self.scheduler = scheduler
         self.scheduler_kws = scheduler_kws
         self.scheduler_fstring = scheduler_fstring
-        # Stand up the bad-node registry *before* anything that might
-        # call str.format() on the scheduler_fstring, so the
-        # exclude_nodes key is present and any persisted bad-node
-        # exclusion is in effect from the first submission this farmer
-        # makes (including resumes after a crash that already learned
-        # which nodes were bad).
+        # Before anything formats scheduler_fstring, so exclude_nodes is set.
         self.node_blocklist = util.BadNodeRegistry(
             bad_node_persist, scheduler, self.scheduler_kws,
             patterns=bad_node_patterns)
-        # Honor handle_preempt whether it arrives via this constructor arg or
-        # is set directly on config_template, so the config_template route
-        # cannot arm the SentinelReporter behind the Farmer's back.
+        # Either route to handle_preempt must reach the check below.
         if handle_preempt or self.config_template.get('handle_preempt'):
             self.config_template['handle_preempt'] = True
         self.check_preempt_template()
@@ -372,11 +363,7 @@ class Farmer:
                 self.check_path(Path(self.config_template['integrator_xml'])).resolve()
             )
 
-        # A generation's last partial chunk writes neither a frame nor a
-        # checkpoint, so the steps in it can never be counted as done: the
-        # clone would spend its whole restart budget on that last sliver and
-        # then be failed. Both keys are optional, since not every engine's
-        # template carries them.
+        # Both keys are optional; not every engine's template carries them.
         steps = self.config_template.get('steps')
         write_interval = self.config_template.get('write_interval')
         if steps and write_interval and steps % write_interval:
@@ -386,12 +373,7 @@ class Farmer:
                 f'{steps % write_interval} would write no frame and no '
                 'checkpoint, so the generation would never finish.')
 
-        # buffering=0 on the DCD reporter's underlying file would make every
-        # struct.pack inside DCDFile.writeModel its own syscall — much slower
-        # than buffered writes plus an explicit flush per frame (which is what
-        # FlushingDCDReporter does, microseconds per fire). If a user has put
-        # buffering=0 in the config template they probably meant "flush per
-        # frame" but reached for the wrong knob.
+        # Whoever set this meant "flush per frame", already the default.
         if self.config_template.get('buffering') == 0:
             print('WARNING: config_template["buffering"] == 0 will make each '
                   'DCDFile.writeModel struct.pack a separate syscall and slow '
@@ -422,8 +404,7 @@ class Farmer:
         self.active_clone_threshold = active_clone_threshold
         self.active_clone_set = set()
         self.failed_clone_set = set()
-        # Every generation appends to this from its own gen directory, so it
-        # has to be one absolute path however it was given.
+        # Every gen appends from its own directory, so it must be absolute.
         self.config_template['traj_list'] = str(Path(
             self.config_template.get('traj_list') or traj_list
             or 'traj_list.txt').resolve())
@@ -450,9 +431,7 @@ class Farmer:
                 if clone is not None:
                     clone_queue.append(clone)
             self.priority_ordered_clones.append(clone_queue)
-        # Per-clone setup failures are printed one by one and are easy to miss
-        # in a long boot log. Count them while the queues still hold clones,
-        # since packing replaces them with packs.
+        # Count now: packing replaces the clones in these queues with packs.
         asked_for = self.n_seeds * self.n_clones
         built = sum(len(queue) for queue in self.priority_ordered_clones)
         if built < asked_for:
