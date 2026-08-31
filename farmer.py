@@ -258,38 +258,27 @@ class Farmer:
                  scheduler_assoc_rep_cmd: str,
                  traj_list=None,
                  quiet=False,
+                 # Slots for running clones at once, or for packs once packing.
                  active_clone_threshold=50,
                  dirname_pad=3,
                  job_number_re='[1-9][0-9]*',
-                 # Where the live job ids are mirrored. None puts
-                 # '<title>-jids.txt' in the launch directory, which collides
-                 # if two Farmers share a title and a working directory.
+                 # Where live job ids are mirrored; None -> '<title>-jids.txt'.
                  jids_file=None,
-                 # Consecutive dead launches a generation may take before its
-                 # clone is abandoned. A generation spanning many walltime
-                 # blocks wants more headroom than one that is a single job.
+                 # Dead launches a gen may take before its clone is dropped.
                  restarts_per_gen=3,
-                 # Ticks in a row a clone may fail to advance before the tender
-                 # gives up on it. Counts submissions the scheduler refused and
-                 # generations that ran out of restarts alike.
+                 # Failed advances in a row before a clone is dropped.
                  submit_failure_limit=SUBMIT_FAILURE_LIMIT,
-                 # MPS packing. pack_size members share one job and one GPU;
-                 # None lets every clone submit on its own. With packing on,
-                 # active_clone_threshold counts packs, so pack_size times as
-                 # many clones run at once. pack_grouping,
-                 # callable(clones) -> list of lists, chooses who goes with
-                 # whom. pack_member_cores, a list or callable(group) -> list,
-                 # gives each member its own number of cores.
+                 # MPS packing: this many clones share one job and one GPU.
                  pack_size=None,
+                 # callable(clones) -> groups, choosing who packs with whom.
                  pack_grouping=None,
-                 # A number, or callable(group) -> number when packs of
-                 # different conditions need different core budgets.
+                 # A number, or callable(group) -> number for uneven packs.
                  pack_cpus_per_task=None,
                  pack_scheduler_fstring=None,
                  pack_run_script=None,
+                 # A list, or callable(group) -> list, of cores per member.
                  pack_member_cores=None,
-                 # One dict per seed, applied over config_template in
-                 # from_disk. len(seed_config_overrides) == n_seeds.
+                 # One dict per seed, laid over config_template. Length n_seeds.
                  seed_config_overrides=None,
                  sep='-',
                  seeds_first=True,
@@ -299,34 +288,18 @@ class Farmer:
                  overwrite=False,
                  harvester=None,
                  runner=sims.omm_generation,
-                 # Per-gen run.py body written into each gen dir. None -> the
-                 # OpenMM default (seeder.default_run_script). For GROMACS pass
-                 # gmx_simulate.default_gmx_run_script.
+                 # run.py body for each gen dir. None -> runner's own default.
                  run_script=None,
-                 # Disk-recovery classifier for Clone.from_disk. None -> the
-                 # OpenMM seeder._try_recover_gen. For GROMACS pass
-                 # gmx_simulate.gmx_try_recover_gen.
+                 # Disk-recovery classifier. None -> runner's own default.
                  recover_fn=None,
-                 # How a Clone measures a generation's progress. None -> infer
-                 # from the trajectory's frame count (correct for the OpenMM
-                 # reporters). GROMACS needs gmx_simulate.gmx_gen_progress.
+                 # How a gen's progress is measured. None -> its frame count.
                  progress_fn=None,
                  dry_run=False,
-                 # If True, expect the scheduler_fstring to install a SIGTERM
-                 # trap that touches a sentinel file (see
-                 # basic_scheduler_fstrings_preempt), and propagate the flag
-                 # into config_template so omm_generation installs a
-                 # SentinelReporter. Validated at boot.
+                 # Shut down cleanly on preemption. Template must trap SIGTERM.
                  handle_preempt=False,
-                 # Path to the human-readable persistence file that
-                 # BadNodeRegistry appends to whenever a clone aborts on
-                 # a node whose log matches bad_node_patterns. Reloaded
-                 # at boot so a restarted farmer doesn't relearn the
-                 # same bad nodes.
+                 # Where learned bad nodes are written, and reloaded from.
                  bad_node_persist='bad_nodes.txt',
-                 # Iterable of substrings whose presence in a gen's
-                 # scheduler log marks the failure as node-local. If
-                 # None, use utilities.default_bad_node_patterns.
+                 # Log substrings marking a node-local failure. None -> default.
                  bad_node_patterns=None,
                  ):
         self.n_seeds = n_seeds
