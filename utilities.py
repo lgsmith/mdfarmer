@@ -1,3 +1,33 @@
+"""Helpers shared by the orchestrator, the runners and the harvest.
+
+Job scripts. basic_scheduler_fstrings and its variants are ready-made submit
+scripts, keyed by scheduler. Anything you put in their place has to keep the
+placeholders: {job_name}, which the queue reports below match on, {queue_name},
+{gpu_line}, and {exclude_nodes}, which expands to a directive line excluding the
+nodes BadNodeRegistry has flagged and to nothing when none are. Keep the NODE:
+and GPU: echoes as well, since that registry reads them out of the job's log.
+
+Job names. A job is named title, seed, clone and gen joined by the config's sep,
+so 'mycampaign-0-3-5'. The reports match that whole name rather than the title
+as a prefix, because a second campaign titled 'mycampaign-long' names its jobs
+'mycampaign-long-0-3-5', and a looser test would bind those ids to this
+campaign's clone (0, 3, 5).
+
+Bad nodes. A generation that aborts at 0 steps because the node is broken (a
+stale CUDA driver, a GLIBC mismatch, no visible GPU) aborts the same way on
+every retry, since the scheduler tends to hand the resubmission back to the same
+node, and the farmer spends each clone's restart budget doing it.
+BadNodeRegistry recognises those failures, remembers the host in a file that
+survives a restart, and excludes it from later submissions.
+
+Resuming. The last frame of a generation's DCD has to sit at exactly the step
+its state.xml stopped at, or the next append lands at the wrong point in time
+and gen-to-gen concatenation drifts. A run killed between the trajectory report
+and the checkpoint report has one frame too many, so is_state_xml_usable,
+state_xml_step_count, dcd_header_info and truncate_dcd_to_nframes are here to
+check that and trim it.
+"""
+
 import inspect
 import os
 import struct
