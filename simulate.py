@@ -501,6 +501,13 @@ def omm_generation(traj_dir_top_level: str,
 
 
 def omm_basic_sim_block_json(config):
+    """Run one generation from a JSON config, appending its path to traj_list.
+
+    A preempted generation is incomplete, so nothing is appended and the process
+    returns normally — Slurm then records the job as cancelled rather than
+    failed, and the orchestrator finds the partial trajectory on its next boot
+    and resumes it in append mode.
+    """
     with open(config, 'r') as f:
         conf_dict = json.load(f)
 
@@ -521,9 +528,7 @@ def omm_basic_sim_block_json(config):
     try:
         new_traj_path = omm_generation(**conf_dict)
     except Preempted:
-        # Skip the traj_list append: the gen is incomplete. The orchestrator
-        # will detect the partial DCD on the next boot and resume in append
-        # mode. Exit 0 so Slurm records the job as cancelled, not failed.
+        # Incomplete gen: leave it off traj_list.
         return
     with traj_list_path.open('a') as tl:
         tl.write(str(new_traj_path) + '\n')
