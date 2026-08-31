@@ -376,12 +376,12 @@ basic_scheduler_assoc_reports = {
 }
 
 
-# Per-scheduler post-mortem checks for whether a finished job was preempted.
-# Used by Clone.check_start_gen to avoid charging preemptions against the
-# per-gen restart_attempts budget. Returns False on any error (missing
-# binary, timeout, accounting gap, unknown state) so a true failure still
-# counts as a restart.
 def slurm_was_preempted(jid):
+    """Whether Slurm's accounting says this finished job was preempted.
+
+    False whenever the question cannot be answered (no sacct, a timeout, a gap
+    in the accounting), so a real failure still costs the clone a restart.
+    """
     try:
         out = sp.check_output(
             ['sacct', '-j', str(jid), '-n', '-o', 'State', '-X'],
@@ -396,6 +396,8 @@ def slurm_was_preempted(jid):
 
 
 def lsf_was_preempted(jid):
+    """Whether LSF recorded TERM_PREEMPT for this finished job. False on any
+    error, as above."""
     try:
         out = sp.check_output(
             ['bjobs', '-d', '-o', 'exit_reason', '-noheader', str(jid)],
@@ -406,30 +408,15 @@ def lsf_was_preempted(jid):
     return 'TERM_PREEMPT' in out
 
 
+# Clone.check_start_gen uses these so a preemption is not charged against the
+# generation's restart_attempts budget.
 preemption_checkers = {
     'sbatch': slurm_was_preempted,
     'bsub': lsf_was_preempted,
 }
 
 
-# Bad-node detection: when a clone's gen aborts at 0 steps because the
-# *node* is broken (stale CUDA driver against a too-new PTX, libc/GLIBC
-# ABI mismatch, missing GPU), retrying the same gen routes a new sbatch
-# straight back to the same broken queue/partition and the scheduler
-# tends to hand it to the same node. The result is a cascade: every
-# clone the farmer tries to relaunch lands on the bad node and dies, and
-# the farmer eventually exhausts each clone's restart budget.
-#
-# BadNodeRegistry breaks that cycle. When a 0-step abort is detected,
-# the registry scans the gen's scheduler log for a known "this is the
-# node, not the sim" pattern, harvests the NODE: line, and appends the
-# node to a scheduler-directive line that's injected into the next
-# submission via {exclude_nodes} in scheduler_fstring. It also writes a
-# human-readable breadcrumb row to a persistence file (default
-# bad_nodes.txt) so (a) a restarted farmer doesn't re-learn the same
-# bad nodes and (b) the user has a paper trail showing which nodes
-# failed how, when, and where to read the offending log.
-
+# Log strings that mean the node is broken rather than the simulation.
 default_bad_node_patterns = (
     'CUDA_ERROR_UNSUPPORTED_PTX_VERSION',
     'CUDA_ERROR_NO_DEVICE',
@@ -438,8 +425,7 @@ default_bad_node_patterns = (
     'CUDA driver version is insufficient',
     'No CUDA-capable device is detected',
     'Failed to initialize NVML',
-    # GLIBC ABI mismatch ("version `GLIBC_2.34' not found"). Quoted
-    # half is enough, since the rest of the line varies.
+    # GLIBC ABI mismatch; only the quoted half of the message is stable.
     "version `GLIBC_",
 )
 
@@ -586,9 +572,8 @@ class BadNodeRegistry:
             if not line or line.startswith('#'):
                 continue
             parts = line.split('\t')
-            # New format: timestamp\tnode\tgpu\tpattern\tlog_path\tclone_tag
-            # Tolerate older / hand-edited rows: pick the first field
-            # that looks like a hostname (no spaces, not an ISO date).
+            # Older and hand-edited rows are tolerated by taking the first
+            # field that looks like a hostname rather than column 2.
             for cand in parts:
                 cand = cand.strip()
                 if not cand:
@@ -623,12 +608,13 @@ class BadNodeRegistry:
                 return rest if rest else None
         return None
 
-    # Scan the gen's scheduler log for a known fatal-on-this-node
-    # pattern. If matched, harvest the NODE: line (and GPU: if present),
-    # write a breadcrumb row, add the node to the in-memory exclude set,
-    # and refresh scheduler_kws['exclude_nodes']. Returns the node name
-    # if recorded, else None.
     def scan_and_record(self, gen_dir, clone_tag):
+        """Blocklist the node behind a generation's failure, and name it.
+
+        The generation's scheduler log is searched for a bad_node_patterns hit;
+        on one, the NODE: line it echoed is recorded and excluded from here on.
+        None when nothing matched, or when the script echoed no NODE: line.
+        """
         log_p = Path(gen_dir) / self.log_name
         if not log_p.is_file():
             return None
@@ -662,14 +648,16 @@ class BadNodeRegistry:
         return node
 
 
-# Resolve which OpenMM Platform to use and which platformProperties to apply.
-# If platform_name is set, demand that exact platform (raise if it can't load).
-# Otherwise pick the fastest available non-Reference platform; raise if only
-# Reference is available, since AMOEBA / large-system MD on Reference is
-# effectively a hang from the scheduler's perspective. Filter platform_properties
-# to those the chosen platform actually exposes so e.g. {'Precision': 'mixed'}
-# applies cleanly on CUDA/HIP/OpenCL but is silently dropped on CPU.
 def select_platform(platform_name=None, platform_properties=None):
+    """(platform, properties) for a simulation to run on.
+
+    A named platform is demanded and raises if it will not load. Otherwise the
+    fastest platform that is not Reference is taken, and having only Reference
+    raises too, since MD on it is a hang as far as the scheduler can tell.
+
+    Properties the chosen platform does not expose are dropped, so a request
+    like {'Precision': 'mixed'} can be left in a config that also runs on CPU.
+    """
     if platform_name is not None:
         platform = mm.Platform.getPlatformByName(platform_name)
     else:
