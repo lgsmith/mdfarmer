@@ -491,10 +491,7 @@ class Farmer:
         flat = [c for queue in self.priority_ordered_clones for c in queue]
         packs = []
         for group in self.group_clones(flat):
-            # Both may be callables of the group, since packs of different
-            # conditions ask Slurm for different amounts. One global figure
-            # would make the smaller pack request what the larger one needs,
-            # and strand the cores it never uses.
+            # A callable lets unlike packs ask for unlike amounts of core.
             group_cpus = cpus(group) if callable(cpus) else cpus
             tag = self.sep.join(
                 f's{c.config["seed_index"]:0{self.dirname_pad}d}'
@@ -513,8 +510,6 @@ class Farmer:
         self.priority_ordered_clones = [[pack] for pack in packs]
         self.active_clone_set = {pack for pack in packs
                                  if pack.job_number is not None}
-        # The tending loop now counts packs, so the number of clones running at
-        # once is the threshold times the members in a pack.
         if packs:
             biggest = max(len(pack.clones) for pack in packs)
             print(f'NOTE: {len(packs)} packs of up to {biggest} clones. '
@@ -524,10 +519,13 @@ class Farmer:
                   'once.')
         return packs
 
-    # check_start_gen touches the filesystem, the scheduler and the gmx
-    # binary, any of which can raise. One raise must not kill a tender that has
-    # been minding a campaign for weeks.
     def _safe_check_start_gen(self, clone):
+        """check_start_gen, with any exception logged and reported as failure.
+
+        It touches the filesystem, the scheduler and the engine binary, any of
+        which can raise, and one raise must not kill a tender that has been
+        minding a campaign for weeks.
+        """
         try:
             return clone.check_start_gen(
                 self.current_jids, overwrite=self.overwrite)
@@ -537,11 +535,13 @@ class Farmer:
             traceback.print_exc()
             return False
 
-    # Record one failed advance. True means the clone keeps its place in the
-    # queue for another tick: a refused submission, a stalled filesystem or a
-    # generation that used up its restarts are all worth retrying before the
-    # rest of this clone's campaign is written off.
     def note_failure(self, clone):
+        """Record one failed advance; True keeps the clone for another tick.
+
+        A refused submission, a stalled filesystem and a generation out of
+        restarts are all worth retrying before the rest of this clone's
+        campaign is written off.
+        """
         count = self.submit_failures.get(clone, 0) + 1
         self.submit_failures[clone] = count
         if count < self.submit_failure_limit:
