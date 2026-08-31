@@ -48,9 +48,12 @@ openmm_topology_readers = {
 
 
 def read_openmm_top(top_fn):
-    # Only the lookup is guarded. A reader raises a KeyError of its own when a
-    # topology names an atom type it was never given, and reporting that as an
-    # unsupported format sends the user looking for the wrong problem.
+    """The OpenMM Topology in a structure file, using the reader its suffix names.
+
+    Only the suffix lookup is guarded: a reader raises a KeyError of its own for
+    an atom type it was never given, and calling that an unsupported format
+    would send the user after the wrong problem.
+    """
     top_p = Path(top_fn)
     try:
         reader = openmm_topology_readers[top_p.suffix]
@@ -61,10 +64,8 @@ def read_openmm_top(top_fn):
     return reader(top_fn).topology
 
 
-# Frame counting. mdtraj.open() gives a file handle whose length is the frame
-# count, without reading coordinates and without needing a topology at all.
-# LOOS is only the fallback, since it cannot read a GROMACS .top and raises a
-# plain RuntimeError when asked to, which is why the except below is broad.
+# Frame counting. mdtraj.open() measures a trajectory without reading its
+# coordinates or needing a topology at all, so LOOS is only the fallback.
 try:
     import mdtraj as _mdtraj
 except ImportError:
@@ -78,9 +79,8 @@ except ImportError:
     pyloos = None
 
 if _mdtraj is None and loos is None:
-    # A broken install, not a runtime condition: with no way to count frames
-    # every trajectory measures as empty, which the orchestrator reads as a
-    # generation that never ran and deletes.
+    # With no way to count frames every generation measures as empty, which the
+    # orchestrator reads as one that never ran and deletes.
     raise ImportError('mdfarmer needs mdtraj or LOOS to count frames, and '
                       'neither is importable.')
 
@@ -130,9 +130,8 @@ def get_traj_len(traj_fn, top_fn, dry_topology_name=DRY_TOPOLOGY_NAME):
             try:
                 return _traj_len_loos(traj_p, candidate)
             except Exception as exc:
-                # Deliberately broad: createSystem raises RuntimeError for an
-                # unsupported topology, LOOSError for an unreadable frame, and
-                # the orchestrator must survive both.
+                # Broad: an unsupported topology is a RuntimeError, an
+                # unreadable frame a LOOSError, and both have to be survivable.
                 print(f'LOOS could not read {traj_fn} with topology '
                       f'{candidate}: {type(exc).__name__}: {exc}.')
         print(f'No usable topology for {traj_fn}; treating as empty.')
@@ -248,10 +247,9 @@ basic_scheduler_fstrings = {
                 """)
 }
 
-# Preempt-aware variants for Farmer(handle_preempt=True): the SIGTERM trap
-# touches the file SentinelReporter watches, python is backgrounded so bash can
-# deliver the signal at all, and the sleep outlives the 60s grace period so the
-# job is recorded as CANCELLED rather than FAILED.
+# Preempt-aware variants for Farmer(handle_preempt=True): the trap touches the
+# file SentinelReporter watches, python is backgrounded so bash can deliver the
+# signal at all, and the sleep outlives the grace period so Slurm says CANCELLED.
 basic_scheduler_fstrings_preempt = {
     "lsf": inspect.cleandoc("""#!/bin/bash
                 #BSUB -J {job_name}
@@ -350,10 +348,9 @@ basic_scheduler_fstrings_mps = {
                 """)
 }
 
-# Job ids belonging to this campaign, for Farmer.update_jids, which formats in
-# the title. The awk anchors the whole name field for the reason the module
-# docstring gives; '-' is the default sep, so edit these if the Farmer has
-# another. Braces are doubled to survive str.format.
+# Job ids belonging to this campaign, for Farmer.update_jids. The awk anchors
+# the whole name field, for the reason the module docstring gives, and doubles
+# its braces to survive str.format. '-' is the default sep; edit if yours is not.
 basic_scheduler_reports = {
     # -o 'JOBID JOB_NAME', not -o JOBID, since the name is what awk tests.
     "lsf": "bjobs -o 'JOBID JOB_NAME' -noheader -J '{title}-*'"
@@ -812,17 +809,16 @@ def calx_remaining_steps(traj_fn, top_fn, total_steps, write_interval):
     return remaining
 
 
-# Keys a config carries for the run block rather than for the runner itself.
-# gmx_basic_sim_block_json and omm_basic_sim_block_json take traj_list out of
-# the config before calling the runner, so it is no runner's parameter and still
-# belongs in config.json.
+# Keys config.json carries for the run block rather than for a runner: the
+# sim-block wrappers pop traj_list back out before calling one.
 CONFIG_ONLY_KEYS = ('traj_list',)
 
 
-# This won't be nicely jsonizable unless all default and provided vals are.
 def merge_args_defaults_dict(function, config_only_keys=CONFIG_ONLY_KEYS,
                              **kwargs):
     """A config dict recording the full call: every parameter and its value.
+
+    Only as jsonizable as the values put in it.
 
     Two things stay out of the result, since both would carry the sentinel
     inspect._empty, a class, which json.dumps cannot write:
@@ -882,8 +878,7 @@ def dir_seeds_clones_gens(top_lvl: Path, seed_index, clone_index, gen_index, pad
     return p
 
 
-default_steps = int(2.5e7)  # Given 0.004 ps timestep,
-# this is 100 ns of simulation.
+default_steps = int(2.5e7)  # 100 ns at a 0.004 ps timestep.
 default_state_data_kwargs = dict(
     totalSteps=default_steps,
     step=True,
@@ -904,11 +899,9 @@ default_straight_sampling_config_template = dict(
     traj_name='traj',
     traj_suffix='.xtc',
     restart_name='state.xml',
-    # None -> auto-select fastest available non-Reference platform.
-    # Set explicitly (e.g. 'CUDA', 'HIP', 'OpenCL') if you want to force one.
+    # None takes the fastest platform that is not Reference; name one to force it.
     platform_name=None,
-    # Precision is filtered against the chosen platform's supported properties,
-    # so this works on CUDA/HIP/OpenCL and is silently dropped on CPU.
+    # Filtered against what the platform supports, so CPU just drops this.
     platform_properties={'Precision': 'mixed'},
     steps=default_steps,
     state_data_kwargs=default_state_data_kwargs,
@@ -919,7 +912,7 @@ default_straight_sampling_config_template = dict(
     new_velocities=False
 )
 
-# You'll need to replace all of these, but I wanted it to be more clear what the slots were.
+# Replace all of these; they are here to make the slots obvious.
 default_straight_sampling_init_config = dict(
     title='samplingX',  # This you should def overwrite for your own jobs!
     seeds=[
@@ -935,9 +928,8 @@ default_straight_sampling_init_config = dict(
 )
 
 
-#  make two trajs--one stripped of solvent, the _other_ downsampled by some integer factor but not dried.
-# harvest_generation reads the box and picks its own backend, so one script
-# suits any cell. A requeued harvest that already ran does nothing.
+# Writes two trajectories, one dried and one downsampled but still solvated.
+# harvest_generation picks its own backend, and a re-run of one does nothing.
 default_harvest_shellscript = inspect.cleandoc("""#!/bin/bash
                 #BSUB -J harvest
                 #BSUB -o harvest.out
