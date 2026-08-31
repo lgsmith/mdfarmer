@@ -9,6 +9,7 @@ that ship with GROMACS itself, located through `gmx -version`. Nothing is
 vendored, and a machine without a `gmx` on PATH skips those suites rather than
 failing them.
 """
+import importlib.util
 import os
 import shutil
 import subprocess as sp
@@ -17,9 +18,27 @@ import tempfile
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-# Import mdfarmer as a package from its parent directory, so a suite runs
-# against this checkout rather than whatever is installed.
-sys.path.insert(0, str(REPO_ROOT.parent))
+
+
+def _import_checkout(repo_root=REPO_ROOT):
+    """Import the checkout this file lives in, under the name mdfarmer.
+
+    Loading by path rather than by putting the parent on sys.path, because that
+    only finds the package when the checkout directory happens to be named
+    mdfarmer. In a git worktree it is not, and the import then silently falls
+    through to whatever is installed, so every suite tests the wrong tree.
+    """
+    spec = importlib.util.spec_from_file_location(
+        'mdfarmer', repo_root / '__init__.py',
+        submodule_search_locations=[str(repo_root)])
+    module = importlib.util.module_from_spec(spec)
+    # Registered before it is executed, so its own `from . import x` resolves.
+    sys.modules['mdfarmer'] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+mdfarmer = _import_checkout()
 
 # Override to keep test output somewhere durable; /tmp is periodically pruned.
 SCRATCH_ROOT = Path(os.environ.get(
