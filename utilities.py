@@ -1,3 +1,33 @@
+"""Helpers shared by the orchestrator, the runners and the harvest.
+
+Job scripts. basic_scheduler_fstrings and its variants are ready-made submit
+scripts, keyed by scheduler. Anything you put in their place has to keep the
+placeholders: {job_name}, which the queue reports below match on, {queue_name},
+{gpu_line}, and {exclude_nodes}, which expands to a directive line excluding the
+nodes BadNodeRegistry has flagged and to nothing when none are. Keep the NODE:
+and GPU: echoes as well, since that registry reads them out of the job's log.
+
+Job names. A job is named title, seed, clone and gen joined by the config's sep,
+so 'mycampaign-0-3-5'. The reports match that whole name rather than the title
+as a prefix, because a second campaign titled 'mycampaign-long' names its jobs
+'mycampaign-long-0-3-5', and a looser test would bind those ids to this
+campaign's clone (0, 3, 5).
+
+Bad nodes. A generation that aborts at 0 steps because the node is broken (a
+stale CUDA driver, a GLIBC mismatch, no visible GPU) aborts the same way on
+every retry, since the scheduler tends to hand the resubmission back to the same
+node, and the farmer spends each clone's restart budget doing it.
+BadNodeRegistry recognises those failures, remembers the host in a file that
+survives a restart, and excludes it from later submissions.
+
+Resuming. The last frame of a generation's DCD has to sit at exactly the step
+its state.xml stopped at, or the next append lands at the wrong point in time
+and gen-to-gen concatenation drifts. A run killed between the trajectory report
+and the checkpoint report has one frame too many, so is_state_xml_usable,
+state_xml_step_count, dcd_header_info and truncate_dcd_to_nframes are here to
+check that and trim it.
+"""
+
 import inspect
 import os
 import struct
@@ -18,9 +48,12 @@ openmm_topology_readers = {
 
 
 def read_openmm_top(top_fn):
-    # Only the lookup is guarded. A reader raises a KeyError of its own when a
-    # topology names an atom type it was never given, and reporting that as an
-    # unsupported format sends the user looking for the wrong problem.
+    """The OpenMM Topology in a structure file, using the reader its suffix names.
+
+    Only the suffix lookup is guarded: a reader raises a KeyError of its own for
+    an atom type it was never given, and calling that an unsupported format
+    would send the user after the wrong problem.
+    """
     top_p = Path(top_fn)
     try:
         reader = openmm_topology_readers[top_p.suffix]
@@ -31,10 +64,8 @@ def read_openmm_top(top_fn):
     return reader(top_fn).topology
 
 
-# Frame counting. mdtraj.open() gives a file handle whose length is the frame
-# count, without reading coordinates and without needing a topology at all.
-# LOOS is only the fallback, since it cannot read a GROMACS .top and raises a
-# plain RuntimeError when asked to, which is why the except below is broad.
+# Frame counting. mdtraj.open() measures a trajectory without reading its
+# coordinates or needing a topology at all, so LOOS is only the fallback.
 try:
     import mdtraj as _mdtraj
 except ImportError:
@@ -48,9 +79,8 @@ except ImportError:
     pyloos = None
 
 if _mdtraj is None and loos is None:
-    # A broken install, not a runtime condition: with no way to count frames
-    # every trajectory measures as empty, which the orchestrator reads as a
-    # generation that never ran and deletes.
+    # With no way to count frames every generation measures as empty, which the
+    # orchestrator reads as one that never ran and deletes.
     raise ImportError('mdfarmer needs mdtraj or LOOS to count frames, and '
                       'neither is importable.')
 
@@ -100,9 +130,8 @@ def get_traj_len(traj_fn, top_fn, dry_topology_name=DRY_TOPOLOGY_NAME):
             try:
                 return _traj_len_loos(traj_p, candidate)
             except Exception as exc:
-                # Deliberately broad: createSystem raises RuntimeError for an
-                # unsupported topology, LOOSError for an unreadable frame, and
-                # the orchestrator must survive both.
+                # Broad: an unsupported topology is a RuntimeError, an
+                # unreadable frame a LOOSError, and both have to be survivable.
                 print(f'LOOS could not read {traj_fn} with topology '
                       f'{candidate}: {type(exc).__name__}: {exc}.')
         print(f'No usable topology for {traj_fn}; treating as empty.')
@@ -183,14 +212,8 @@ def strip_ds_mdtraj(config_fn, harvester_config_fn):
         config_fn, harvester_config_fn, backend=harvester.BACKEND_MDTRAJ)
 
 
-
-# These basic strings are useful in many cases on clusters using the scheduler named as the key.
-# NOTE the format target '{job_name}' has to appear for the default queue parser to find the job.
-# The 'NODE:' / 'GPU:' echoes are how BadNodeRegistry learns which host
-# produced a failure and which device was on it. Keep them if you
-# replace this fstring with your own and want bad-node blocking to work.
-# {exclude_nodes} expands to a scheduler directive line excluding any
-# nodes BadNodeRegistry has flagged (empty when none are blocked).
+# Ready-made job scripts, keyed by scheduler. The module docstring says what a
+# replacement has to keep.
 basic_scheduler_fstrings = {
     "lsf": inspect.cleandoc("""#!/bin/bash
                 #BSUB -J {job_name}
@@ -205,10 +228,8 @@ basic_scheduler_fstrings = {
 
                 python {run_script_name}
                 """),
-    # -J is sbatch's job-name flag, and the shebang decides which shell runs
-    # the job. {exclude_nodes} is empty when nothing is blocked; the blank line
-    # that leaves is fine, but keep every #SBATCH above the echoes, since Slurm
-    # stops reading directives at the first real command.
+    # Every #SBATCH has to stay above the echoes: Slurm stops reading
+    # directives at the first real command.
     "slurm": inspect.cleandoc("""#!/bin/bash
                 #SBATCH -J {job_name}
                 #SBATCH -e slurm.out
@@ -226,12 +247,9 @@ basic_scheduler_fstrings = {
                 """)
 }
 
-# Preempt-aware variants: install a SIGTERM trap that touches the sentinel
-# file SentinelReporter watches for, then background+wait the python
-# invocation so the trap can fire (bash blocks signal delivery while a
-# non-builtin foreground command runs). The trailing sleep 70 keeps the
-# script alive past the 60s preempt grace period so Slurm records the job
-# as CANCELLED rather than FAILED. Pair with Farmer(handle_preempt=True).
+# Preempt-aware variants for Farmer(handle_preempt=True): the trap touches the
+# file SentinelReporter watches, python is backgrounded so bash can deliver the
+# signal at all, and the sleep outlives the grace period so Slurm says CANCELLED.
 basic_scheduler_fstrings_preempt = {
     "lsf": inspect.cleandoc("""#!/bin/bash
                 #BSUB -J {job_name}
@@ -250,9 +268,8 @@ basic_scheduler_fstrings_preempt = {
                 python {run_script_name} &
                 wait
                 """),
-    # --signal=B:TERM@120 gives 120 seconds' warning at the end of the
-    # allocation as well as on preemption, which is the time to checkpoint in.
-    # B: sends it to the batch shell so the trap below runs.
+    # --signal=B:TERM@120 warns the batch shell (B:) 120 seconds before the
+    # allocation ends or a preemption lands, which is the time to checkpoint in.
     "slurm": inspect.cleandoc("""#!/bin/bash
                 #SBATCH -J {job_name}
                 #SBATCH -e slurm.out
@@ -281,10 +298,7 @@ basic_gpu_lines = {
 }
 
 # One job, one GPU, several replicas sharing it through CUDA MPS. Goes with
-# gmx_pack.gmx_pack_sim_block_json, which does the core pinning. The MPS pipe
-# and log directories are named after the job id, so two packed jobs on one node
-# cannot clobber each other's daemon. A daemon that fails to start is only a
-# slowdown, not an error, so the script says so loudly instead of dying.
+# gmx_pack.gmx_pack_sim_block_json, which does the core pinning.
 basic_scheduler_fstrings_mps = {
     "slurm": inspect.cleandoc("""#!/bin/bash
                 #SBATCH -J {job_name}
@@ -334,50 +348,37 @@ basic_scheduler_fstrings_mps = {
                 """)
 }
 
-# A job of this campaign is named title, seed, clone and gen joined by the
-# separator, and the awk below matches the name field against exactly that, end
-# to end. Anything looser lets a campaign titled '{title}-long' answer to this
-# one: its jobs are named '{title}-long-0-0-5', so they pass any test on the
-# title as a prefix, and their ids then bind to this campaign's (0, 0, 5).
-# The '-' is the default sep; edit these if the Farmer is given another one.
-# Curly braces must be escaped with curly braces when using awk via str.format.
-
-# Basic report to print _only_ a list of job ids associated to this runner.
-# Should have 'title' fstring target somewhere to purify spurious jobids.
-# update_jids calls:
-#   self.scheduler_report_fstring.format(title=self.config_template['title'])
+# Job ids belonging to this campaign, for Farmer.update_jids. The awk anchors
+# the whole name field, for the reason the module docstring gives, and doubles
+# its braces to survive str.format. '-' is the default sep; edit if yours is not.
 basic_scheduler_reports = {
-    # -o 'JOBID JOB_NAME' rather than -o JOBID, since the name is what awk tests.
+    # -o 'JOBID JOB_NAME', not -o JOBID, since the name is what awk tests.
     "lsf": "bjobs -o 'JOBID JOB_NAME' -noheader -J '{title}-*'"
            " | awk '$2 ~ /^{title}-[0-9]+-[0-9]+-[0-9]+$/ {{print $1}}'",
-    # -h -o '%i %j' prints JobID and untruncated JobName, two whitespace-separated columns.
-    # The default -O Name truncates to 8 chars, which silently breaks title matching.
+    # '%i %j' prints the id and the untruncated name; -O Name would truncate to
+    # 8 characters and silently stop matching.
     "slurm": "squeue --me -h -o '%i %j'"
              " | awk '$2 ~ /^{title}-[0-9]+-[0-9]+-[0-9]+$/ {{print $1}}'"
 }
 
-# Basic report to print the name, and then the jobid, for each job with job title
-# created by orchestrator. Allows scripts to associate currently running jobs to
-# their seed, clone, and gen indexes. Output should be a string where each new line
-# is a job, with the Job ID in the first field and the Job Name in the second.
-# __init__ from Orchestrator calls:
-#   self.scheduler_assoc_fstring.format(title=self.config_template['title'])
+# The same, but one 'jobid jobname' line per job, so the orchestrator can map a
+# running job back to its seed, clone and gen.
 basic_scheduler_assoc_reports = {
     "lsf": "bjobs -o 'JOBID JOB_NAME' -noheader -J '{title}-*'"
            " | awk '$2 ~ /^{title}-[0-9]+-[0-9]+-[0-9]+$/'",
-    # awk (not grep) so a clean queue exits 0 instead of grep's exit-1-on-no-match,
-    # which would crash the boot-time sp.check_output in Farmer.__init__.
+    # awk, not grep: an empty queue has to exit 0, or the boot-time query in
+    # Farmer.__init__ raises instead of reporting no jobs.
     "slurm": "squeue --me -h -o '%i %j'"
              " | awk '$2 ~ /^{title}-[0-9]+-[0-9]+-[0-9]+$/'"
 }
 
 
-# Per-scheduler post-mortem checks for whether a finished job was preempted.
-# Used by Clone.check_start_gen to avoid charging preemptions against the
-# per-gen restart_attempts budget. Returns False on any error (missing
-# binary, timeout, accounting gap, unknown state) so a true failure still
-# counts as a restart.
 def slurm_was_preempted(jid):
+    """Whether Slurm's accounting says this finished job was preempted.
+
+    False whenever the question cannot be answered (no sacct, a timeout, a gap
+    in the accounting), so a real failure still costs the clone a restart.
+    """
     try:
         out = sp.check_output(
             ['sacct', '-j', str(jid), '-n', '-o', 'State', '-X'],
@@ -392,6 +393,8 @@ def slurm_was_preempted(jid):
 
 
 def lsf_was_preempted(jid):
+    """Whether LSF recorded TERM_PREEMPT for this finished job. False on any
+    error, as above."""
     try:
         out = sp.check_output(
             ['bjobs', '-d', '-o', 'exit_reason', '-noheader', str(jid)],
@@ -402,30 +405,15 @@ def lsf_was_preempted(jid):
     return 'TERM_PREEMPT' in out
 
 
+# Clone.check_start_gen uses these so a preemption is not charged against the
+# generation's restart_attempts budget.
 preemption_checkers = {
     'sbatch': slurm_was_preempted,
     'bsub': lsf_was_preempted,
 }
 
 
-# Bad-node detection: when a clone's gen aborts at 0 steps because the
-# *node* is broken (stale CUDA driver against a too-new PTX, libc/GLIBC
-# ABI mismatch, missing GPU), retrying the same gen routes a new sbatch
-# straight back to the same broken queue/partition and the scheduler
-# tends to hand it to the same node. The result is a cascade: every
-# clone the farmer tries to relaunch lands on the bad node and dies, and
-# the farmer eventually exhausts each clone's restart budget.
-#
-# BadNodeRegistry breaks that cycle. When a 0-step abort is detected,
-# the registry scans the gen's scheduler log for a known "this is the
-# node, not the sim" pattern, harvests the NODE: line, and appends the
-# node to a scheduler-directive line that's injected into the next
-# submission via {exclude_nodes} in scheduler_fstring. It also writes a
-# human-readable breadcrumb row to a persistence file (default
-# bad_nodes.txt) so (a) a restarted farmer doesn't re-learn the same
-# bad nodes and (b) the user has a paper trail showing which nodes
-# failed how, when, and where to read the offending log.
-
+# Log strings that mean the node is broken rather than the simulation.
 default_bad_node_patterns = (
     'CUDA_ERROR_UNSUPPORTED_PTX_VERSION',
     'CUDA_ERROR_NO_DEVICE',
@@ -434,8 +422,7 @@ default_bad_node_patterns = (
     'CUDA driver version is insufficient',
     'No CUDA-capable device is detected',
     'Failed to initialize NVML',
-    # GLIBC ABI mismatch ("version `GLIBC_2.34' not found"). Quoted
-    # half is enough, since the rest of the line varies.
+    # GLIBC ABI mismatch; only the quoted half of the message is stable.
     "version `GLIBC_",
 )
 
@@ -582,9 +569,8 @@ class BadNodeRegistry:
             if not line or line.startswith('#'):
                 continue
             parts = line.split('\t')
-            # New format: timestamp\tnode\tgpu\tpattern\tlog_path\tclone_tag
-            # Tolerate older / hand-edited rows: pick the first field
-            # that looks like a hostname (no spaces, not an ISO date).
+            # Older and hand-edited rows are tolerated by taking the first
+            # field that looks like a hostname rather than column 2.
             for cand in parts:
                 cand = cand.strip()
                 if not cand:
@@ -619,12 +605,13 @@ class BadNodeRegistry:
                 return rest if rest else None
         return None
 
-    # Scan the gen's scheduler log for a known fatal-on-this-node
-    # pattern. If matched, harvest the NODE: line (and GPU: if present),
-    # write a breadcrumb row, add the node to the in-memory exclude set,
-    # and refresh scheduler_kws['exclude_nodes']. Returns the node name
-    # if recorded, else None.
     def scan_and_record(self, gen_dir, clone_tag):
+        """Blocklist the node behind a generation's failure, and name it.
+
+        The generation's scheduler log is searched for a bad_node_patterns hit;
+        on one, the NODE: line it echoed is recorded and excluded from here on.
+        None when nothing matched, or when the script echoed no NODE: line.
+        """
         log_p = Path(gen_dir) / self.log_name
         if not log_p.is_file():
             return None
@@ -658,14 +645,16 @@ class BadNodeRegistry:
         return node
 
 
-# Resolve which OpenMM Platform to use and which platformProperties to apply.
-# If platform_name is set, demand that exact platform (raise if it can't load).
-# Otherwise pick the fastest available non-Reference platform; raise if only
-# Reference is available, since AMOEBA / large-system MD on Reference is
-# effectively a hang from the scheduler's perspective. Filter platform_properties
-# to those the chosen platform actually exposes so e.g. {'Precision': 'mixed'}
-# applies cleanly on CUDA/HIP/OpenCL but is silently dropped on CPU.
 def select_platform(platform_name=None, platform_properties=None):
+    """(platform, properties) for a simulation to run on.
+
+    A named platform is demanded and raises if it will not load. Otherwise the
+    fastest platform that is not Reference is taken, and having only Reference
+    raises too, since MD on it is a hang as far as the scheduler can tell.
+
+    Properties the chosen platform does not expose are dropped, so a request
+    like {'Precision': 'mixed'} can be left in a config that also runs on CPU.
+    """
     if platform_name is not None:
         platform = mm.Platform.getPlatformByName(platform_name)
     else:
@@ -701,17 +690,8 @@ def select_platform(platform_name=None, platform_properties=None):
     return platform, filtered_properties
 
 
-# Resume-correctness helpers: state.xml ↔ DCD alignment.
-#
-# On every resume we need the DCD's last frame's logical step to equal
-# the state.xml's stepCount exactly, otherwise the next append lands at
-# the wrong place in time and gen-to-gen concatenation drifts. The
-# helpers below validate the state file, read the DCD header's frame
-# accounting, and (if the kill happened between the DCD report and the
-# checkpoint report) truncate the DCD to match.
-
-
 def is_state_xml_usable(p: Path) -> bool:
+    """Whether this state.xml can be deserialized, so a gen can resume from it."""
     if not p.is_file() or p.stat().st_size == 0:
         return False
     try:
@@ -723,13 +703,13 @@ def is_state_xml_usable(p: Path) -> bool:
 
 
 def state_xml_step_count(p: Path) -> int:
+    """The step a state.xml stopped at. ValueError if it cannot be read."""
     import xml.etree.ElementTree as ET
     try:
         root = ET.parse(p).getroot()
     except ET.ParseError as exc:
-        # The caller cascades to an older generation on ValueError. ParseError
-        # is a SyntaxError, so raising it as it comes escapes that guard and the
-        # clone is dropped for the rest of the run instead.
+        # ParseError is a SyntaxError, which the caller's ValueError guard
+        # would miss, dropping the clone instead of cascading to an older gen.
         raise ValueError(f'state.xml at {p} is not parseable XML, so the step '
                          f'it stopped at cannot be read: {exc}') from exc
     sc = root.attrib.get('stepCount')
@@ -752,8 +732,7 @@ def dcd_header_info(p: Path) -> dict:
             raise ValueError(f'DCD magic {magic!r} != b"CORD" at {p}')
         ints = struct.unpack('<20i', f.read(80))
         nset, istart, nsavc = ints[0], ints[1], ints[2]
-        # ints[10] is at byte offset 48 from file start — the
-        # with-unit-cell flag (1 if frames carry the 6-double box record).
+        # ints[10], at byte 48, is 1 when frames carry the 6-double box record.
         with_unitcell = ints[10]
         be1 = struct.unpack('<i', f.read(4))[0]
         if be1 != 84:
@@ -779,9 +758,8 @@ def dcd_header_info(p: Path) -> dict:
 
 
 def dcd_frame_size(with_unitcell: bool, n_atoms: int) -> int:
-    # PBC block: 4 + 6*8 + 4 = 56 bytes
-    # Each coord record: 4 + 4*n_atoms + 4 = 8 + 4n
-    # 3 coord records: 3*(8+4n) = 24 + 12n
+    """Bytes one DCD frame occupies: a 56-byte box record if the file has them,
+    plus three Fortran coordinate records of 8 + 4*n_atoms each."""
     return (56 if with_unitcell else 0) + 24 + 12 * n_atoms
 
 
@@ -798,9 +776,8 @@ def truncate_dcd_to_nframes(p: Path, target_nframes: int) -> int:
     info = dcd_header_info(p)
     frame_size = dcd_frame_size(info['with_unitcell'], info['n_atoms'])
     header_size = info['header_size']
-    # nset is not trusted. OpenMM bumps it before writing the frame it
-    # counts, so a kill mid-write leaves it ahead of the data. The byte
-    # length is what actually happened.
+    # nset is not trusted: OpenMM bumps it before writing the frame it counts,
+    # so a kill mid-write leaves it ahead of the data. Bytes are what happened.
     whole_frames = max(0, (p.stat().st_size - header_size) // frame_size)
     achievable = min(target_nframes, whole_frames)
     if achievable != target_nframes:
@@ -815,13 +792,15 @@ def truncate_dcd_to_nframes(p: Path, target_nframes: int) -> int:
 
 
 def calx_remaining_steps(traj_fn, top_fn, total_steps, write_interval):
+    """Steps a generation still owes, from the frames already on disk.
+
+    A negative answer means more frames than the generation should hold, usually
+    duplicates from appending against a stale state.xml or a config whose
+    write_interval or total_steps has changed since the run started. The caller
+    treats that as complete, so it is warned about rather than passed silently.
+    """
     traj_len = get_traj_len(traj_fn, top_fn)
     remaining = total_steps - traj_len * write_interval
-    # A negative result means the traj has more frames than the gen
-    # should contain — usually duplicated frames from an append against
-    # a stale state.xml, or a write_interval / total_steps mismatch
-    # between the on-disk config and the current run. Surface it so it
-    # doesn't masquerade as "gen complete."
     if remaining < 0:
         print(f'WARNING: calx_remaining_steps({traj_fn}) = {remaining}; '
               f'traj has {traj_len} frames at write_interval={write_interval} '
@@ -830,17 +809,16 @@ def calx_remaining_steps(traj_fn, top_fn, total_steps, write_interval):
     return remaining
 
 
-# Keys a config carries for the run block rather than for the runner itself.
-# gmx_basic_sim_block_json and omm_basic_sim_block_json take traj_list out of
-# the config before calling the runner, so it is no runner's parameter and still
-# belongs in config.json.
+# Keys config.json carries for the run block rather than for a runner: the
+# sim-block wrappers pop traj_list back out before calling one.
 CONFIG_ONLY_KEYS = ('traj_list',)
 
 
-# This won't be nicely jsonizable unless all default and provided vals are.
 def merge_args_defaults_dict(function, config_only_keys=CONFIG_ONLY_KEYS,
                              **kwargs):
     """A config dict recording the full call: every parameter and its value.
+
+    Only as jsonizable as the values put in it.
 
     Two things stay out of the result, since both would carry the sentinel
     inspect._empty, a class, which json.dumps cannot write:
@@ -900,8 +878,7 @@ def dir_seeds_clones_gens(top_lvl: Path, seed_index, clone_index, gen_index, pad
     return p
 
 
-default_steps = int(2.5e7)  # Given 0.004 ps timestep,
-# this is 100 ns of simulation.
+default_steps = int(2.5e7)  # 100 ns at a 0.004 ps timestep.
 default_state_data_kwargs = dict(
     totalSteps=default_steps,
     step=True,
@@ -922,11 +899,9 @@ default_straight_sampling_config_template = dict(
     traj_name='traj',
     traj_suffix='.xtc',
     restart_name='state.xml',
-    # None -> auto-select fastest available non-Reference platform.
-    # Set explicitly (e.g. 'CUDA', 'HIP', 'OpenCL') if you want to force one.
+    # None takes the fastest platform that is not Reference; name one to force it.
     platform_name=None,
-    # Precision is filtered against the chosen platform's supported properties,
-    # so this works on CUDA/HIP/OpenCL and is silently dropped on CPU.
+    # Filtered against what the platform supports, so CPU just drops this.
     platform_properties={'Precision': 'mixed'},
     steps=default_steps,
     state_data_kwargs=default_state_data_kwargs,
@@ -937,7 +912,7 @@ default_straight_sampling_config_template = dict(
     new_velocities=False
 )
 
-# You'll need to replace all of these, but I wanted it to be more clear what the slots were.
+# Replace all of these; they are here to make the slots obvious.
 default_straight_sampling_init_config = dict(
     title='samplingX',  # This you should def overwrite for your own jobs!
     seeds=[
@@ -953,9 +928,8 @@ default_straight_sampling_init_config = dict(
 )
 
 
-#  make two trajs--one stripped of solvent, the _other_ downsampled by some integer factor but not dried.
-# harvest_generation reads the box and picks its own backend, so one script
-# suits any cell. A requeued harvest that already ran does nothing.
+# Writes two trajectories, one dried and one downsampled but still solvated.
+# harvest_generation picks its own backend, and a re-run of one does nothing.
 default_harvest_shellscript = inspect.cleandoc("""#!/bin/bash
                 #BSUB -J harvest
                 #BSUB -o harvest.out
