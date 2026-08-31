@@ -551,11 +551,15 @@ class Farmer:
         return False
 
     def launch(self, update_jids=True):
+        """One tick: advance, finish or fail every clone the queues still hold.
+
+        Returns one flat True/False per clone looked at, True meaning it is
+        still part of the campaign. A clone that is waiting for a free slot
+        counts as running, not as a failure.
+        """
         still_running = []  # note, this will be flat
         if update_jids and not self.update_jids():
-            # Scheduler unreachable. Every clone we know about is presumed to
-            # still be doing whatever it was doing; try again next tick rather
-            # than making launch decisions on evidence we do not have.
+            # Scheduler unreachable; presume all running, retry next tick.
             return [True] * max(1, sum(len(cl) for cl in
                                        self.priority_ordered_clones))
         for queue_index, clone_list in enumerate(self.priority_ordered_clones):
@@ -564,8 +568,7 @@ class Farmer:
                 print('not clonelist-triggered')
                 still_running.append(False)
                 continue
-            # The clones this queue keeps for the next tick. Everything else
-            # has either finished or failed, and is dropped.
+            # What this queue keeps for the next tick; the rest are dropped.
             survivors = []
             for clone in clone_list:
                 print('starting into clone loop for', clone.get_tag())
@@ -577,11 +580,10 @@ class Farmer:
                 elif self.check_mark_clone_finished(clone):
                     print('clone was just marked finished')
                     still_running.append(False)
-                # If clone is in active set, it may have just finished a generation.
+                # In the active set, so it may have just finished a gen.
                 elif clone in self.active_clone_set:
                     print('clone is in active clone list')
-                    # Try to start another. A bad checkpoint or a failed
-                    # submission fails this clone, not the whole campaign.
+                    # Try to start another.
                     if self._safe_check_start_gen(clone):
                         self.submit_failures.pop(clone, None)
                         survivors.append(clone)
@@ -593,8 +595,7 @@ class Farmer:
                         self.mark_clone_failed(clone)
                         still_running.append(False)
 
-                # This condition arises when there are few enough active clones
-                # that we could launch more.
+                # Few enough active clones that we could launch another.
                 elif len(self.active_clone_set) < self.active_clone_threshold:
                     print(
                         'there are some more active clones, let us launch', clone.get_tag())
@@ -611,8 +612,7 @@ class Farmer:
                     else:
                         self.mark_clone_failed(clone)
                         still_running.append(False)
-                # Every slot is taken, so this clone waits its turn. Nothing is
-                # wrong, and it is still part of the campaign.
+                # Every slot is taken, so this clone waits its turn.
                 else:
                     if not self.quiet:
                         print(clone.get_tag(),
@@ -622,15 +622,17 @@ class Farmer:
             self.priority_ordered_clones[queue_index] = survivors
         return still_running
 
-    # whether you're starting or restarting, this is probably what you want
-    # if you'd just like a 'minder' process to start all your sims and keep them
-    # running until they've gotten through all the generations.
     def start_tending_fields(self, update_interval=120):
+        """Mind the whole campaign: launch every clone and keep it going.
+
+        Whether you are starting or restarting, this is probably what you
+        want. Returns True once every clone has finished, and False if a
+        'stop' brake file halted the loop or any clone was given up on.
+        Raises if no clone could be built at all.
+        """
         if not self.priority_ordered_clones or not any(
                 self.priority_ordered_clones):
-            # Every clone failed to build. Setup failures are isolated per
-            # clone on purpose, but all of them failing is not the campaign
-            # finishing, and must not report success having launched nothing.
+            # All of them failing is not the campaign finishing.
             raise RuntimeError(
                 'No clones could be set up; nothing to tend. Check the '
                 'per-clone setup errors printed above (missing structure, '
@@ -642,17 +644,14 @@ class Farmer:
         # If dry run, short circuit the tending loop.
         if self.dry_run:
             still_running = [False]
-        # check on how the jobs are doing, see if you can launch more!
-        # AKA the tending loop.
+        # The tending loop: see how the jobs do, launch where there is room.
         while any(still_running):
             if brake_file_p.is_file():
                 print(
                     f'Brake file detected: {brake_file_p.resolve()} Stopping submission loop.')
                 return False
             time.sleep(update_interval)
-            # The loop has to outlive anything passing: a scheduler hiccup,
-            # a stalled filesystem, a harvest blowing up. Losing the tender
-            # leaves every running job unminded, which is what costs.
+            # Losing the tender leaves every running job unminded.
             try:
                 still_running = self.launch()
             except Exception as exc:
@@ -665,8 +664,7 @@ class Farmer:
                 print('The following (seed clone gen) are complete:', ', '.join((
                     map(lambda c: c.get_tag(), self.finished_clones))))
             print('STILL RUNNING:', *still_running, flush=True)
-        # If we get here, the minder thinks every clone has stopped. That is
-        # only good news if they stopped by finishing.
+        # They have all stopped; only good news if they stopped by finishing.
         if self.failed_clone_set:
             print(f'WARNING: {len(self.failed_clone_set)} clone(s) failed and '
                   f'{len(self.finished_clones)} finished: '
