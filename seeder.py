@@ -239,64 +239,51 @@ class Clone:
     # This should mostly be used by the init function, and by adaptive sampling scripts.
 
     def __init__(self,
-                 # keys should match argument parameter names from runner
-                 # function, 4x:omm_basic_sim_block
+                 # keys must match the runner function's parameter names.
                  config: dict,
 
                  # Scheduler to call. Will also be used to name files later.
                  scheduler: str,
                  # BSUB/SBATCH/Scheduler script with anchors for str.format().
                  scheduler_fstring: str,
-                 # Keys should match fstring anchors. Values should be desired substitution.
+                 # keys match the fstring's anchors, values the substitutions.
                  scheduler_kws: dict,
-                 # should be path to the serialized xml this clone will grow from.
+                 # path to the serialized xml this clone will grow from.
                  seed_fn: str,
-                 # If true, call inspect.cleandoc on sched. fstring prior to binding it to self.
+                 # if true, run inspect.cleandoc on scheduler_fstring first.
                  cleandoc_sched_fstring=True,
                  restarts_per_gen=3,
-                 # will store the scheduler's assigned job  number for current job.
+                 # the scheduler's assigned job number for the current job.
                  job_number=None,
                  dirname_pad=2,
                  sep='-',
                  run_script=default_run_script,
                  # regex to extract job_number from submission call output.
                  job_number_re='[1-9][0-9]*',
-                 # A string with anchors for keys from the config to fill in  job_name at
-                 # each generation. This is arg to -J flag in bsub.sh
+                 # anchors for config keys, rendering the job name each gen.
                  job_name_fstring=None,
-                 # if job_name_fstring is none, join iterable of job_name_elements
-                 # and save as sef.job_name_fstring. Default vals are recommended min.
-                 # If each of these are not in job name, with seed, clone, gen in that order
-                 # reassociation from a killed orchestrator will fail.
+                 # Joined into job_name_fstring when that is None. Seed, clone
+                 # and gen must appear in that order or reassociation fails.
                  job_name_elements=(
                      '{title}', '{seed_index}', '{clone_index}',
                      '{gen_index}'),
-                 # Compare keys are used by eq and hash to determine whether two clones are equal.
+                 # config keys __eq__ and __hash__ compare two clones on.
                  compare_keys=('seed_index', 'clone_index'),
                  harvester=None,
-                 # Callable jid -> bool, returns True if the named job was
-                 # preempted by the scheduler. If provided, preemption restarts
-                 # don't count against restarts_per_gen.
+                 # Callable jid -> bool. A restart after a preemption it reports
+                 # does not count against restarts_per_gen.
                  preemption_checker=None,
-                 # Shared BadNodeRegistry. When a 0-step abort is detected
-                 # and the gen's scheduler log matches a node-local
-                 # failure pattern, scan_and_record harvests the node and
-                 # excludes it from subsequent submissions. May be None
-                 # (older callers and tests).
+                 # Shared BadNodeRegistry. A 0-step abort whose scheduler log
+                 # names a node-local failure bars that node from later jobs.
                  node_blocklist=None,
-                 # The full per-gen step count from the template. On a resume
-                 # config['steps'] is the steps-remaining-this-gen, not the
-                 # template total, so we have to track the total separately
-                 # or start_next will reset gens to the shortened count. If
-                 # None, fall back to config['steps'] for backwards compat.
+                 # Full per-gen step count. On a resume config['steps'] holds
+                 # only the remainder, which would otherwise shorten later gens.
                  steps_per_gen=None,
-                 # Callable(gen_dir, **context) giving the steps a generation
-                 # still owes. None counts frames, which is right for OpenMM.
-                 # GROMACS passes gmx_simulate.gmx_gen_progress instead.
+                 # Callable(gen_dir, **context) -> steps a gen still owes. None
+                 # counts frames (OpenMM); GROMACS passes gmx_gen_progress.
                  progress_fn=None,
-                 # 0-based index of this clone's final generation. None means
-                 # no limit, for callers outside a Farmer. check_start_gen
-                 # will not start a generation past it.
+                 # 0-based index of this clone's final generation, past which
+                 # check_start_gen will not start one. None means no limit.
                  last_gen_index=None,
                  dry_run=False
                  ):
@@ -347,8 +334,7 @@ class Clone:
         self.job_number_re = re.compile(job_number_re)
         self.harvester = harvester
         # The harvest reads the full generation length from config.json, and
-        # config['steps'] is the steps still owed on a resume. Record the
-        # untouched value on every construction path.
+        # config['steps'] holds only the steps still owed on a resume.
         if config.get('steps_per_gen') is None:
             config['steps_per_gen'] = self.total_steps
         elif config['steps_per_gen'] != self.total_steps:
@@ -356,9 +342,8 @@ class Clone:
                 f"config['steps_per_gen']={config['steps_per_gen']} disagrees "
                 f'with steps_per_gen={self.total_steps}; the harvest would '
                 'place this clone\'s frames at the wrong global index.')
-        # Catch a bad generation length now, while it is still free to fix.
-        # Both spacings break the harvested trajectories at every seam, and
-        # neither ever fails loudly.
+        # Catch an incommensurable generation length now, while it is free to
+        # fix: it breaks harvested trajectories at every seam, and never loudly.
         if harvester is not None:
             downsample_frq = (getattr(harvester, 'run_config', None)
                               or {}).get('downsample_frq')
@@ -377,9 +362,8 @@ class Clone:
         self.progress_fn = progress_fn
         self.last_gen_index = last_gen_index
         self.run_script = run_script
-        # Where this clone's scheduler log lands. None means its own generation
-        # directory; a ClonePack points every member at the pack directory,
-        # which is the only place a packed job writes one.
+        # Where this clone's scheduler log lands. None means its own gen dir; a
+        # ClonePack points every member at the one log a packed job writes.
         self.scheduler_log_dir = None
         self.scheduler_script_p = None  # always redefined each run
 
