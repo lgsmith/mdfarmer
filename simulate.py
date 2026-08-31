@@ -69,6 +69,7 @@ class _TandemDCDReporter:
         self._out = open(file, 'r+b' if append else 'wb')
 
     def describeNextReport(self, simulation):
+        # OpenMM 8.x dict format; 'include' limits what getState() populates.
         steps = self._reportInterval - simulation.currentStep % self._reportInterval
         return {'steps': steps, 'periodic': self._enforcePeriodicBox,
                 'include': [self._quantity]}
@@ -80,13 +81,8 @@ class _TandemDCDReporter:
                 simulation.integrator.getStepSize(),
                 self._reportInterval, self._reportInterval, self._append
             )
-        # DCDFile.writeModel dimension-checks its input via
-        # .value_in_unit(nanometers), which dies for velocity (nm/ps) or
-        # force (kJ/(mol·nm)) Quantities. DCD has no on-disk unit
-        # metadata, so we strip to the raw numeric array in the
-        # quantity's native units and re-tag as nanometers — the numbers
-        # in the file are unchanged; the file just *claims* nm. Readers
-        # must know it's velocities (nm/ps) or forces (kJ/mol/nm).
+        # writeModel dimension-checks via .value_in_unit(nanometers), which dies
+        # on velocity/force Quantities, so re-tag the raw numbers as nanometers.
         if self._quantity == 'velocities':
             raw = state.getVelocities(asNumpy=True).value_in_unit(
                 unit.nanometer / unit.picosecond)
@@ -136,13 +132,7 @@ class _TandemXTCReporter:
                 simulation.integrator.getStepSize(),
                 self._reportInterval, self._reportInterval, self._append
             )
-        # XTCFile.writeModel also calls .value_in_unit(nanometers) on
-        # its input and additionally checks that abs(values)*1000 fits
-        # in int32 (XTC's compressed-position range, ~2.1e6 nm post-
-        # scaling). Velocities (~few nm/ps) and bonded forces (up to
-        # ~1e5 kJ/mol/nm) both clear that bound, but XTC's lossy
-        # compression *will* truncate precision — use .dcd if you need
-        # full precision on saved velocities/forces.
+        # writeModel calls .value_in_unit(nanometers) here too; re-tag as above.
         if self._quantity == 'velocities':
             raw = state.getVelocities(asNumpy=True).value_in_unit(
                 unit.nanometer / unit.picosecond)
@@ -195,8 +185,7 @@ class _TandemHDF5Reporter:
             self._traj_file.write(coordinates=vels_nm_ps, velocities=None)
         else:
             forces = state.getForces(asNumpy=True)
-            # kJ/(mol·nm) — store in coordinate slot in native HDF5 distance units (nm).
-            # This is a semantic repurposing; callers must know the file holds forces.
+            # kJ/(mol·nm) numbers, written into the coordinate slot.
             forces_kj = forces.value_in_unit(unit.kilojoule_per_mole / unit.nanometer)
             self._traj_file.write(coordinates=forces_kj)
         if hasattr(self._traj_file, 'flush'):
@@ -210,17 +199,13 @@ _TANDEM_REPORTER_CLS = {
     '.dcd': _TandemDCDReporter,
     '.xtc': _TandemXTCReporter,
     '.h5':  _TandemHDF5Reporter,
-    # .trr: mdtraj's TRRTrajectoryFile.write() only accepts xyz (positions);
-    # there is no velocities or forces argument in the current mdtraj API.
-    # Until mdtraj exposes that, .trr is not supported for tandem files.
+    # No .trr: mdtraj's TRRTrajectoryFile.write() accepts only xyz (positions).
 }
 
 _SUPPORTED_TANDEM_SUFFIXES = set(_TANDEM_REPORTER_CLS)
 
 
-# Sentinel file the bash SIGTERM trap touches when Slurm preempts the job.
-# SentinelReporter watches for it on each write_interval cycle and raises
-# Preempted, which unwinds the simulation loop cleanly.
+# Touched by the batch script's SIGTERM trap when Slurm preempts the job.
 PREEMPT_SENTINEL_NAME = 'PREEMPT_SIGTERM'
 
 
