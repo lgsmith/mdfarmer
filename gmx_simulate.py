@@ -41,54 +41,40 @@ from pathlib import Path
 from . import utilities as util
 
 
-# Sentinel the batch script's SIGTERM trap touches on preempt (matches
-# simulate.PREEMPT_SENTINEL_NAME so the same scheduler fstrings work).
+# Preempt sentinel the SIGTERM trap touches; same name as simulate's.
 PREEMPT_SENTINEL_NAME = 'PREEMPT_SIGTERM'
 
-# Written by the runner after every mdrun so the orchestrator can decide whether
-# a generation is finished without counting frames or invoking gmx.
+# Written after each mdrun so the orchestrator can judge progress without gmx.
 GEN_STATUS_NAME = 'gen_status.json'
 
-# Clone copies the incoming checkpoint in under restart_name, and the runner
-# moves it here at once, so restart_name only ever names a checkpoint this
-# generation's own mdrun wrote.
+# Incoming seed checkpoint, moved off the name mdrun writes its own one to.
 SEED_CPT_NAME = 'seed.cpt'
 
-# Per-generation tpr. Generation N>0 is built from generation N-1's by
-# convert-tpr, so this name is also how a generation finds its predecessor.
+# Per-generation tpr; gen N>0 is convert-tpr'd from gen N-1's file of this name.
 TPR_NAME = 'prod.tpr'
 
 # mdrun -deffnm stem; also the prefix of the .partNNNN outputs.
 DEFFNM = 'prod'
 
-# Prefix a stale part is renamed to, so it stops matching part_files' glob but
-# stays on disk as a record of the abandoned branch.
+# Prefix that hides a stale part from part_files' glob without deleting it.
 ABANDONED_PART_PREFIX = 'abandoned-'
 
-# First four bytes of every GROMACS checkpoint, big-endian 171817. Reading them
-# tells a checkpoint from a .gro without asking gmx.
+# First bytes of any GROMACS checkpoint: tells one from a .gro without gmx.
 CHECKPOINT_MAGIC = b'\x00\x02\x9f\x29'
 
-# How often mdrun writes a checkpoint, in minutes. GROMACS defaults to 15, which
-# is how much work a hard kill can cost; a shorter period costs almost nothing.
+# mdrun checkpoint period. The GROMACS default of 15 is what a hard kill costs.
 CHECKPOINT_MINUTES = 5
 
-# Spacing between seeds in the gen-seed sequence. gen-seed is
-# base + GEN_SEED_STRIDE * seed_index + clone_index, so this must exceed
-# n_clones or two seeds draw the same initial velocities.
+# gen-seed = base + GEN_SEED_STRIDE * seed + clone; must exceed n_clones.
 GEN_SEED_STRIDE = 1000
 
-# Structure formats grompp -c will read. A generation that continues another is
-# seeded with a checkpoint instead, which is why the suffix has to be checked.
+# Structure formats grompp -c reads; a continuing gen is seeded with a .cpt.
 GROMPP_STRUCTURE_SUFFIXES = ('.gro', '.g96', '.pdb', '.brk', '.ent')
 
-# Parameters gmx_pack injects into every gmx_generation call at runtime. A
-# config template records them too, so the file's copies must be dropped before
-# it is splatted, or the call gets two values for the same keyword.
+# gmx_pack passes these at run time; a config template must not also carry them.
 RUNTIME_ONLY_KEYS = ('fleet', 'fleet_key', 'grompp_lock')
 
-# Arguments a Clone supplies per generation. A driver builds its template
-# before it knows any of them, so gmx_config_template leaves placeholders.
+# Filled in per generation by a Clone; gmx_config_template leaves placeholders.
 CLONE_FILLED_KEYS = ('seed_index', 'clone_index', 'gen_index', 'seed_fn',
                      'top_fn')
 
@@ -112,8 +98,7 @@ class GenIncomplete(Exception):
     pass
 
 
-# Default run.py body the Farmer writes into each gen dir. The batch script runs
-# python run.py, which dispatches to the GROMACS block runner.
+# Default run.py the Farmer writes into each gen dir; the batch script runs it.
 default_gmx_run_script = """
 from mdfarmer.gmx_simulate import gmx_basic_sim_block_json as runner
 runner('config.json')
@@ -126,9 +111,7 @@ def _norm_mdp_key(k):
     return k.strip().lower().replace('_', '-')
 
 
-# Legacy spellings GROMACS removed. Silently leaving one of these in a .mdp
-# means the intended setting is ignored and grompp fatals on the unknown key, so
-# they are normalised to the modern name rather than left to fail at run time.
+# Spellings GROMACS removed: grompp fatals on them, so map to the modern name.
 LEGACY_MDP_KEYS = {
     'nstxtcout': 'nstxout-compressed',
     'xtc-precision': 'compressed-x-precision',
