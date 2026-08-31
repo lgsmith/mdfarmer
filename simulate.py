@@ -353,8 +353,7 @@ def omm_generation(traj_dir_top_level: str,
     try:
         if traj_suffix == '.h5':
             h5_cls = reporters['.h5']
-            # HDF5Reporter does not accept append via init kwarg — open in append
-            # mode by passing an already-open HDF5TrajectoryFile if appending.
+            # HDF5Reporter has no append kwarg; pass an already-open file instead.
             if traj_path.is_file() and append:
                 from mdtraj.formats import HDF5TrajectoryFile
                 h5_file = HDF5TrajectoryFile(str(traj_path), 'a')
@@ -401,22 +400,19 @@ def omm_generation(traj_dir_top_level: str,
         write_interval,
         writeState=True)
 
-    # Build tandem velocity/force reporters if requested. On a resume
-    # (append=True), only activate the tandem reporter if its file is
-    # frame-aligned with the position trajectory — same frame count.
-    # Skip cases:
-    #   - file doesn't exist (pre-velocity gen).
-    #   - file exists but has fewer frames than the position traj
-    #     (crashed mid-gen — e.g. the 0-frame `velocities.dcd` left by
-    #     the nm/ps-vs-nm units bug). Appending would write frame N of
-    #     velocity while position writes frame N+k, permanently offset
-    #     for the rest of the gen.
-    # Skipping preserves the user's invariant that velocity frame N
-    # corresponds to position frame N. Next fresh gen creates a clean
-    # from-frame-0 tandem file.
+    # Tandem velocity/force reporters, activated on resume only if aligned.
     extra_reporters = []
 
     def _tandem_aligned(tandem_path):
+        """True if tandem_path exists and has as many frames as traj_path.
+
+        A tandem file that is absent (a gen predating this option) or short (a
+        gen that crashed partway) must not be appended to on a resume: from then
+        on it would write its frame N alongside position frame N+k and stay
+        permanently offset, breaking the invariant that tandem frame N goes with
+        position frame N. The caller skips the reporter instead, and the next
+        fresh gen starts a clean tandem file from frame 0.
+        """
         if not tandem_path.is_file():
             return False
         if not traj_path.is_file():
@@ -463,15 +459,8 @@ def omm_generation(traj_dir_top_level: str,
                                     platform=platform)
     simulation.loadState(seed_fn)
 
-    # CUDA context warmup. When several GPU jobs initialize concurrently
-    # on a shared node, the first getState(getPositions=True) readback
-    # can race with kernel completion and return uninitialized device
-    # memory — observed as a single garbage frame at frame 0 in
-    # clone-{028,030,031,032}/gen-000 and clone-{046..049}/gen-001 of
-    # the antifreeze dataset (four H200 jobs per node, same SLURM job
-    # ID block). Pulling positions back here forces the device→host
-    # sync before any reporter fires, so DCDReporter's first frame is
-    # from a settled context.
+    # CUDA warmup: with several GPU jobs starting at once, the first readback can
+    # race with kernel completion and hand back device garbage as frame 0.
     _ = simulation.context.getState(getPositions=True)
 
     if new_velocities:
@@ -480,10 +469,8 @@ def omm_generation(traj_dir_top_level: str,
     if minimize_first:
         print('Performing energy minimization...')
         simulation.minimizeEnergy()
-    # Equilibration runs only when starting a generation from scratch. On a
-    # resume (append=True) the eq has already been done; re-running it would
-    # also wind simulation.currentStep backwards, desyncing reporter triggers
-    # from the loaded state.
+    # Equilibrate only on a fresh gen: a resume has already done it, and redoing
+    # it would wind currentStep backwards and desync the reporter triggers.
     if eq_steps and not append:
         print('Equilibrating...')
         simulation.step(eq_steps)
@@ -496,12 +483,10 @@ def omm_generation(traj_dir_top_level: str,
     simulation.reporters.append(restart_reporter)
     for r in extra_reporters:
         simulation.reporters.append(r)
-    # SentinelReporter must be appended LAST so DCD / state.xml / .out
-    # writes for the current cycle have already landed on disk before it
-    # raises. Stale sentinel from a previous preempted run in this gen
-    # dir would fire immediately, so clear it first.
+    # Appended last, so this cycle's writes land on disk before it can raise.
     if handle_preempt:
         sentinel_p = Path(PREEMPT_SENTINEL_NAME)
+        # A sentinel left in this gen dir by an earlier preempt would fire at once.
         if sentinel_p.exists():
             sentinel_p.unlink()
         simulation.reporters.append(SentinelReporter(write_interval))
