@@ -693,17 +693,8 @@ def select_platform(platform_name=None, platform_properties=None):
     return platform, filtered_properties
 
 
-# Resume-correctness helpers: state.xml ↔ DCD alignment.
-#
-# On every resume we need the DCD's last frame's logical step to equal
-# the state.xml's stepCount exactly, otherwise the next append lands at
-# the wrong place in time and gen-to-gen concatenation drifts. The
-# helpers below validate the state file, read the DCD header's frame
-# accounting, and (if the kill happened between the DCD report and the
-# checkpoint report) truncate the DCD to match.
-
-
 def is_state_xml_usable(p: Path) -> bool:
+    """Whether this state.xml can be deserialized, so a gen can resume from it."""
     if not p.is_file() or p.stat().st_size == 0:
         return False
     try:
@@ -715,13 +706,13 @@ def is_state_xml_usable(p: Path) -> bool:
 
 
 def state_xml_step_count(p: Path) -> int:
+    """The step a state.xml stopped at. ValueError if it cannot be read."""
     import xml.etree.ElementTree as ET
     try:
         root = ET.parse(p).getroot()
     except ET.ParseError as exc:
-        # The caller cascades to an older generation on ValueError. ParseError
-        # is a SyntaxError, so raising it as it comes escapes that guard and the
-        # clone is dropped for the rest of the run instead.
+        # ParseError is a SyntaxError, which the caller's ValueError guard
+        # would miss, dropping the clone instead of cascading to an older gen.
         raise ValueError(f'state.xml at {p} is not parseable XML, so the step '
                          f'it stopped at cannot be read: {exc}') from exc
     sc = root.attrib.get('stepCount')
@@ -744,8 +735,7 @@ def dcd_header_info(p: Path) -> dict:
             raise ValueError(f'DCD magic {magic!r} != b"CORD" at {p}')
         ints = struct.unpack('<20i', f.read(80))
         nset, istart, nsavc = ints[0], ints[1], ints[2]
-        # ints[10] is at byte offset 48 from file start — the
-        # with-unit-cell flag (1 if frames carry the 6-double box record).
+        # ints[10], at byte 48, is 1 when frames carry the 6-double box record.
         with_unitcell = ints[10]
         be1 = struct.unpack('<i', f.read(4))[0]
         if be1 != 84:
@@ -771,9 +761,8 @@ def dcd_header_info(p: Path) -> dict:
 
 
 def dcd_frame_size(with_unitcell: bool, n_atoms: int) -> int:
-    # PBC block: 4 + 6*8 + 4 = 56 bytes
-    # Each coord record: 4 + 4*n_atoms + 4 = 8 + 4n
-    # 3 coord records: 3*(8+4n) = 24 + 12n
+    """Bytes one DCD frame occupies: a 56-byte box record if the file has them,
+    plus three Fortran coordinate records of 8 + 4*n_atoms each."""
     return (56 if with_unitcell else 0) + 24 + 12 * n_atoms
 
 
@@ -790,9 +779,8 @@ def truncate_dcd_to_nframes(p: Path, target_nframes: int) -> int:
     info = dcd_header_info(p)
     frame_size = dcd_frame_size(info['with_unitcell'], info['n_atoms'])
     header_size = info['header_size']
-    # nset is not trusted. OpenMM bumps it before writing the frame it
-    # counts, so a kill mid-write leaves it ahead of the data. The byte
-    # length is what actually happened.
+    # nset is not trusted: OpenMM bumps it before writing the frame it counts,
+    # so a kill mid-write leaves it ahead of the data. Bytes are what happened.
     whole_frames = max(0, (p.stat().st_size - header_size) // frame_size)
     achievable = min(target_nframes, whole_frames)
     if achievable != target_nframes:
@@ -807,13 +795,15 @@ def truncate_dcd_to_nframes(p: Path, target_nframes: int) -> int:
 
 
 def calx_remaining_steps(traj_fn, top_fn, total_steps, write_interval):
+    """Steps a generation still owes, from the frames already on disk.
+
+    A negative answer means more frames than the generation should hold, usually
+    duplicates from appending against a stale state.xml or a config whose
+    write_interval or total_steps has changed since the run started. The caller
+    treats that as complete, so it is warned about rather than passed silently.
+    """
     traj_len = get_traj_len(traj_fn, top_fn)
     remaining = total_steps - traj_len * write_interval
-    # A negative result means the traj has more frames than the gen
-    # should contain — usually duplicated frames from an append against
-    # a stale state.xml, or a write_interval / total_steps mismatch
-    # between the on-disk config and the current run. Surface it so it
-    # doesn't masquerade as "gen complete."
     if remaining < 0:
         print(f'WARNING: calx_remaining_steps({traj_fn}) = {remaining}; '
               f'traj has {traj_len} frames at write_interval={write_interval} '
