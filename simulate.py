@@ -496,11 +496,6 @@ def omm_generation(traj_dir_top_level: str,
         print(f'Preempt received: {exc}; exiting cleanly at last reporter '
               f'cycle. The partial gen will resume via append on next launch.')
         raise
-    # The CheckpointReporter writes at every write_interval, so the most
-    # recent state.xml on disk already aligns with the trajectory's last
-    # frame. Writing one final state at a non-write_interval boundary
-    # desyncs state.xml from the traj frame count, breaking the next
-    # resume's calx_remaining_steps math.
     print('Done!')
     return traj_path.resolve()
 
