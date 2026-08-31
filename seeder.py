@@ -852,13 +852,11 @@ class ClonePack:
     the job holds the card until its slowest member finishes, so mismatched
     per-step costs waste GPU time.
 
-    That rule is about straggler cost, not data safety. Worth saying plainly,
-    because the next reader will otherwise take it as a safety invariant and
-    not know what they are allowed to trade away. Failure is already per-member
+    That rule is about straggler cost, not data safety. Failure is per-member
     (gmx_pack collects K outcomes and the tender fails exactly one clone) and
-    recovery is already per-member, from mdrun -cpi off that member's own
-    checkpoint), so a bad job costs a lost block that gets redone, not a damaged
-    dataset. Packing across conditions is therefore a throughput decision.
+    so is recovery, from mdrun -cpi off that member's own checkpoint, so a bad
+    job costs a lost block that gets redone rather than a damaged dataset.
+    Packing across conditions is a throughput decision, not an unsafe one.
     """
 
     def __init__(self, clones, pack_dir, scheduler, scheduler_fstring,
@@ -868,9 +866,9 @@ class ClonePack:
                  pack_manifest_name='pack.json',
                  run_script_name='run.py',
                  member_cores=None,
-                 # Members with unequal steps are refused, since the job
-                 # holds the card until its slowest finishes. True when every
-                 # launch ends on walltime, where none of them waits.
+                 # Unequal steps are refused, since the job holds the card
+                 # until its slowest member finishes. True when every launch
+                 # ends on walltime instead, where none of them waits.
                  wallclock_matched=False,
                  sep=None,
                  job_name_elements=('{title}', '{seed_index}',
@@ -890,9 +888,8 @@ class ClonePack:
         self.pack_dir.mkdir(parents=True, exist_ok=True)
         self.scheduler = scheduler
         self.scheduler_fstring = inspect.cleandoc(scheduler_fstring)
-        # Held by reference, not copied, so that nodes blocked later still
-        # reach this pack. The pack's own keys are laid over it at submit
-        # time, which keeps this dict read-only here.
+        # Held by reference, not copied, so nodes blocked later still reach this
+        # pack. The pack's own keys are laid over it at submit time.
         self.scheduler_kws = scheduler_kws
         self.pack_scheduler_kws = {'cpus': int(cpus_per_task),
                                    'run_script_name': run_script_name}
@@ -909,9 +906,8 @@ class ClonePack:
         self.member_cores = member_cores
         self.pack_manifest_name = pack_manifest_name
         self.job_number_re = re.compile(job_number_re)
-        # The name has to parse the way Farmer re-associates jobs at boot,
-        # as seed, clone and gen numbers. One that does not leaves job_number
-        # unset, and the next tick starts a second job in this directory.
+        # The name must parse as seed, clone and gen the way Farmer re-associates
+        # at boot; one that does not gets a second job in this directory.
         self.sep = clones[0].sep if sep is None else sep
         self.job_name_fstring = (job_name_fstring
                                  or self.sep.join(job_name_elements))
@@ -927,16 +923,16 @@ class ClonePack:
             # in its own gen dir, so a node scan rooted there finds nothing.
             clone.scheduler_log_dir = self.pack_dir
         self.dry_run = dry_run
-        # Indexes into self.clones that have exhausted their restart budget
-        # and will never run again. Kept out of self.clones itself, since
-        # member_cores and the pack's job name are positional over that list.
+        # Members that exhausted their restart budget. Kept out of self.clones,
+        # which member_cores and the pack's job name index positionally.
         self.retired = set()
 
     @property
     def current_gen(self):
-        # The pack advances together, so the laggard among the members still
-        # live defines where it is. A retired member's frozen current_gen
-        # would otherwise pin the pack there forever.
+        """Where the pack is: the laggard among the members still live.
+
+        A retired member's frozen current_gen would otherwise pin it forever.
+        """
         live = [c.current_gen for i, c in enumerate(self.clones)
                 if i not in self.retired]
         return min(live) if live else min(c.current_gen for c in self.clones)
@@ -985,17 +981,14 @@ class ClonePack:
                       f'{type(exc).__name__}: {exc}')
                 continue
             if not ok:
-                # check_start_gen only refuses once the restart budget for
-                # this generation is spent, and a member that never runs can
-                # never earn it back. Retire it so its frozen current_gen
-                # stops pinning the whole pack in place.
+                # Its restart budget is spent, and a member that never runs can
+                # never earn it back; retire it so it stops pinning the pack.
                 self.retired.add(index)
                 print(f'{clone.get_tag()}: exhausted its restart budget; '
                       'retiring it from the pack.')
                 continue
             if clone.is_done:
-                # That call finished this member's last generation; it has
-                # nothing left to submit, so leave it out of this launch.
+                # That call finished this member's last gen; nothing to submit.
                 newly_finished += 1
                 continue
             member_configs.append(clone.current_gen_dir / 'config.json')
@@ -1015,9 +1008,8 @@ class ClonePack:
             return False
         unfinished = tried - newly_finished
         if len(member_configs) < unfinished:
-            # Relaunch the pack with the members that are still healthy rather
-            # than shrinking it permanently: a shrunk pack leaves the card
-            # underpacked for the rest of the campaign.
+            # Launch the healthy members rather than shrinking the pack for
+            # good, which would leave the card underpacked from here on.
             print(f'{self.get_tag()}: {unfinished - len(member_configs)} of '
                   f'{unfinished} members could not be prepared; launching '
                   'the rest.')
