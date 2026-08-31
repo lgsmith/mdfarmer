@@ -130,15 +130,13 @@ def write_gen_mdp(base_mdp, out_mdp, *, nsteps, nstxout_compressed,
     """
     overrides = {
         'nsteps': str(int(nsteps)),
-        # nsteps is this generation's absolute cumulative target, so the run has
-        # to count from zero; an inherited init-step would offset every step.
+        # nsteps is the absolute cumulative target, so this run counts from 0.
         'init-step': '0',
         'nstxout-compressed': str(int(nstxout_compressed)),
         'gen-vel': 'yes' if gen_vel else 'no',
         'continuation': 'yes' if continuation else 'no',
     }
-    # ld-seed is set whether or not velocities are generated: it drives a
-    # stochastic thermostat for the whole run, not just the start.
+    # Set even without gen-vel: ld-seed drives the thermostat for the whole run.
     if ld_seed is not None:
         overrides['ld-seed'] = str(int(ld_seed))
     if gen_vel:
@@ -160,8 +158,7 @@ def write_gen_mdp(base_mdp, out_mdp, *, nsteps, nstxout_compressed,
                           'needs nsteps to be the absolute step target, so '
                           'init-step is pinned to 0.', flush=True)
                 if key in seen:
-                    # A duplicate assignment later in the file would override
-                    # ours; drop it rather than emit a second, conflicting line.
+                    # A later duplicate would override ours, so drop it.
                     continue
                 out_lines.append(f'{key} = {overrides[key]}')
                 seen.add(key)
@@ -274,13 +271,10 @@ def concat_parts(gen_dir, out_fn, deffnm=DEFFNM, traj_suffix='.xtc',
         raise FileNotFoundError(
             f'no {deffnm}.partNNNN{traj_suffix} files in {gen_dir} to merge')
     out_p = Path(out_fn)
-    # Built under a temp name and renamed, so nothing ever reads a half-written
-    # trajectory. The temp name keeps the suffix, since gmx reads the format
-    # from the extension.
+    # Temp name (suffix kept; gmx reads the format from it), renamed when built.
     tmp_p = out_p.with_name(f'{out_p.stem}.trjcat-tmp{out_p.suffix}')
     if len(parts) == 1:
-        # Nothing to merge; copy rather than rename so a re-run of this step is
-        # idempotent and the part stays as the provenance record.
+        # Copy, not rename, so re-running is idempotent and the part survives.
         shutil.copy(parts[0], tmp_p)
     else:
         _run([gmx_bin, 'trjcat', '-f', *[str(p) for p in parts],
@@ -339,8 +333,7 @@ class MdrunFleet:
     def register(self, key, proc):
         with self._lock:
             self._procs[key] = proc
-            # A replica that starts after the signal already fired still has to
-            # be told, or it would run on alone until walltime kills it hard.
+            # A replica starting after the signal fired still has to be told.
             if self._stopping.is_set():
                 proc.send_signal(signal.SIGTERM)
 
@@ -393,8 +386,7 @@ def _wait_in_fleet(proc, fleet, fleet_key):
     finally:
         fleet.unregister(fleet_key)
     if fleet.stopping:
-        # mdrun exits 0 after a clean SIGTERM stop, so the exit code alone
-        # cannot distinguish "preempted" from "finished".
+        # mdrun exits 0 after a clean SIGTERM stop, so rc cannot tell us.
         raise Preempted(f'preempt sentinel at {fleet.sentinel}')
     return rc
 
@@ -423,8 +415,7 @@ def _run_mdrun(cmd, cwd, handle_preempt, poll_seconds=PREEMPT_POLL_SECONDS,
     cwd = Path(cwd)
     sentinel = None
     if fleet is None and handle_preempt:
-        # A solo generation watches its own directory. Clear a stale sentinel
-        # from an earlier preempted attempt here; a pack's owner clears the
+        # A solo gen clears its own stale sentinel; a pack's owner clears the
         # pack's once, before any member starts.
         sentinel = cwd / sentinel_name
         if sentinel.exists():
@@ -516,13 +507,10 @@ def gmx_generation(traj_dir_top_level: str,
     own_cpt = gen_dir / restart_name
     seed_cpt = gen_dir / seed_cpt_name
 
-    # The cumulative step the tpr must target. Absolute, because -cpi resumes at
-    # the checkpoint's absolute step and runs until the tpr's nsteps.
+    # Absolute: -cpi resumes at the checkpoint's step and runs to the tpr's.
     target_step = (gen_index + 1) * steps_per_gen
 
-    # Move the incoming seed aside. restart_name is also where mdrun writes
-    # its own checkpoint, and -cpi given a checkpoint from another run, or the
-    # .gro at generation 0, is fatal.
+    # -cpi on another run's checkpoint, or on a .gro, is fatal: move seed aside.
     if not seed_cpt.exists() and own_cpt.exists() and not tpr.is_file():
         # No tpr yet => mdrun has not run here => restart_name is the seed.
         own_cpt.replace(seed_cpt)
@@ -543,8 +531,6 @@ def gmx_generation(traj_dir_top_level: str,
             grompp_maxwarn=grompp_maxwarn, grompp_lock=grompp_lock)
 
     # -cpi takes our own checkpoint if mdrun has run here, else the seed.
-    # -noappend because mdrun will not append into a directory that does not
-    # already hold the output files its checkpoint names.
     resume_from = None
     if is_checkpoint(own_cpt):
         resume_from = own_cpt
@@ -556,10 +542,7 @@ def gmx_generation(traj_dir_top_level: str,
             f'(looked at {own_cpt} and {seed_cpt}). Its predecessor did not '
             'leave a readable state.cpt.')
 
-    # The launch about to happen writes part resume_part + 1 (part 1 when
-    # nothing is resumed), so any higher part already here is a branch this
-    # checkpoint has rewound past. Move it aside before concat_parts can see
-    # it, whether or not mdrun actually runs below.
+    # This launch writes part resume_part + 1; hide higher, rewound-past parts.
     if resume_from is not None:
         resume_part, already = checkpoint_part_step(resume_from, gmx_bin=gmx_bin)
     else:
@@ -567,9 +550,7 @@ def gmx_generation(traj_dir_top_level: str,
     _move_aside_stale_parts(gen_dir, resume_part, deffnm=deffnm,
                             traj_suffix=traj_suffix)
 
-    # Already finished? Finalise instead of re-running. mdrun given a
-    # checkpoint at or past its nsteps aborts, so a relaunch after a lost status
-    # file would otherwise turn a finished generation into a failure.
+    # mdrun aborts on a checkpoint at or past its nsteps, so finalise instead.
     if already is not None and already >= target_step:
         print(f'[gmx] generation {gen_index} is already at step {already} '
               f'of {target_step}; finalising without running mdrun.',
@@ -581,6 +562,7 @@ def gmx_generation(traj_dir_top_level: str,
         reached = None
 
     if reached is None:
+        # -noappend: mdrun cannot append into a dir lacking its cpt's own files.
         mdrun = [gmx_bin, 'mdrun', '-s', tpr, '-deffnm', deffnm,
                  '-cpo', own_cpt, '-maxh', maxh, '-cpt', checkpoint_minutes,
                  '-noappend', *mdrun_args]
@@ -590,9 +572,7 @@ def gmx_generation(traj_dir_top_level: str,
             _run_mdrun(mdrun, gen_dir, handle_preempt,
                        fleet=fleet, fleet_key=fleet_key)
         except Preempted:
-            # Record the progress the stopped run did make, or the orchestrator
-            # reads this generation as never having started and charges it a
-            # restart for work it actually did.
+            # Record what it reached, or it is charged a restart for real work.
             if is_checkpoint(own_cpt):
                 write_gen_status(
                     gen_dir, target_step=target_step, complete=False,
@@ -645,10 +625,7 @@ def _build_gen_tpr(*, tpr, gen_dir, gen_index, new_velocities, target_step,
                 raise ValueError(
                     'gmx_generation needs an .mdp via mdp_fn (or system_fn) to '
                     'build generation 0.')
-            # grompp -c takes this generation's own starting structure, which
-            # is seed_fn whenever the generation starts fresh. Using it rather
-            # than structure_fn is what lets seeds differ in topology, and lets
-            # an adaptive scheme reseed from a configuration it picked.
+            # Prefer seed_fn, so seeds may differ and be adaptively reseeded.
             start_fn = seed_fn if (
                 seed_fn and Path(seed_fn).suffix.lower()
                 in grompp_structure_suffixes) else structure_fn
@@ -673,8 +650,7 @@ def _build_gen_tpr(*, tpr, gen_dir, gen_index, new_velocities, target_step,
                       '-maxwarn', grompp_maxwarn]
             if ndx_fn:
                 grompp += ['-n', str(Path(ndx_fn).resolve())]
-            # grompp runs from the topology's directory so a .top with relative
-            # force-field includes resolves regardless of the gen-dir cwd.
+            # Run from the topology's dir so relative #includes still resolve.
             _run(grompp, str(Path(top_fn).resolve().parent))
         else:
             prev_tpr = _previous_gen_tpr(
@@ -791,8 +767,7 @@ def gmx_try_recover_gen(gen_path: Path, *,
     tpr = gen_path / tpr_name
 
     if status is None:
-        # Never reported: nothing ran, or it died before its first
-        # checkpoint. Relaunchable either way, if a checkpoint can be found.
+        # Never reported: nothing ran, or it died before its first checkpoint.
         seed_cpt = gen_path / seed_cpt_name
         if have_own_cpt and tpr.is_file():
             return gen_index, str(own_cpt.resolve()), total_steps, True
