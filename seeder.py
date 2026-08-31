@@ -28,33 +28,34 @@ class ConfigError(ValueError):
     """
 
 
-# Config entries Clone.from_disk computes for each clone from the disk state.
-# A per-seed override naming one of these would be silently overwritten, so it
-# is refused instead.
+# Config entries from_disk works out per clone. A seed override naming one would
+# be silently overwritten, so it is refused instead.
 CLONE_DERIVED_CONFIG_KEYS = frozenset((
     'seed_index', 'clone_index', 'gen_index', 'steps', 'steps_per_gen',
     'append', 'new_velocities', 'seed_fn', 'top_fn', 'system_fn'))
 
 
-# Sort key that orders gen directories numerically. Anything that isn't
-# '<prefix><sep><digits>' sorts to the end, keyed by name so the order is still
-# deterministic.
 def _gen_sort_key(path, sep):
+    """Sort key ordering gen directories numerically.
+
+    Anything that is not '<prefix><sep><digits>' sorts to the end, keyed by
+    name so the order is still deterministic.
+    """
     tail = path.name.rsplit(sep, 1)[-1]
     if tail.isdigit():
         return (0, int(tail), '')
     return (1, 0, path.name)
 
 
-# Trim the velocity and force trajectories back to the frame count positions
-# were just truncated to.
-#
-# True once every tandem trajectory the config names is aligned. False when one
-# cannot be: a format that cannot be truncated, a header that will not read, a
-# truncation that missed its target, or a tandem BEHIND positions, whose missing
-# frames cannot be fabricated without a matching checkpoint. The caller cascades
-# on False, which redoes this gen -- safe, since it is a dead gen either way.
 def _align_tandem_dcds(gen_path: Path, prev_config: dict, target_nset: int):
+    """Trim the velocity and force trajectories to target_nset frames.
+
+    True once every tandem trajectory the config names is aligned. False when
+    one cannot be: an untruncatable format, an unreadable header, a truncation
+    that missed its target, or a tandem behind positions, whose missing frames
+    cannot be fabricated without a matching checkpoint. The caller cascades on
+    False and redoes the gen, which is dead either way.
+    """
     for name_key, suffix_key, default_name in (
             ('velocity_name', 'velocity_traj_suffix', 'velocities'),
             ('force_name', 'force_traj_suffix', 'forces')):
@@ -97,35 +98,6 @@ def _align_tandem_dcds(gen_path: Path, prev_config: dict, target_nset: int):
     return True
 
 
-# Examine one gen directory and decide whether it can seed the next launch.
-#
-# Returns (gen_index, seed_fn, steps_to_run, append) on success:
-#   - gen_index: which gen the next launch is for (may equal this dir's
-#     gen, or be one higher if this gen is complete and we advance).
-#   - seed_fn: absolute path to the state.xml to load from.
-#   - steps_to_run: how many sim steps the next launch should take.
-#   - append: whether trajectory reporters should open in append mode.
-#
-# Returns None if this gen is unrecoverable. Caller cascades to an older
-# gen, then falls back to the initial seed.
-#
-# Two failures collapse into "unrecoverable" (β policy — prune & redo):
-#   1. state.xml unparseable or missing — torn-mid-write or never landed.
-#   2. state.xml stepCount doesn't sit on a DCD frame boundary — header
-#      doesn't match the checkpoint, both probably bad.
-#
-# For state-behind-DCD (kill between DCDReporter and CheckpointReporter,
-# expected single-frame drift), we truncate the DCD to align and resume.
-# For state-ahead-of-DCD (buffered DCD frames lost at kill before
-# flush-per-frame existed), we accept state.xml as authoritative and
-# advance to the next gen — the lost DCD tail is unrecoverable but the
-# integrator state is intact and the next gen can seed from it.
-#
-# Note on the gen-relative step math: OpenMM's DCDReporter hard-codes the
-# DCD header's istart to reportInterval, regardless of cumulative
-# simulation step. state.xml's stepCount, by contrast, accumulates across
-# gens. So we derive the absolute step at gen start from gen_index and
-# total_steps rather than trusting the DCD header's istart.
 def _try_recover_gen(gen_path: Path, *,
                      append_mode: bool,
                      restart_name: str,
@@ -134,6 +106,26 @@ def _try_recover_gen(gen_path: Path, *,
                      write_interval: int,
                      total_steps: int,
                      top_fn: str):
+    """Decide whether one gen directory can seed the next launch.
+
+    Returns (gen_index, seed_fn, steps_to_run, append): the gen the launch is
+    for, which is one higher than this directory's if this gen is complete;
+    the state.xml to load; the steps to take; and whether the trajectory
+    reporters open in append mode. Returns None if the gen is unrecoverable,
+    and the caller cascades to an older gen, then to the initial seed.
+
+    Unrecoverable means prune and redo: a state.xml that is missing or will
+    not parse, or a stepCount that does not sit on a trajectory frame
+    boundary, where header and checkpoint disagree and both are suspect. A
+    state behind the trajectory is the expected drift from a kill between the
+    two reporters, so the trajectory is trimmed to match. A state ahead of it
+    loses the trajectory tail but keeps an intact integrator state, so it
+    advances to the next gen and seeds from there.
+
+    The step at gen start is derived from gen_index and total_steps rather
+    than read from the DCD header: OpenMM's DCDReporter hard-codes istart to
+    reportInterval, while state.xml's stepCount accumulates across gens.
+    """
     config_p = gen_path / 'config.json'
     if not config_p.is_file():
         return None
@@ -159,9 +151,8 @@ def _try_recover_gen(gen_path: Path, *,
         # No traj yet for this gen. Start it now from this state.
         return gen_index, seed_fn, total_steps, False
 
-    # Only DCD has a header we can read and rewrite. An XTC has to be counted
-    # instead, and cannot be trimmed, so an XTC that ran past its checkpoint is
-    # redone rather than cut back.
+    # Only DCD has a header we can read and rewrite; an XTC has to be counted
+    # instead, and one that ran past its checkpoint is redone rather than cut.
     is_dcd = traj_suffix == '.dcd'
     if is_dcd:
         try:
@@ -192,14 +183,11 @@ def _try_recover_gen(gen_path: Path, *,
     target_nset = state_offset // nsavc
 
     if target_nset > nset:
-        # State ahead of DCD — legacy preempt-buffer-drift from before
-        # FlushingDCDReporter existed. state.xml's integrator state is
-        # intact; advance and let the next gen seed from it.
+        # State ahead of the DCD: the integrator state is intact, so advance.
         return gen_index + 1, seed_fn, total_steps, False
     if target_nset < nset and not is_dcd:
-        # Trajectory past its checkpoint, in a format we cannot trim. Going
-        # on would leave frames the next generation re-simulates, which reads
-        # as time running backwards. Redo it instead.
+        # Untrimmable: going on leaves frames the next gen re-simulates, which
+        # reads as time running backwards. Redo the gen instead.
         print(f'_try_recover_gen: {traj_p} has {nset} frames but state.xml is '
               f'at frame {target_nset}, and {traj_suffix} cannot be truncated; '
               f'cascading so this gen is redone rather than left discontiguous.')
@@ -219,10 +207,8 @@ def _try_recover_gen(gen_path: Path, *,
                   f'target {target_nset}; cascading.')
             return None
         nset = actual
-        # Only from here, the position-truncation branch: a healthy in-flight
-        # gen has positions and state in step, takes the target_nset == nset
-        # path above, and so never reaches this. That is what keeps a live
-        # clone's tandem files from being rewritten under it.
+        # Reached only once positions were trimmed; a healthy in-flight gen
+        # takes the target_nset == nset path, so its tandems are left alone.
         if not _align_tandem_dcds(gen_path, prev_config, target_nset):
             return None
 
@@ -241,6 +227,12 @@ def _try_recover_gen(gen_path: Path, *,
 
 
 class Clone:
+    """One trajectory, grown a generation at a time by repeated scheduler jobs.
+
+    Built by a Farmer at boot, and directly by adaptive sampling scripts that
+    steer a clone themselves.
+    """
+
     __slots__ = (
         'config', 'dry_run', 'job_number', 'job_number_re', 'job_name_fstring', 'current_seed',
         'current_gen_dir', 'config_p', 'scheduler_script_p', 'compare_keys',
@@ -250,67 +242,51 @@ class Clone:
         'preemption_checker', 'node_blocklist', 'progress_fn',
         'scheduler_log_dir', 'last_gen_index', 'reaped_gen')
 
-    # This should mostly be used by the init function, and by adaptive sampling scripts.
-
     def __init__(self,
-                 # keys should match argument parameter names from runner
-                 # function, 4x:omm_basic_sim_block
+                 # keys must match the runner function's parameter names.
                  config: dict,
 
                  # Scheduler to call. Will also be used to name files later.
                  scheduler: str,
                  # BSUB/SBATCH/Scheduler script with anchors for str.format().
                  scheduler_fstring: str,
-                 # Keys should match fstring anchors. Values should be desired substitution.
+                 # keys match the fstring's anchors, values the substitutions.
                  scheduler_kws: dict,
-                 # should be path to the serialized xml this clone will grow from.
+                 # path to the serialized xml this clone will grow from.
                  seed_fn: str,
-                 # If true, call inspect.cleandoc on sched. fstring prior to binding it to self.
+                 # if true, run inspect.cleandoc on scheduler_fstring first.
                  cleandoc_sched_fstring=True,
                  restarts_per_gen=3,
-                 # will store the scheduler's assigned job  number for current job.
+                 # the scheduler's assigned job number for the current job.
                  job_number=None,
                  dirname_pad=2,
                  sep='-',
                  run_script=default_run_script,
                  # regex to extract job_number from submission call output.
                  job_number_re='[1-9][0-9]*',
-                 # A string with anchors for keys from the config to fill in  job_name at
-                 # each generation. This is arg to -J flag in bsub.sh
+                 # anchors for config keys, rendering the job name each gen.
                  job_name_fstring=None,
-                 # if job_name_fstring is none, join iterable of job_name_elements
-                 # and save as sef.job_name_fstring. Default vals are recommended min.
-                 # If each of these are not in job name, with seed, clone, gen in that order
-                 # reassociation from a killed orchestrator will fail.
+                 # Joined into job_name_fstring when that is None. Seed, clone
+                 # and gen must appear in that order or reassociation fails.
                  job_name_elements=(
                      '{title}', '{seed_index}', '{clone_index}',
                      '{gen_index}'),
-                 # Compare keys are used by eq and hash to determine whether two clones are equal.
+                 # config keys __eq__ and __hash__ compare two clones on.
                  compare_keys=('seed_index', 'clone_index'),
                  harvester=None,
-                 # Callable jid -> bool, returns True if the named job was
-                 # preempted by the scheduler. If provided, preemption restarts
-                 # don't count against restarts_per_gen.
+                 # Callable jid -> bool; a preemption it reports costs no
+                 # restart_attempt.
                  preemption_checker=None,
-                 # Shared BadNodeRegistry. When a 0-step abort is detected
-                 # and the gen's scheduler log matches a node-local
-                 # failure pattern, scan_and_record harvests the node and
-                 # excludes it from subsequent submissions. May be None
-                 # (older callers and tests).
+                 # Shared BadNodeRegistry. A 0-step abort whose scheduler log
+                 # names a node-local failure bars that node from later jobs.
                  node_blocklist=None,
-                 # The full per-gen step count from the template. On a resume
-                 # config['steps'] is the steps-remaining-this-gen, not the
-                 # template total, so we have to track the total separately
-                 # or start_next will reset gens to the shortened count. If
-                 # None, fall back to config['steps'] for backwards compat.
+                 # Full per-gen step count. On a resume config['steps'] holds
+                 # only the remainder, which would otherwise shorten later gens.
                  steps_per_gen=None,
-                 # Callable(gen_dir, **context) giving the steps a generation
-                 # still owes. None counts frames, which is right for OpenMM.
-                 # GROMACS passes gmx_simulate.gmx_gen_progress instead.
+                 # Callable(gen_dir, **context) -> steps a gen still owes. None
+                 # counts frames (OpenMM); GROMACS passes gmx_gen_progress.
                  progress_fn=None,
-                 # 0-based index of this clone's final generation. None means
-                 # no limit, for callers outside a Farmer. check_start_gen
-                 # will not start a generation past it.
+                 # 0-based index of the last generation; None means no limit.
                  last_gen_index=None,
                  dry_run=False
                  ):
@@ -361,8 +337,7 @@ class Clone:
         self.job_number_re = re.compile(job_number_re)
         self.harvester = harvester
         # The harvest reads the full generation length from config.json, and
-        # config['steps'] is the steps still owed on a resume. Record the
-        # untouched value on every construction path.
+        # config['steps'] holds only the steps still owed on a resume.
         if config.get('steps_per_gen') is None:
             config['steps_per_gen'] = self.total_steps
         elif config['steps_per_gen'] != self.total_steps:
@@ -370,9 +345,8 @@ class Clone:
                 f"config['steps_per_gen']={config['steps_per_gen']} disagrees "
                 f'with steps_per_gen={self.total_steps}; the harvest would '
                 'place this clone\'s frames at the wrong global index.')
-        # Catch a bad generation length now, while it is still free to fix.
-        # Both spacings break the harvested trajectories at every seam, and
-        # neither ever fails loudly.
+        # Catch an incommensurable generation length now, while it is free to
+        # fix: it breaks harvested trajectories at every seam, and never loudly.
         if harvester is not None:
             downsample_frq = (getattr(harvester, 'run_config', None)
                               or {}).get('downsample_frq')
@@ -385,46 +359,34 @@ class Clone:
                     raise ConfigError(str(exc)) from exc
         self.preemption_checker = preemption_checker
         self.node_blocklist = node_blocklist
-        # The generation whose harvest has already been submitted, so a
-        # generation that is checked in on again does not get a second one.
+        # The generation already harvested, so it never gets a second harvest.
         self.reaped_gen = None
         self.progress_fn = progress_fn
         self.last_gen_index = last_gen_index
         self.run_script = run_script
-        # Where this clone's scheduler log lands. None means its own generation
-        # directory; a ClonePack points every member at the pack directory,
-        # which is the only place a packed job writes one.
+        # Where this clone's scheduler log lands. None means its own gen dir; a
+        # ClonePack points every member at the one log a packed job writes.
         self.scheduler_log_dir = None
         self.scheduler_script_p = None  # always redefined each run
 
-    # Construct a Clone by walking the on-disk state for (seed_index,
-    # clone_index) under tdir. Decides which gen to run next, what to seed
-    # it from, and whether to append or start fresh. Falls through extant
-    # gens newest -> oldest, then falls back to initial_seed_fn if nothing
-    # is recoverable.
     @classmethod
     def from_disk(cls,
                   tdir: Path,
                   seed_index: int,
                   clone_index: int,
                   *,
-                  # The user-provided initial structure for this seed. Used
-                  # when no on-disk gen is recoverable.
+                  # This seed's starting structure, used when no gen recovers.
                   initial_seed_fn: str,
                   # Resolved, validated top and system paths for this seed.
                   top_fn: str,
                   system_fn: str,
-                  # The .gro or .pdb this seed's generation 0 starts from.
-                  # Per seed, since one shared value can only suit one of them.
-                  # None keeps whatever the template says.
+                  # The .gro or .pdb this seed's generation 0 starts from. Per
+                  # seed, since one shared value can only suit one of them.
                   structure_fn: str = None,
-                  # Config entries laid over the shared template for this
-                  # seed, for seeds that differ in more than their files, such
-                  # as in mdrun_args or write_interval. May not name a key
-                  # from_disk works out per clone.
+                  # Config entries laid over the template for this seed. May
+                  # not name a key from_disk works out per clone.
                   config_overrides: dict = None,
-                  # The Farmer's full config_template. Read-only here; we
-                  # deepcopy before mutating.
+                  # The Farmer's config_template. Deepcopied before mutation.
                   config_template: dict,
                   # Scheduler context (passed straight through to __init__).
                   scheduler: str,
@@ -439,20 +401,23 @@ class Clone:
                   preemption_checker=None,
                   node_blocklist=None,
                   restarts_per_gen=3,
-                  # 0-based index of this clone's final generation, passed
-                  # straight through to Clone.__init__. None means no limit.
+                  # Passed through to __init__; None means no generation limit.
                   last_gen_index=None,
-                  # GROMACS support hooks. None -> OpenMM defaults:
-                  #   recover_fn -> _try_recover_gen (state.xml/DCD recovery)
-                  #   run_script -> Clone's default_run_script (omm runner)
+                  # GROMACS hooks. None gives the OpenMM defaults, which are
+                  # _try_recover_gen and default_run_script.
                   recover_fn=None,
                   run_script=None,
                   progress_fn=None,
-                  # (seed, clone, gen) -> jid for jobs currently in the
-                  # scheduler queue, so we can re-associate after an
-                  # orchestrator restart.
+                  # (seed, clone, gen) -> jid for jobs currently queued, so they
+                  # can be re-associated after an orchestrator restart.
                   rep_dict: dict = None,
                   dry_run: bool = False):
+        """Build a Clone from the on-disk state for one seed and clone index.
+
+        Decides which gen to run next, what to seed it from, and whether to
+        append or start fresh, by falling through the extant gens newest to
+        oldest and then back to initial_seed_fn if none is recoverable.
+        """
         if rep_dict is None:
             rep_dict = {}
         append_mode = config_template['append']
@@ -461,18 +426,15 @@ class Clone:
         clone_dir = util.dir_seeds_clones(
             tdir, seed_index, clone_index, dirname_pad, sep=sep, mkdir=False)
         if clone_dir.is_dir():
-            # Sorted by generation number, not by name: sorting by name only
-            # agrees once every index is the same width, so gen-999 would come
-            # after gen-1000. Names that do not parse sort last.
+            # By generation number, not by name: names only sort right at equal
+            # width, so gen-999 would come after gen-1000. Unparseable go last.
             gen_paths = sorted(clone_dir.iterdir(),
                                key=lambda p: _gen_sort_key(p, sep))
         else:
             gen_paths = []
 
-        # A generation whose job is still running is never recovered. Recovery
-        # trims and renames files that job still holds open, and it is the
-        # normal case at boot: that is what rep_dict is for. Bind to the live
-        # job instead and let check_start_gen see it is alive.
+        # A gen whose job is still running is never recovered: recovery trims
+        # and renames files that job holds open. Bind to the live job instead.
         live_gens = sorted(gen for six, cix, gen in rep_dict
                            if (six, cix) == (seed_index, clone_index))
         _recover = recover_fn if recover_fn is not None else _try_recover_gen
@@ -537,8 +499,7 @@ class Clone:
                     f'config_overrides may not set {clashing}: from_disk '
                     'derives those per clone and would overwrite them.')
             config.update(config_overrides)
-        # Keep the StateDataReporter progress display consistent with the
-        # actual run length so % complete isn't misleading on a resume.
+        # Keeps the StateDataReporter's % complete honest on a resume.
         if isinstance(config.get('state_data_kwargs'), dict):
             config['state_data_kwargs'] = {
                 **config['state_data_kwargs'],
@@ -547,13 +508,11 @@ class Clone:
 
         jid = rep_dict.get((seed_index, clone_index, gen_index))
 
-        # steps_per_gen is the untouched full generation length; the GROMACS
-        # runner needs it to compute an absolute cumulative step target even
-        # when config['steps'] has been narrowed to a remainder.
+        # The full generation length: the GROMACS runner needs it for an
+        # absolute step target even when config['steps'] is only a remainder.
         config['steps_per_gen'] = steps_per_gen
 
-        # OpenMM callers pass nothing and get the OpenMM runner; GROMACS
-        # callers pass their own.
+        # OpenMM callers pass nothing and get the OpenMM runner.
         if run_script is None:
             run_script = default_run_script
         return cls(
@@ -578,18 +537,20 @@ class Clone:
             run_script=run_script,
         )
 
-    # Two clones should be the same if their config has the same seed, clone, and title in it.
-    # Customize by providing a set of keys to compare.
     def __hash__(self):
+        """Hash the config entries named by compare_keys."""
         return hash(tuple(self.config[k] for k in self.compare_keys))
 
-    # Use has to define equality;
-    # Note if the two clones are using different compare keys this will nearly always be false
     def __eq__(self, other: Clone) -> bool:
+        """Equal when the hashes match.
+
+        Two clones compared on different compare_keys will nearly always
+        differ, whatever else they have in common.
+        """
         return hash(self) == hash(other)
 
-    # Return a string representing key features of this clone
     def get_tag(self):
+        """Return a string of the config entries that identify this clone."""
         return ' '.join((f'{k}: {self.config[k]}'
                          for k in self.compare_keys))
 
@@ -606,35 +567,38 @@ class Clone:
             raise FileNotFoundError(seed_fp)
 
     def check_copy_set_restart_seed(self):
-        # Check if there's a state save matching current state here
+        """Put a copy of this clone's seed in the current gen directory.
+
+        A no-op when the seed already lives there. The copy becomes the seed
+        the config names, so the launched job finds it beside itself.
+        """
         seed_p = self.current_seed
         seed_dir = seed_p.parent
         if seed_dir != self.current_gen_dir:
             cg_seed_p = self.current_gen_dir/self.config['restart_name']
-            # Critical! Copy the old seed file into the new dir!
             shutil.copy(seed_p, cg_seed_p)
             self.set_seed(cg_seed_p)
 
-    # Returns True if the scheduler reports this clone's last job was
-    # preempted (so the upcoming restart shouldn't count against the
-    # per-gen restart_attempts budget).
     def was_preempted(self):
+        """True if the scheduler reports this clone's last job was preempted.
+
+        The restart that follows one does not count against restarts_per_gen.
+        """
         if self.preemption_checker is None:
             return False
         if self.job_number is None:
             return False
         return self.preemption_checker(self.job_number)
 
-    # note this gets the gen index from config then builds the dir for that gen
-    # So, if you want to start a new generation, you have to increment/change
-    # self.config['gen_index'] before calling this.
-    # Tries to set up directory, and checks if we've gone over the number of restart limits
-    # Returns a bool based on success (True) or failure (False) of these efforts.
-    # If count_as_restart is False (e.g. last job was preempted), skip the
-    # restart_attempts increment so the budget isn't burned by preemption.
     def plow_harrow_plant(self, overwrite=False, count_as_restart=True):
-        # If we're running subsequent generations, we want to restart from prev.
-        # positions and velocities.
+        """Make this generation's directory and write the files a launch needs.
+
+        The generation comes from config['gen_index'], so a caller starting a
+        new one has to increment that first. Returns False once this generation
+        has used up restarts_per_gen. count_as_restart False, as after a
+        preemption, skips the restart_attempts increment.
+        """
+        # Subsequent gens restart from the previous positions and velocities.
         if self.config['gen_index'] != 0:
             self.config['new_velocities'] = False
 
@@ -647,13 +611,10 @@ class Clone:
             sep=self.config['sep'],
             mkdir=True
         )
-        # If we've made a fresh directory this should copy the
-        # previous seed into the new directory.
+        # A fresh directory needs the previous seed copied into it.
         self.check_copy_set_restart_seed()
-        # config.json is always rewritten, even when overwrite is False: the
-        # config in memory is what this launch should do, and a stale file on
-        # disk would relaunch a half-finished generation from scratch. Written
-        # to a temp name first, so nothing reads it half-written.
+        # Rewritten even when overwrite is False: a stale config on disk would
+        # relaunch a half-finished gen from scratch. Temp name, so no torn read.
         config_p = self.current_gen_dir / 'config.json'
         tmp_p = config_p.with_name(config_p.name + '.tmp')
         with tmp_p.open('w') as f:
@@ -698,32 +659,25 @@ class Clone:
         if should_launch and not self.dry_run:
             print('launching', self.get_tag())
             # SIMULATION RUNS HERE. OUTPUT SCANNED FOR JOB NUMBER.
-            # sp.run with capture_output=True (not check_output) so stderr is
-            # captured and surfaced — check_output leaves err.stderr=None,
-            # which made the previous failure print uninformative.
+            # capture_output, not check_output, so stderr can be surfaced.
             with self.scheduler_script_p.open() as f:
                 result = sp.run(
                     self.scheduler, stdin=f, cwd=self.current_gen_dir,
                     text=True, capture_output=True)
             if result.returncode != 0:
-                # Submission failed (bad QOS, account, scheduler hiccup,
-                # malformed script). Return False so the Farmer marks this
-                # clone failed via mark_clone_failed and keeps tending the
-                # rest, rather than letting one bad sbatch kill the
-                # orchestrator.
+                # Submission failed: bad QOS, account, scheduler hiccup or
+                # script. Fail this clone rather than the whole orchestrator.
                 print(f'{self.scheduler} call for {self.get_tag()} returned '
                       f'exit code {result.returncode}')
                 print('  stdout:', result.stdout)
                 print('  stderr:', result.stderr)
                 return False
-            # NOTE: this assumes that some text is printed when a job is started,
-            # and that within that text the first number matching job_number_re
-            # is the Job number.
+            # Assumes the scheduler prints something on submission, whose first
+            # job_number_re match is the job number.
             match = self.job_number_re.search(result.stdout)
             if match is None:
-                # The job IS running; only its id is lost. Say so, so it can be
-                # found and cancelled rather than left to write into a
-                # directory the tender has given up on.
+                # The job is running; only its id is lost. Say so, so it can be
+                # cancelled rather than left writing into an abandoned dir.
                 print(f'{self.scheduler} SUBMITTED a job for {self.get_tag()} '
                       f'in {self.current_gen_dir}, but no job number could be '
                       f'read from its output. That job is RUNNING AND '
@@ -736,45 +690,47 @@ class Clone:
         return should_launch
 
     def start_next(self, overwrite=False, submit=True):
-        # Set seed to be current restart file, but full path so it will be found in next gen dir.
+        """Advance this clone one generation and launch it."""
+        # An absolute path, so the restart file is found from the next gen dir.
         new_seed = self.current_gen_dir/self.config['restart_name']
         self.set_seed(new_seed.resolve())
-        # reset number of restart attempts
         self.restart_attempts = 0
-        # reset number of steps to take
-        # first for accounting inside the clone
+        # The full step count again, for the clone and for config.json.
         self.remaining_steps = self.total_steps
-        # then with respect to the number of steps to write to the config.json
         self.config['steps'] = self.total_steps
-        # A new generation is never a resume. Leaving append set would carry
-        # into it from the generation before, which then starts as though
-        # continuing a partial run it never began.
+        # A new generation is never a resume; an append carried over from the
+        # last one starts it as though continuing a run it never began.
         self.config['append'] = False
-        # because we want to start next, increment the gen before building
+        # Increment before building, since the point is to start the next one.
         self.config['gen_index'] += 1
         attempted_launch = self.start_current(overwrite=overwrite,
                                               submit=submit)
         return attempted_launch
 
-    # The generation this clone would run next. Read from the config rather
-    # than tracked alongside it, so a caller that moves config['gen_index'] --
-    # which is how an adaptive-sampling script redirects a clone -- cannot
-    # leave the two disagreeing.
     @property
     def current_gen(self):
+        """The generation this clone would run next.
+
+        Read from the config rather than tracked alongside it, so an adaptive
+        sampling script that redirects a clone by moving config['gen_index']
+        cannot leave the two disagreeing.
+        """
         return self.config['gen_index']
 
-    # True once this clone has finished its last configured generation and
-    # will never start another. False when last_gen_index is None, since
-    # there is then no limit to have reached.
     @property
     def is_done(self):
+        """True once this clone has finished its last configured generation.
+
+        Always False when last_gen_index is None: there is then no limit.
+        """
         return (self.last_gen_index is not None
                 and self.current_gen > self.last_gen_index)
 
-    # How many steps this generation still owes. progress_fn answers if one
-    # was given; otherwise it is counted from the trajectory's frames.
     def gen_remaining_steps(self):
+        """How many steps this generation still owes.
+
+        progress_fn answers if one was given, otherwise frames are counted.
+        """
         if self.progress_fn is not None:
             return self.progress_fn(
                 self.current_gen_dir,
@@ -794,25 +750,26 @@ class Clone:
             str(traj_p), self.config['top_fn'], self.total_steps,
             self.config['write_interval'])
 
-    # Returns false if launch not attempted because of too many restart attempts
     def check_start_gen(self, scheduler_report: set, overwrite=False,
                         submit=True):
+        """Look at where this clone is and launch whatever it needs next.
+
+        False when no launch was attempted because this generation has spent
+        its restart budget.
+        """
         if self.job_number in scheduler_report:
             print('Job', self.job_number, 'still running',
                   self.job_name_fstring.format(**self.config))
             return True
 
-        # If the scheduler reports this job as preempted, the upcoming restart
-        # shouldn't burn a restart_attempt. Genuine failures (segfault, OOM, GPU
-        # error) still count.
+        # A preemption should not burn a restart_attempt; genuine failures
+        # (segfault, OOM, GPU error) still count.
         count_as_restart = not self.was_preempted()
 
         previous_remaining = self.remaining_steps
         self.remaining_steps = self.gen_remaining_steps()
-        # A launch that got somewhere is not a restart: it is how a
-        # generation longer than one allocation finishes. Progress also clears
-        # the budget, which therefore counts launches that died in a row, not
-        # bad nodes spread over a generation's whole life.
+        # A launch that got somewhere is not a restart: that is how a gen longer
+        # than one allocation finishes, and progress clears the budget too.
         if self.remaining_steps < previous_remaining:
             count_as_restart = False
             self.restart_attempts = 0
@@ -823,9 +780,8 @@ class Clone:
             # do any automated traj postprocessing encoded by harvester
             if self.harvester and self.reaped_gen != self.config['gen_index']:
                 print('running harvester!')
-                # Recorded before the attempt: a pack member whose start_next
-                # raises is checked in on again next tick, and one harvest is
-                # all this generation gets either way.
+                # Recorded before the attempt: one harvest is all this gen gets,
+                # even if a failed start_next brings us back here next tick.
                 self.reaped_gen = self.config['gen_index']
                 try:
                     self.harvester.reap(
@@ -837,17 +793,15 @@ class Clone:
                           f'{type(exc).__name__}: {exc}; continuing.')
             if (self.last_gen_index is not None
                     and self.config['gen_index'] >= self.last_gen_index):
-                # This was the last generation asked for; count it done
-                # instead of starting one more. Nothing builds a directory for
-                # the generation this now names, since is_done is True.
+                # The last generation asked for; count it done instead of
+                # starting one more. is_done stops anything building its dir.
                 self.config['gen_index'] += 1
                 return True
             return self.start_next(overwrite=overwrite, submit=submit)
 
         if self.remaining_steps >= self.total_steps:
-            # Nothing ran. Read the scheduler log for a node-local cause
-            # before the next submission overwrites it. A match adds the node
-            # to exclude_nodes, which steers later jobs off it.
+            # Nothing ran. Read the scheduler log for a node-local cause before
+            # the next submission overwrites it; a match steers later jobs off.
             if self.node_blocklist is not None:
                 self.node_blocklist.scan_and_record(
                     self.scheduler_log_dir or self.current_gen_dir,
@@ -899,13 +853,11 @@ class ClonePack:
     the job holds the card until its slowest member finishes, so mismatched
     per-step costs waste GPU time.
 
-    That rule is about straggler cost, not data safety. Worth saying plainly,
-    because the next reader will otherwise take it as a safety invariant and
-    not know what they are allowed to trade away. Failure is already per-member
+    That rule is about straggler cost, not data safety. Failure is per-member
     (gmx_pack collects K outcomes and the tender fails exactly one clone) and
-    recovery is already per-member, from mdrun -cpi off that member's own
-    checkpoint), so a bad job costs a lost block that gets redone, not a damaged
-    dataset. Packing across conditions is therefore a throughput decision.
+    so is recovery, from mdrun -cpi off that member's own checkpoint, so a bad
+    job costs a lost block that gets redone rather than a damaged dataset.
+    Packing across conditions is a throughput decision, not an unsafe one.
     """
 
     def __init__(self, clones, pack_dir, scheduler, scheduler_fstring,
@@ -915,9 +867,8 @@ class ClonePack:
                  pack_manifest_name='pack.json',
                  run_script_name='run.py',
                  member_cores=None,
-                 # Members with unequal steps are refused, since the job
-                 # holds the card until its slowest finishes. True when every
-                 # launch ends on walltime, where none of them waits.
+                 # Unequal steps are refused: the job holds the card until its
+                 # slowest member finishes. True if every launch ends at -maxh.
                  wallclock_matched=False,
                  sep=None,
                  job_name_elements=('{title}', '{seed_index}',
@@ -937,9 +888,8 @@ class ClonePack:
         self.pack_dir.mkdir(parents=True, exist_ok=True)
         self.scheduler = scheduler
         self.scheduler_fstring = inspect.cleandoc(scheduler_fstring)
-        # Held by reference, not copied, so that nodes blocked later still
-        # reach this pack. The pack's own keys are laid over it at submit
-        # time, which keeps this dict read-only here.
+        # Held by reference, not copied, so nodes blocked later still reach this
+        # pack. The pack's own keys are laid over it at submit time.
         self.scheduler_kws = scheduler_kws
         self.pack_scheduler_kws = {'cpus': int(cpus_per_task),
                                    'run_script_name': run_script_name}
@@ -956,14 +906,12 @@ class ClonePack:
         self.member_cores = member_cores
         self.pack_manifest_name = pack_manifest_name
         self.job_number_re = re.compile(job_number_re)
-        # The name has to parse the way Farmer re-associates jobs at boot,
-        # as seed, clone and gen numbers. One that does not leaves job_number
-        # unset, and the next tick starts a second job in this directory.
+        # The name must parse as seed, clone and gen, the way Farmer
+        # re-associates at boot; one that does not gets a second job here.
         self.sep = clones[0].sep if sep is None else sep
         self.job_name_fstring = (job_name_fstring
                                  or self.sep.join(job_name_elements))
-        # Member 0's config renders that name, so its re-associated job
-        # number is the pack's.
+        # Member 0's config renders that name, so its job number is the pack's.
         if job_number is None:
             job_number = next((c.job_number for c in self.clones
                                if c.job_number is not None), None)
@@ -974,23 +922,22 @@ class ClonePack:
             # in its own gen dir, so a node scan rooted there finds nothing.
             clone.scheduler_log_dir = self.pack_dir
         self.dry_run = dry_run
-        # Indexes into self.clones that have exhausted their restart budget
-        # and will never run again. Kept out of self.clones itself, since
-        # member_cores and the pack's job name are positional over that list.
+        # Members that exhausted their restart budget. Kept out of self.clones,
+        # which member_cores and the pack's job name index positionally.
         self.retired = set()
 
     @property
     def current_gen(self):
-        # The pack advances together, so the laggard among the members still
-        # live defines where it is. A retired member's frozen current_gen
-        # would otherwise pin the pack there forever.
+        """Where the pack is: the laggard among the members still live.
+
+        A retired member's frozen current_gen would otherwise pin it forever.
+        """
         live = [c.current_gen for i, c in enumerate(self.clones)
                 if i not in self.retired]
         return min(live) if live else min(c.current_gen for c in self.clones)
 
     def get_tag(self):
-        # Retired members are marked, so a pack that finished a member short
-        # does not read the same as one where every member succeeded.
+        # Retired members are marked, so a short pack reads differently.
         return 'pack[' + ' | '.join(
             c.get_tag() + (' RETIRED' if i in self.retired else '')
             for i, c in enumerate(self.clones)) + ']'
@@ -1032,17 +979,14 @@ class ClonePack:
                       f'{type(exc).__name__}: {exc}')
                 continue
             if not ok:
-                # check_start_gen only refuses once the restart budget for
-                # this generation is spent, and a member that never runs can
-                # never earn it back. Retire it so its frozen current_gen
-                # stops pinning the whole pack in place.
+                # Its restart budget is spent, and a member that never runs can
+                # never earn it back; retire it so it stops pinning the pack.
                 self.retired.add(index)
                 print(f'{clone.get_tag()}: exhausted its restart budget; '
                       'retiring it from the pack.')
                 continue
             if clone.is_done:
-                # That call finished this member's last generation; it has
-                # nothing left to submit, so leave it out of this launch.
+                # That call finished this member's last gen; nothing to submit.
                 newly_finished += 1
                 continue
             member_configs.append(clone.current_gen_dir / 'config.json')
@@ -1062,16 +1006,14 @@ class ClonePack:
             return False
         unfinished = tried - newly_finished
         if len(member_configs) < unfinished:
-            # Relaunch the pack with the members that are still healthy rather
-            # than shrinking it permanently: a shrunk pack leaves the card
-            # underpacked for the rest of the campaign.
+            # Launch the healthy members rather than shrinking the pack for
+            # good, which would leave the card underpacked from here on.
             print(f'{self.get_tag()}: {unfinished - len(member_configs)} of '
                   f'{unfinished} members could not be prepared; launching '
                   'the rest.')
 
         from . import gmx_pack
-        # Subset the core split to the members that actually prepared, so a
-        # short-handed pack still gets a layout of the right length.
+        # Subset the core split to the members that actually prepared.
         member_cores = (None if self.member_cores is None
                         else [self.member_cores[i] for i in member_indexes])
         gmx_pack.write_pack_manifest(
@@ -1108,8 +1050,7 @@ class ClonePack:
             print('  stderr:', result.stderr)
             return False
         self.job_number = int(match.group(0))
-        # Every member answers to the pack's job id, so the Farmer's
-        # still-running check works per member as well as per pack.
+        # Every member answers to the pack's job id, so per-member checks work.
         for clone in self.clones:
             clone.job_number = self.job_number
         print('Started pack:', self.get_tag(), 'as job', self.job_number)
