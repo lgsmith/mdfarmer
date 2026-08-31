@@ -213,14 +213,8 @@ def strip_ds_mdtraj(config_fn, harvester_config_fn):
         config_fn, harvester_config_fn, backend=harvester.BACKEND_MDTRAJ)
 
 
-
-# These basic strings are useful in many cases on clusters using the scheduler named as the key.
-# NOTE the format target '{job_name}' has to appear for the default queue parser to find the job.
-# The 'NODE:' / 'GPU:' echoes are how BadNodeRegistry learns which host
-# produced a failure and which device was on it. Keep them if you
-# replace this fstring with your own and want bad-node blocking to work.
-# {exclude_nodes} expands to a scheduler directive line excluding any
-# nodes BadNodeRegistry has flagged (empty when none are blocked).
+# Ready-made job scripts, keyed by scheduler. The module docstring says what a
+# replacement has to keep.
 basic_scheduler_fstrings = {
     "lsf": inspect.cleandoc("""#!/bin/bash
                 #BSUB -J {job_name}
@@ -235,10 +229,8 @@ basic_scheduler_fstrings = {
 
                 python {run_script_name}
                 """),
-    # -J is sbatch's job-name flag, and the shebang decides which shell runs
-    # the job. {exclude_nodes} is empty when nothing is blocked; the blank line
-    # that leaves is fine, but keep every #SBATCH above the echoes, since Slurm
-    # stops reading directives at the first real command.
+    # Every #SBATCH has to stay above the echoes: Slurm stops reading
+    # directives at the first real command.
     "slurm": inspect.cleandoc("""#!/bin/bash
                 #SBATCH -J {job_name}
                 #SBATCH -e slurm.out
@@ -256,12 +248,10 @@ basic_scheduler_fstrings = {
                 """)
 }
 
-# Preempt-aware variants: install a SIGTERM trap that touches the sentinel
-# file SentinelReporter watches for, then background+wait the python
-# invocation so the trap can fire (bash blocks signal delivery while a
-# non-builtin foreground command runs). The trailing sleep 70 keeps the
-# script alive past the 60s preempt grace period so Slurm records the job
-# as CANCELLED rather than FAILED. Pair with Farmer(handle_preempt=True).
+# Preempt-aware variants for Farmer(handle_preempt=True): the SIGTERM trap
+# touches the file SentinelReporter watches, python is backgrounded so bash can
+# deliver the signal at all, and the sleep outlives the 60s grace period so the
+# job is recorded as CANCELLED rather than FAILED.
 basic_scheduler_fstrings_preempt = {
     "lsf": inspect.cleandoc("""#!/bin/bash
                 #BSUB -J {job_name}
@@ -280,9 +270,8 @@ basic_scheduler_fstrings_preempt = {
                 python {run_script_name} &
                 wait
                 """),
-    # --signal=B:TERM@120 gives 120 seconds' warning at the end of the
-    # allocation as well as on preemption, which is the time to checkpoint in.
-    # B: sends it to the batch shell so the trap below runs.
+    # --signal=B:TERM@120 warns the batch shell (B:) 120 seconds before the
+    # allocation ends or a preemption lands, which is the time to checkpoint in.
     "slurm": inspect.cleandoc("""#!/bin/bash
                 #SBATCH -J {job_name}
                 #SBATCH -e slurm.out
@@ -311,10 +300,7 @@ basic_gpu_lines = {
 }
 
 # One job, one GPU, several replicas sharing it through CUDA MPS. Goes with
-# gmx_pack.gmx_pack_sim_block_json, which does the core pinning. The MPS pipe
-# and log directories are named after the job id, so two packed jobs on one node
-# cannot clobber each other's daemon. A daemon that fails to start is only a
-# slowdown, not an error, so the script says so loudly instead of dying.
+# gmx_pack.gmx_pack_sim_block_json, which does the core pinning.
 basic_scheduler_fstrings_mps = {
     "slurm": inspect.cleandoc("""#!/bin/bash
                 #SBATCH -J {job_name}
@@ -364,39 +350,27 @@ basic_scheduler_fstrings_mps = {
                 """)
 }
 
-# A job of this campaign is named title, seed, clone and gen joined by the
-# separator, and the awk below matches the name field against exactly that, end
-# to end. Anything looser lets a campaign titled '{title}-long' answer to this
-# one: its jobs are named '{title}-long-0-0-5', so they pass any test on the
-# title as a prefix, and their ids then bind to this campaign's (0, 0, 5).
-# The '-' is the default sep; edit these if the Farmer is given another one.
-# Curly braces must be escaped with curly braces when using awk via str.format.
-
-# Basic report to print _only_ a list of job ids associated to this runner.
-# Should have 'title' fstring target somewhere to purify spurious jobids.
-# update_jids calls:
-#   self.scheduler_report_fstring.format(title=self.config_template['title'])
+# Job ids belonging to this campaign, for Farmer.update_jids, which formats in
+# the title. The awk anchors the whole name field for the reason the module
+# docstring gives; '-' is the default sep, so edit these if the Farmer has
+# another. Braces are doubled to survive str.format.
 basic_scheduler_reports = {
-    # -o 'JOBID JOB_NAME' rather than -o JOBID, since the name is what awk tests.
+    # -o 'JOBID JOB_NAME', not -o JOBID, since the name is what awk tests.
     "lsf": "bjobs -o 'JOBID JOB_NAME' -noheader -J '{title}-*'"
            " | awk '$2 ~ /^{title}-[0-9]+-[0-9]+-[0-9]+$/ {{print $1}}'",
-    # -h -o '%i %j' prints JobID and untruncated JobName, two whitespace-separated columns.
-    # The default -O Name truncates to 8 chars, which silently breaks title matching.
+    # '%i %j' prints the id and the untruncated name; -O Name would truncate to
+    # 8 characters and silently stop matching.
     "slurm": "squeue --me -h -o '%i %j'"
              " | awk '$2 ~ /^{title}-[0-9]+-[0-9]+-[0-9]+$/ {{print $1}}'"
 }
 
-# Basic report to print the name, and then the jobid, for each job with job title
-# created by orchestrator. Allows scripts to associate currently running jobs to
-# their seed, clone, and gen indexes. Output should be a string where each new line
-# is a job, with the Job ID in the first field and the Job Name in the second.
-# __init__ from Orchestrator calls:
-#   self.scheduler_assoc_fstring.format(title=self.config_template['title'])
+# The same, but one 'jobid jobname' line per job, so the orchestrator can map a
+# running job back to its seed, clone and gen.
 basic_scheduler_assoc_reports = {
     "lsf": "bjobs -o 'JOBID JOB_NAME' -noheader -J '{title}-*'"
            " | awk '$2 ~ /^{title}-[0-9]+-[0-9]+-[0-9]+$/'",
-    # awk (not grep) so a clean queue exits 0 instead of grep's exit-1-on-no-match,
-    # which would crash the boot-time sp.check_output in Farmer.__init__.
+    # awk, not grep: an empty queue has to exit 0, or the boot-time query in
+    # Farmer.__init__ raises instead of reporting no jobs.
     "slurm": "squeue --me -h -o '%i %j'"
              " | awk '$2 ~ /^{title}-[0-9]+-[0-9]+-[0-9]+$/'"
 }
