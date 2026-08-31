@@ -234,10 +234,6 @@ class SentinelReporter:
             raise Preempted(f'preempt sentinel detected at {self._sentinel.resolve()}')
 
 
-# This function is written so that you could use jug's 'Task' class to uplift
-# instances of calls. It returns the path to the trajectory written.
-
-
 def omm_generation(traj_dir_top_level: str,
                    system_fn: str,
                    top_fn: str,
@@ -270,8 +266,6 @@ def omm_generation(traj_dir_top_level: str,
                    # Given 0.004 ps dt, 10 ps write freq.
                    write_interval=2500,
                    # If true, run minimizeEnergy on simulation before taking steps.
-                   # simulation parameters below here; standard values for normal solvated protein inserted.
-                   # Note units in comments
                    minimize_first=False,
                    # Integrator parameters
                    temperature=None,  # kelvin
@@ -280,27 +274,31 @@ def omm_generation(traj_dir_top_level: str,
                    velocity_name='velocities',
                    # Basename for the parallel force trajectory (no suffix).
                    force_name='forces',
-                   # Write velocities into the main trajectory file.
-                   # Only supported for traj_suffix='.h5' (mdtraj HDF5Reporter).
+                   # Embed velocities in the main trajectory; needs traj_suffix='.h5'.
                    embed_velocities=False,
-                   # Writing forces into the main trajectory is not supported by any
-                   # mdtraj reporter; always raises ValueError if True.
+                   # Unsupported by every mdtraj reporter; always raises ValueError.
                    embed_forces=False,
-                   # Extension for a parallel velocity file. One of '.dcd', '.xtc', '.h5'.
-                   # None means no parallel velocity file is written.
+                   # Parallel velocity file: '.dcd', '.xtc', '.h5', or None for none.
                    velocity_traj_suffix=None,
-                   # Extension for a parallel force file. One of '.dcd', '.xtc', '.h5'.
-                   # None means no parallel force file is written.
+                   # Parallel force file: '.dcd', '.xtc', '.h5', or None for none.
                    force_traj_suffix=None,
-                   # If True, install a SentinelReporter that watches for a
-                   # PREEMPT_SIGTERM file in cwd (touched by the batch
-                   # script's SIGTERM trap on Slurm preempt) and raises
-                   # Preempted at the next write_interval cycle. Requires the
-                   # batch script to install the trap and background+wait
-                   # the python invocation; see basic_scheduler_fstrings_preempt.
+                   # If True, install a SentinelReporter watching cwd for PREEMPT_SIGTERM.
                    handle_preempt=False,
                    ):
+    """Run one generation of MD and return the path to the trajectory written.
 
+    Parameters are documented inline in the signature above. Every reporter
+    writes on the same write_interval, so the trajectory, state.xml and .out
+    file stay frame-aligned on disk and an interrupted generation can be picked
+    up later with append=True.
+
+    With handle_preempt, Preempted is raised at the first reporter cycle after
+    the batch script's SIGTERM trap touches PREEMPT_SIGTERM in cwd; this needs a
+    batch script that installs that trap and background+waits the python
+    invocation (see basic_scheduler_fstrings_preempt).
+
+    Written so calls can be uplifted with jug's 'Task' class.
+    """
     # Validate embedded-output requests up front.
     if embed_forces:
         raise ValueError(
