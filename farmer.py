@@ -639,7 +639,6 @@ class Farmer:
                 'topology, .mdp, or an unreadable checkpoint).')
         still_running = self.launch(update_jids=False)
         brake_file_p = Path('stop')
-        # this needs to be while all(list of T/F for completed seeds/clones)
         print('still_running:', *still_running, flush=True)
         # If dry run, short circuit the tending loop.
         if self.dry_run:
