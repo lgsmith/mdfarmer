@@ -10,19 +10,16 @@ from pathlib import Path
 from os import environ
 
 
-# Subclass that pushes Python's user-space buffer to the kernel after each
-# frame write. A SIGKILL from Slurm preempt otherwise loses bytes still
-# sitting in the BufferedWriter; flushing promotes them to the kernel page
-# cache, which survives the process death (node stays up). flush() is
-# microseconds and never blocks on disk — the kernel writes to disk
-# asynchronously, on its own schedule, independent of the simulation loop.
-#
-# Don't be tempted to substitute buffering=0 on the underlying open():
-# DCDFile.writeModel emits many small struct.pack writes per frame, each
-# of which would become its own syscall under buffering=0, slowing the
-# write loop dramatically. Buffered writes + explicit flush is the
-# correct combination.
 class FlushingDCDReporter(app.DCDReporter):
+    """DCDReporter that pushes Python's buffer to the kernel after each frame.
+
+    A SIGKILL from Slurm preempt loses bytes still sitting in the BufferedWriter;
+    the kernel page cache they are flushed into survives the process death.
+    flush() costs microseconds and never blocks on disk. Do not reach for
+    buffering=0 instead: DCDFile.writeModel emits many small struct.pack writes
+    per frame, each of which would then become its own syscall.
+    """
+
     def report(self, simulation, state):
         super().report(simulation, state)
         try:
@@ -45,18 +42,15 @@ def _flush_dcd_file(reporter):
         )
 
 
-# Tandem-file reporters: write velocity or force vectors into the position
-# slot of a DCD or XTC file that rides alongside the position trajectory,
-# frame-for-frame. The semantic abuse is intentional — DCD and XTC carry no
-# velocity/force fields, so we repurpose the position slot. Callers are
-# responsible for knowing what the file contains.
-#
-# describeNextReport returns the new dict format (OpenMM 8.x).  The
-# 'include' list controls which quantities getState() populates; we request
-# only what we need and never positions.
-
 class _TandemDCDReporter:
-    """Write velocities or forces into the position slot of a DCD file."""
+    """Write velocities or forces into the position slot of a DCD file.
+
+    DCD carries no velocity or force field, so the position slot is repurposed
+    and the file rides alongside the position trajectory frame-for-frame. The
+    numbers on disk are in the quantity's native units — nm/ps for velocities,
+    kJ/(mol·nm) for forces — but labelled nanometers, so a reader has to know
+    which quantity a given file holds.
+    """
 
     def __init__(self, file, reportInterval, quantity, append=False,
                  enforcePeriodicBox=None):
@@ -108,7 +102,14 @@ class _TandemDCDReporter:
 
 
 class _TandemXTCReporter:
-    """Write velocities or forces into the position slot of an XTC file."""
+    """Write velocities or forces into the position slot of an XTC file.
+
+    Same repurposing and same unit labelling as _TandemDCDReporter, but XTC's
+    writer additionally requires abs(value) * 1000 to fit in int32 (~2.1e6 nm
+    after scaling). Velocities (a few nm/ps) and bonded forces (up to ~1e5
+    kJ/mol/nm) both clear that bound, but XTC compression is lossy — use .dcd
+    if you need full precision on saved velocities or forces.
+    """
 
     def __init__(self, file, reportInterval, quantity, append=False,
                  enforcePeriodicBox=None):
@@ -152,11 +153,12 @@ class _TandemXTCReporter:
         self._xtc.writeModel(vectors, periodicBoxVectors=state.getPeriodicBoxVectors())
 
 
-# HDF5 tandem reporter: velocities go into the velocities field (native
-# support); forces are shoehorned into the coordinates field because
-# HDF5TrajectoryFile.write has no forces kwarg.
 class _TandemHDF5Reporter:
-    """Write velocities or forces to an HDF5 trajectory file."""
+    """Write velocities or forces to an HDF5 trajectory file.
+
+    Velocities go into the native velocities field; forces are shoehorned into
+    the coordinates field, since HDF5TrajectoryFile.write has no forces kwarg.
+    """
 
     def __init__(self, file, reportInterval, quantity, append=False,
                  enforcePeriodicBox=None):
@@ -227,10 +229,12 @@ class Preempted(Exception):
 
 
 class SentinelReporter:
-    """Detects a Slurm-preempt SIGTERM via a sentinel file written by the
-    batch script's trap handler. Appended LAST in the reporter list so the
-    position / state / data writers for the current cycle have already
-    fired and produced aligned on-disk output before we raise."""
+    """Raise Preempted once the batch script's trap handler drops the sentinel.
+
+    Checked on each write_interval cycle, and appended LAST in the reporter list
+    so the position / state / data writers for that cycle have already fired and
+    produced aligned on-disk output before the simulation loop unwinds.
+    """
 
     def __init__(self, reportInterval, sentinel_path=None):
         self._reportInterval = reportInterval
