@@ -8,9 +8,7 @@ from . import gmx_simulate as gmx
 from . import gmx_pack
 import time
 
-# Consecutive failed advances a clone is allowed before it is given up on. A
-# failed submission or a scheduler hiccup is usually transient; abandoning a
-# clone ends its part of the campaign until a human notices.
+# Consecutive failed advances a clone is allowed before it is given up on.
 SUBMIT_FAILURE_LIMIT = 3
 
 
@@ -29,12 +27,14 @@ class Farmer:
                  'seed_config_overrides', 'submit_failure_limit',
                  'submit_failures')
 
-    # Refresh the set of job ids the scheduler says are ours and alive.
-    # Returns False when the answer could not be trusted, leaving current_jids
-    # alone. The report command is a pipeline, so a squeue that fails still
-    # exits 0 and prints nothing, and reading that as "no jobs running" would
-    # relaunch every live clone. pipefail makes the pipeline fail instead.
     def update_jids(self):
+        """Refresh the set of job ids the scheduler says are ours and alive.
+
+        False means the answer could not be trusted and current_jids was left
+        alone. The report command is a pipeline, so a squeue that fails still
+        exits 0 and prints nothing; read as "no jobs running" that would
+        relaunch every live clone.
+        """
         trusted, jids_string = util.scheduler_query(self.scheduler_report_cmd)
         if not trusted:
             print(f'WARNING: keeping the previous {len(self.current_jids)} job '
@@ -57,8 +57,8 @@ class Farmer:
         else:
             raise FileNotFoundError(p)
 
-    # move clone off the active list
     def mark_clone_failed(self, clone):
+        """Move a clone off the active list and onto the failed one."""
         self.failed_clone_set.add(clone)
         try:
             self.active_clone_set.remove(clone)
@@ -66,10 +66,12 @@ class Farmer:
             pass
         print('FAILED CLONE:', clone.get_tag())
 
-    # Check if clone has finished all its generations.
-    # Remove from clone_list, and active set, and add to finished set.
-    # return True if finished, False if not.
     def check_mark_clone_finished(self, clone):
+        """True when the clone has run all n_gens generations.
+
+        A finished clone is moved out of the active set and into
+        finished_clones.
+        """
         next_up_gen = clone.current_gen
         enough_gens = next_up_gen >= self.n_gens
         if enough_gens:
@@ -81,10 +83,14 @@ class Farmer:
                 print('done_before_launch', clone.get_tag())
         return enough_gens
 
-    # Ask the scheduler which of our jobs are alive, and match them back to the
-    # (seed, clone, gen) they belong to. One query answers both questions: two
-    # would let a job come or go in between, binding a dead id to a Clone.
     def reassociate_running_jobs(self):
+        """Map our live job ids back to the (seed, clone, gen) they belong to.
+
+        One query answers both which jobs are alive and whose they are: two
+        would let a job come or go in between, binding a dead id to a Clone.
+        Raises if the scheduler cannot be reached, since booting blind would
+        submit a second job into every live generation directory.
+        """
         self.current_jids = set()
         rep_dict = {}
         trusted, assoc_raw = util.scheduler_query(self.scheduler_assoc_rep_cmd)
@@ -105,23 +111,16 @@ class Farmer:
             self.current_jids.add(jid)
             name = fields[1] if len(fields) > 1 else ''
             try:
-                # The last three fields only. The title comes first and may
-                # contain the separator itself, which would otherwise leave a
-                # running job unbound and get a second one launched over it.
+                # Last three fields only: the title leads and may contain sep.
                 six, cix, gix = map(int, name.split(self.sep)[-3:])
             except ValueError:
-                # No clone is bound to this job, so nothing stops the clone it
-                # belongs to launching a second one into the same generation
-                # directory. Say so; it is the last chance to notice.
                 print(f'WARNING: queued job {jid} is named {name!r}, which '
                       f'does not end in {self.sep}seed{self.sep}clone'
                       f'{self.sep}gen indices. No clone will be bound to it, '
                       'and one may launch a second job on top of it.')
                 continue
             key = (six, cix, gix)
-            # Two live jobs in one generation directory share a checkpoint and
-            # a set of part numbers, which no checkpoint can undo. The tender
-            # cannot cancel either one, so all it can do is say so.
+            # The tender cannot cancel either job, so all it can do is say so.
             if key in rep_dict:
                 print(f'WARNING: jobs {rep_dict[key]} and {jid} are both '
                       f'queued for seed/clone/gen {key}. Two jobs in one '
@@ -131,19 +130,22 @@ class Farmer:
         self.jids_file.write_text(' '.join(map(str, sorted(self.current_jids))))
         return rep_dict
 
-    # The template a pack submits: the one given, else the MPS default for
-    # this scheduler family.
     def pack_template(self):
+        """The template a pack submits: the given one, else the MPS default."""
         family = util.scheduler_families.get(self.scheduler, self.scheduler)
         return (self.pack_scheduler_fstring
                 or util.basic_scheduler_fstrings_mps[family])
 
-    # A preempted job is killed outright unless its submit script traps SIGTERM
-    # and touches PREEMPT_SIGTERM, which is what the simulation watches for so
-    # it can shut down on a whole frame. Check the template that will really be
-    # submitted: packing submits the pack template and never the solo one, and
-    # a packed member watches the sentinel whether or not handle_preempt is set.
     def check_preempt_template(self):
+        """Check that the template about to be submitted traps SIGTERM.
+
+        A preempted job is killed outright unless its submit script traps
+        SIGTERM and touches PREEMPT_SIGTERM, which is what the simulation
+        watches for so it can shut down on a whole frame. Packing submits the
+        pack template and never the solo one, and a packed member watches the
+        sentinel whether or not handle_preempt is set. A solo template without
+        the trap raises; a pack template without it only warns.
+        """
         packing = bool(self.pack_size or self.pack_grouping)
         if not packing and not self.config_template.get('handle_preempt'):
             return
@@ -165,10 +167,12 @@ class Farmer:
             'an equivalent trap+background+wait pattern in your custom '
             'template.')
 
-    # Fill in the run_script, recover_fn and progress_fn that go with runner.
-    # A hand-supplied set that disagrees with it is refused rather than half
-    # applied, since the engine that runs is the one named in the run script.
     def select_engine(self, runner, run_script, recover_fn, progress_fn):
+        """Fill in the run_script, recover_fn and progress_fn matching runner.
+
+        A hand-supplied set that disagrees with runner is refused rather than
+        half applied: the engine that runs is the one named in the run script.
+        """
         self.runner = runner
         self.run_script = run_script
         self.recover_fn = recover_fn
@@ -196,9 +200,13 @@ class Farmer:
                         'campaign; mixing them runs one engine with the '
                         "other's recovery logic.")
 
-    # Build one Clone via disk-state discovery, isolating failures so one
-    # corrupt clone dir can't kill orchestrator boot.
     def _setup_one_clone(self, tdir, seed_index, clone_index, rep_dict):
+        """Build one Clone from its directory, or None if that clone alone fails.
+
+        Isolating the failure keeps one corrupt clone directory from killing
+        boot. A ConfigError is re-raised instead: it is the configuration, not
+        this clone, and every clone it touches will hit it.
+        """
         try:
             clone = seeder.Clone.from_disk(
                 tdir, seed_index, clone_index,
@@ -228,8 +236,6 @@ class Farmer:
                 dry_run=self.dry_run,
             )
         except seeder.ConfigError:
-            # Not this clone's problem: it is the configuration, and every
-            # clone it touches will hit it. Boot loudly rather than short.
             raise
         except Exception as exc:
             print(f'Skipping clone seed={seed_index} clone={clone_index} '
