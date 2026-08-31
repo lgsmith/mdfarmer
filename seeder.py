@@ -747,25 +747,27 @@ class Clone:
             str(traj_p), self.config['top_fn'], self.total_steps,
             self.config['write_interval'])
 
-    # Returns false if launch not attempted because of too many restart attempts
     def check_start_gen(self, scheduler_report: set, overwrite=False,
                         submit=True):
+        """Look at where this clone is and launch whatever it needs next.
+
+        False when no launch was attempted because this generation has spent
+        its restart budget.
+        """
         if self.job_number in scheduler_report:
             print('Job', self.job_number, 'still running',
                   self.job_name_fstring.format(**self.config))
             return True
 
-        # If the scheduler reports this job as preempted, the upcoming restart
-        # shouldn't burn a restart_attempt. Genuine failures (segfault, OOM, GPU
-        # error) still count.
+        # A preemption should not burn a restart_attempt; genuine failures
+        # (segfault, OOM, GPU error) still count.
         count_as_restart = not self.was_preempted()
 
         previous_remaining = self.remaining_steps
         self.remaining_steps = self.gen_remaining_steps()
-        # A launch that got somewhere is not a restart: it is how a
-        # generation longer than one allocation finishes. Progress also clears
-        # the budget, which therefore counts launches that died in a row, not
-        # bad nodes spread over a generation's whole life.
+        # A launch that got somewhere is not a restart: that is how a gen longer
+        # than one allocation finishes. Progress clears the budget too, so it
+        # counts launches that died in a row, not ones spread over a gen's life.
         if self.remaining_steps < previous_remaining:
             count_as_restart = False
             self.restart_attempts = 0
@@ -776,9 +778,8 @@ class Clone:
             # do any automated traj postprocessing encoded by harvester
             if self.harvester and self.reaped_gen != self.config['gen_index']:
                 print('running harvester!')
-                # Recorded before the attempt: a pack member whose start_next
-                # raises is checked in on again next tick, and one harvest is
-                # all this generation gets either way.
+                # Recorded before the attempt: one harvest is all this gen gets,
+                # even if a failed start_next brings us back here next tick.
                 self.reaped_gen = self.config['gen_index']
                 try:
                     self.harvester.reap(
@@ -790,17 +791,16 @@ class Clone:
                           f'{type(exc).__name__}: {exc}; continuing.')
             if (self.last_gen_index is not None
                     and self.config['gen_index'] >= self.last_gen_index):
-                # This was the last generation asked for; count it done
-                # instead of starting one more. Nothing builds a directory for
-                # the generation this now names, since is_done is True.
+                # The last generation asked for; count it done instead of
+                # starting one more. is_done stops anything building its dir.
                 self.config['gen_index'] += 1
                 return True
             return self.start_next(overwrite=overwrite, submit=submit)
 
         if self.remaining_steps >= self.total_steps:
-            # Nothing ran. Read the scheduler log for a node-local cause
-            # before the next submission overwrites it. A match adds the node
-            # to exclude_nodes, which steers later jobs off it.
+            # Nothing ran. Read the scheduler log for a node-local cause before
+            # the next submission overwrites it; a match adds it to
+            # exclude_nodes, which steers later jobs off that node.
             if self.node_blocklist is not None:
                 self.node_blocklist.scan_and_record(
                     self.scheduler_log_dir or self.current_gen_dir,
