@@ -41,54 +41,40 @@ from pathlib import Path
 from . import utilities as util
 
 
-# Sentinel the batch script's SIGTERM trap touches on preempt (matches
-# simulate.PREEMPT_SENTINEL_NAME so the same scheduler fstrings work).
+# Preempt sentinel the SIGTERM trap touches; same name as simulate's.
 PREEMPT_SENTINEL_NAME = 'PREEMPT_SIGTERM'
 
-# Written by the runner after every mdrun so the orchestrator can decide whether
-# a generation is finished without counting frames or invoking gmx.
+# Written after each mdrun so the orchestrator can judge progress without gmx.
 GEN_STATUS_NAME = 'gen_status.json'
 
-# Clone copies the incoming checkpoint in under restart_name, and the runner
-# moves it here at once, so restart_name only ever names a checkpoint this
-# generation's own mdrun wrote.
+# Incoming seed checkpoint, moved off the name mdrun writes its own one to.
 SEED_CPT_NAME = 'seed.cpt'
 
-# Per-generation tpr. Generation N>0 is built from generation N-1's by
-# convert-tpr, so this name is also how a generation finds its predecessor.
+# Per-generation tpr; gen N>0 is convert-tpr'd from gen N-1's file of this name.
 TPR_NAME = 'prod.tpr'
 
 # mdrun -deffnm stem; also the prefix of the .partNNNN outputs.
 DEFFNM = 'prod'
 
-# Prefix a stale part is renamed to, so it stops matching part_files' glob but
-# stays on disk as a record of the abandoned branch.
+# Prefix that hides a stale part from part_files' glob without deleting it.
 ABANDONED_PART_PREFIX = 'abandoned-'
 
-# First four bytes of every GROMACS checkpoint, big-endian 171817. Reading them
-# tells a checkpoint from a .gro without asking gmx.
+# First bytes of any GROMACS checkpoint: tells one from a .gro without gmx.
 CHECKPOINT_MAGIC = b'\x00\x02\x9f\x29'
 
-# How often mdrun writes a checkpoint, in minutes. GROMACS defaults to 15, which
-# is how much work a hard kill can cost; a shorter period costs almost nothing.
+# mdrun checkpoint period. The GROMACS default of 15 is what a hard kill costs.
 CHECKPOINT_MINUTES = 5
 
-# Spacing between seeds in the gen-seed sequence. gen-seed is
-# base + GEN_SEED_STRIDE * seed_index + clone_index, so this must exceed
-# n_clones or two seeds draw the same initial velocities.
+# gen-seed = base + GEN_SEED_STRIDE * seed + clone; must exceed n_clones.
 GEN_SEED_STRIDE = 1000
 
-# Structure formats grompp -c will read. A generation that continues another is
-# seeded with a checkpoint instead, which is why the suffix has to be checked.
+# Structure formats grompp -c reads; a continuing gen is seeded with a .cpt.
 GROMPP_STRUCTURE_SUFFIXES = ('.gro', '.g96', '.pdb', '.brk', '.ent')
 
-# Parameters gmx_pack injects into every gmx_generation call at runtime. A
-# config template records them too, so the file's copies must be dropped before
-# it is splatted, or the call gets two values for the same keyword.
+# gmx_pack passes these at run time; a config template must not also carry them.
 RUNTIME_ONLY_KEYS = ('fleet', 'fleet_key', 'grompp_lock')
 
-# Arguments a Clone supplies per generation. A driver builds its template
-# before it knows any of them, so gmx_config_template leaves placeholders.
+# Filled in per generation by a Clone; gmx_config_template leaves placeholders.
 CLONE_FILLED_KEYS = ('seed_index', 'clone_index', 'gen_index', 'seed_fn',
                      'top_fn')
 
@@ -112,23 +98,19 @@ class GenIncomplete(Exception):
     pass
 
 
-# Default run.py body the Farmer writes into each gen dir. The batch script runs
-# python run.py, which dispatches to the GROMACS block runner.
+# Default run.py the Farmer writes into each gen dir; the batch script runs it.
 default_gmx_run_script = """
 from mdfarmer.gmx_simulate import gmx_basic_sim_block_json as runner
 runner('config.json')
 """
 
 
-# .mdp keys this runner controls; everything else is inherited verbatim from the
-# base .mdp. GROMACS treats '-'/'_' as equivalent and is case-insensitive.
 def _norm_mdp_key(k):
+    """Canonical .mdp key: GROMACS is case-insensitive and reads '_' as '-'."""
     return k.strip().lower().replace('_', '-')
 
 
-# Legacy spellings GROMACS removed. Silently leaving one of these in a .mdp
-# means the intended setting is ignored and grompp fatals on the unknown key, so
-# they are normalised to the modern name rather than left to fail at run time.
+# Spellings GROMACS removed: grompp fatals on them, so map to the modern name.
 LEGACY_MDP_KEYS = {
     'nstxtcout': 'nstxout-compressed',
     'xtc-precision': 'compressed-x-precision',
@@ -140,20 +122,21 @@ LEGACY_MDP_KEYS = {
 def write_gen_mdp(base_mdp, out_mdp, *, nsteps, nstxout_compressed,
                   gen_vel, continuation, gen_seed=None, gen_temp=None,
                   ld_seed=None, legacy_mdp_keys=LEGACY_MDP_KEYS):
-    """Copy base_mdp to out_mdp, changing only the per-generation control keys."""
-    # Only generation 0 needs it. Later ones inherit their parameters from the
-    # previous tpr through convert-tpr, which is what keeps them exact.
+    """Copy base_mdp to out_mdp, changing only the per-generation control keys.
+
+    Everything else is inherited verbatim. Only generation 0 needs this; later
+    generations inherit their parameters from the previous tpr through
+    convert-tpr, which is what keeps them exact.
+    """
     overrides = {
         'nsteps': str(int(nsteps)),
-        # nsteps is this generation's absolute cumulative target, so the run has
-        # to count from zero; an inherited init-step would offset every step.
+        # nsteps is the absolute cumulative target, so this run counts from 0.
         'init-step': '0',
         'nstxout-compressed': str(int(nstxout_compressed)),
         'gen-vel': 'yes' if gen_vel else 'no',
         'continuation': 'yes' if continuation else 'no',
     }
-    # ld-seed is set whether or not velocities are generated: it drives a
-    # stochastic thermostat for the whole run, not just the start.
+    # Set even without gen-vel: ld-seed drives the thermostat for the whole run.
     if ld_seed is not None:
         overrides['ld-seed'] = str(int(ld_seed))
     if gen_vel:
@@ -175,8 +158,7 @@ def write_gen_mdp(base_mdp, out_mdp, *, nsteps, nstxout_compressed,
                           'needs nsteps to be the absolute step target, so '
                           'init-step is pinned to 0.', flush=True)
                 if key in seen:
-                    # A duplicate assignment later in the file would override
-                    # ours; drop it rather than emit a second, conflicting line.
+                    # A later duplicate would override ours, so drop it.
                     continue
                 out_lines.append(f'{key} = {overrides[key]}')
                 seen.add(key)
@@ -289,13 +271,10 @@ def concat_parts(gen_dir, out_fn, deffnm=DEFFNM, traj_suffix='.xtc',
         raise FileNotFoundError(
             f'no {deffnm}.partNNNN{traj_suffix} files in {gen_dir} to merge')
     out_p = Path(out_fn)
-    # Built under a temp name and renamed, so nothing ever reads a half-written
-    # trajectory. The temp name keeps the suffix, since gmx reads the format
-    # from the extension.
+    # Temp name (suffix kept; gmx reads the format from it), renamed when built.
     tmp_p = out_p.with_name(f'{out_p.stem}.trjcat-tmp{out_p.suffix}')
     if len(parts) == 1:
-        # Nothing to merge; copy rather than rename so a re-run of this step is
-        # idempotent and the part stays as the provenance record.
+        # Copy, not rename, so re-running is idempotent and the part survives.
         shutil.copy(parts[0], tmp_p)
     else:
         _run([gmx_bin, 'trjcat', '-f', *[str(p) for p in parts],
@@ -354,8 +333,7 @@ class MdrunFleet:
     def register(self, key, proc):
         with self._lock:
             self._procs[key] = proc
-            # A replica that starts after the signal already fired still has to
-            # be told, or it would run on alone until walltime kills it hard.
+            # A replica starting after the signal fired still has to be told.
             if self._stopping.is_set():
                 proc.send_signal(signal.SIGTERM)
 
@@ -408,8 +386,7 @@ def _wait_in_fleet(proc, fleet, fleet_key):
     finally:
         fleet.unregister(fleet_key)
     if fleet.stopping:
-        # mdrun exits 0 after a clean SIGTERM stop, so the exit code alone
-        # cannot distinguish "preempted" from "finished".
+        # mdrun exits 0 after a clean SIGTERM stop, so rc cannot tell us.
         raise Preempted(f'preempt sentinel at {fleet.sentinel}')
     return rc
 
@@ -438,8 +415,7 @@ def _run_mdrun(cmd, cwd, handle_preempt, poll_seconds=PREEMPT_POLL_SECONDS,
     cwd = Path(cwd)
     sentinel = None
     if fleet is None and handle_preempt:
-        # A solo generation watches its own directory. Clear a stale sentinel
-        # from an earlier preempted attempt here; a pack's owner clears the
+        # A solo gen clears its own stale sentinel; a pack's owner clears the
         # pack's once, before any member starts.
         sentinel = cwd / sentinel_name
         if sentinel.exists():
@@ -461,11 +437,7 @@ def gmx_generation(traj_dir_top_level: str,
                    clone_index: int,
                    gen_index: int,
                    title: str,
-                   # gen 0: path to the starting .gro; gen N: path to the seed
-                   # state.cpt (copied into this gen dir by Clone).
-                   # What this generation starts from: a checkpoint when it
-                   # continues another, a structure when it starts fresh. Only
-                   # append is unread, since mdrun always -noappends.
+                   # gen 0: the starting .gro; gen N: the seed state.cpt.
                    seed_fn: str,
                    # constant starting structure (.gro) for grompp -c at gen 0.
                    structure_fn: str = None,
@@ -473,37 +445,31 @@ def gmx_generation(traj_dir_top_level: str,
                    mdp_fn: str = None,
                    # Farmer sets config['system_fn'] per seed; repurposed as the .mdp.
                    system_fn: str = None,
-                   append: bool = False,
+                   append: bool = False,  # unread; mdrun always -noappends
                    dirname_pad: int = 2,
                    sep: str = '-',
                    traj_name: str = 'prod',
                    traj_suffix: str = '.xtc',
                    restart_name: str = 'state.cpt',
-                   # Full generation length. config['steps'] shrinks to the
-                   # remainder on a resume, but the tpr's nsteps has to be the
-                   # total from the start of the run.
+                   # A resume shrinks this to the remainder still owed.
                    steps: int = 500000,
+                   # Full generation length; what the tpr's nsteps counts to.
                    steps_per_gen: int = None,
-                   # xtc stride; steps must be a whole number of these or the
-                   # last frame of a generation does not land on its final step.
+                   # xtc stride; steps must be a whole number of these.
                    write_interval: int = 50000,
                    temperature=None,            # gen-temp for gen-0 velocities (K)
                    new_velocities: bool = False,  # True only on gen 0
                    gen_seed_base: int = 1,
-                   # gen-seed = base + stride * seed + clone, so two seeds
-                   # cannot draw the same velocities. Farmer checks the stride
-                   # is bigger than n_clones.
+                   # Overrides GEN_SEED_STRIDE; Farmer checks it > n_clones.
                    gen_seed_stride: int = GEN_SEED_STRIDE,
-                   # Written to ld-seed when set, making a stochastic thermostat
-                   # reproducible. None keeps whatever the mdp holds.
+                   # ld-seed when set; None keeps whatever the mdp holds.
                    ld_seed: int = None,
                    maxh: float = 23.5,           # mdrun -maxh backstop
                    checkpoint_minutes: float = CHECKPOINT_MINUTES,
                    gmx_bin: str = GMX_BIN,
                    ndx_fn: str = None,
                    grompp_maxwarn: int = 2,
-                   # mdrun hardware flags. -update cpu is MANDATORY with TIP4P-ice
-                   # virtual sites.
+                   # -update cpu is MANDATORY with TIP4P-ice virtual sites.
                    mdrun_args=('-nb', 'gpu', '-bonded', 'gpu', '-pme', 'gpu',
                                '-update', 'cpu', '-pin', 'on', '-nstlist', '200'),
                    handle_preempt: bool = False,
@@ -511,14 +477,19 @@ def gmx_generation(traj_dir_top_level: str,
                    tpr_name: str = TPR_NAME,
                    seed_cpt_name: str = SEED_CPT_NAME,
                    gen_status_name: str = GEN_STATUS_NAME,
-                   # Shared stop-signal when several generations run in one
-                   # job (MPS packing); None for a solo generation.
+                   # Shared stop signal when generations are packed in one job.
                    fleet=None,
                    fleet_key=None,
-                   # Held while the tpr is built. grompp is cheap but K of them
-                   # at once just contend for cores at job startup.
+                   # Held while the tpr is built, so K grompps do not contend.
                    grompp_lock=None,
                    **_unused):
+    """Run generation gen_index to completion and return its merged trajectory.
+
+    Raises Preempted if the scheduler asked the job to stop, and GenIncomplete
+    if mdrun returned cleanly short of the step target. Both leave a checkpoint
+    and a gen_status.json behind, so the next launch resumes rather than
+    restarts; neither is a failure.
+    """
     steps_per_gen = int(steps_per_gen if steps_per_gen is not None else steps)
     if steps_per_gen % write_interval:
         raise ValueError(
@@ -536,13 +507,10 @@ def gmx_generation(traj_dir_top_level: str,
     own_cpt = gen_dir / restart_name
     seed_cpt = gen_dir / seed_cpt_name
 
-    # The cumulative step the tpr must target. Absolute, because -cpi resumes at
-    # the checkpoint's absolute step and runs until the tpr's nsteps.
+    # Absolute: -cpi resumes at the checkpoint's step and runs to the tpr's.
     target_step = (gen_index + 1) * steps_per_gen
 
-    # Move the incoming seed aside. restart_name is also where mdrun writes
-    # its own checkpoint, and -cpi given a checkpoint from another run, or the
-    # .gro at generation 0, is fatal.
+    # -cpi on another run's checkpoint, or on a .gro, is fatal: move seed aside.
     if not seed_cpt.exists() and own_cpt.exists() and not tpr.is_file():
         # No tpr yet => mdrun has not run here => restart_name is the seed.
         own_cpt.replace(seed_cpt)
@@ -563,8 +531,6 @@ def gmx_generation(traj_dir_top_level: str,
             grompp_maxwarn=grompp_maxwarn, grompp_lock=grompp_lock)
 
     # -cpi takes our own checkpoint if mdrun has run here, else the seed.
-    # -noappend because mdrun will not append into a directory that does not
-    # already hold the output files its checkpoint names.
     resume_from = None
     if is_checkpoint(own_cpt):
         resume_from = own_cpt
@@ -576,10 +542,7 @@ def gmx_generation(traj_dir_top_level: str,
             f'(looked at {own_cpt} and {seed_cpt}). Its predecessor did not '
             'leave a readable state.cpt.')
 
-    # The launch about to happen writes part resume_part + 1 (part 1 when
-    # nothing is resumed), so any higher part already here is a branch this
-    # checkpoint has rewound past. Move it aside before concat_parts can see
-    # it, whether or not mdrun actually runs below.
+    # This launch writes part resume_part + 1; hide higher, rewound-past parts.
     if resume_from is not None:
         resume_part, already = checkpoint_part_step(resume_from, gmx_bin=gmx_bin)
     else:
@@ -587,9 +550,7 @@ def gmx_generation(traj_dir_top_level: str,
     _move_aside_stale_parts(gen_dir, resume_part, deffnm=deffnm,
                             traj_suffix=traj_suffix)
 
-    # Already finished? Finalise instead of re-running. mdrun given a
-    # checkpoint at or past its nsteps aborts, so a relaunch after a lost status
-    # file would otherwise turn a finished generation into a failure.
+    # mdrun aborts on a checkpoint at or past its nsteps, so finalise instead.
     if already is not None and already >= target_step:
         print(f'[gmx] generation {gen_index} is already at step {already} '
               f'of {target_step}; finalising without running mdrun.',
@@ -601,6 +562,7 @@ def gmx_generation(traj_dir_top_level: str,
         reached = None
 
     if reached is None:
+        # -noappend: mdrun cannot append into a dir lacking its cpt's own files.
         mdrun = [gmx_bin, 'mdrun', '-s', tpr, '-deffnm', deffnm,
                  '-cpo', own_cpt, '-maxh', maxh, '-cpt', checkpoint_minutes,
                  '-noappend', *mdrun_args]
@@ -610,9 +572,7 @@ def gmx_generation(traj_dir_top_level: str,
             _run_mdrun(mdrun, gen_dir, handle_preempt,
                        fleet=fleet, fleet_key=fleet_key)
         except Preempted:
-            # Record the progress the stopped run did make, or the orchestrator
-            # reads this generation as never having started and charges it a
-            # restart for work it actually did.
+            # Record what it reached, or it is charged a restart for real work.
             if is_checkpoint(own_cpt):
                 write_gen_status(
                     gen_dir, target_step=target_step, complete=False,
@@ -665,10 +625,7 @@ def _build_gen_tpr(*, tpr, gen_dir, gen_index, new_velocities, target_step,
                 raise ValueError(
                     'gmx_generation needs an .mdp via mdp_fn (or system_fn) to '
                     'build generation 0.')
-            # grompp -c takes this generation's own starting structure, which
-            # is seed_fn whenever the generation starts fresh. Using it rather
-            # than structure_fn is what lets seeds differ in topology, and lets
-            # an adaptive scheme reseed from a configuration it picked.
+            # Prefer seed_fn, so seeds may differ and be adaptively reseeded.
             start_fn = seed_fn if (
                 seed_fn and Path(seed_fn).suffix.lower()
                 in grompp_structure_suffixes) else structure_fn
@@ -693,8 +650,7 @@ def _build_gen_tpr(*, tpr, gen_dir, gen_index, new_velocities, target_step,
                       '-maxwarn', grompp_maxwarn]
             if ndx_fn:
                 grompp += ['-n', str(Path(ndx_fn).resolve())]
-            # grompp runs from the topology's directory so a .top with relative
-            # force-field includes resolves regardless of the gen-dir cwd.
+            # Run from the topology's dir so relative #includes still resolve.
             _run(grompp, str(Path(top_fn).resolve().parent))
         else:
             prev_tpr = _previous_gen_tpr(
@@ -811,8 +767,7 @@ def gmx_try_recover_gen(gen_path: Path, *,
     tpr = gen_path / tpr_name
 
     if status is None:
-        # Never reported: nothing ran, or it died before its first
-        # checkpoint. Relaunchable either way, if a checkpoint can be found.
+        # Never reported: nothing ran, or it died before its first checkpoint.
         seed_cpt = gen_path / seed_cpt_name
         if have_own_cpt and tpr.is_file():
             return gen_index, str(own_cpt.resolve()), total_steps, True
