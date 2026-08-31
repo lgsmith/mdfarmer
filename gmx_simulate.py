@@ -105,9 +105,8 @@ runner('config.json')
 """
 
 
-# .mdp keys this runner controls; everything else is inherited verbatim from the
-# base .mdp. GROMACS treats '-'/'_' as equivalent and is case-insensitive.
 def _norm_mdp_key(k):
+    """Canonical .mdp key: GROMACS is case-insensitive and reads '_' as '-'."""
     return k.strip().lower().replace('_', '-')
 
 
@@ -123,9 +122,12 @@ LEGACY_MDP_KEYS = {
 def write_gen_mdp(base_mdp, out_mdp, *, nsteps, nstxout_compressed,
                   gen_vel, continuation, gen_seed=None, gen_temp=None,
                   ld_seed=None, legacy_mdp_keys=LEGACY_MDP_KEYS):
-    """Copy base_mdp to out_mdp, changing only the per-generation control keys."""
-    # Only generation 0 needs it. Later ones inherit their parameters from the
-    # previous tpr through convert-tpr, which is what keeps them exact.
+    """Copy base_mdp to out_mdp, changing only the per-generation control keys.
+
+    Everything else is inherited verbatim. Only generation 0 needs this; later
+    generations inherit their parameters from the previous tpr through
+    convert-tpr, which is what keeps them exact.
+    """
     overrides = {
         'nsteps': str(int(nsteps)),
         # nsteps is this generation's absolute cumulative target, so the run has
@@ -502,6 +504,13 @@ def gmx_generation(traj_dir_top_level: str,
                    # at once just contend for cores at job startup.
                    grompp_lock=None,
                    **_unused):
+    """Run generation gen_index to completion and return its merged trajectory.
+
+    Raises Preempted if the scheduler asked the job to stop, and GenIncomplete
+    if mdrun returned cleanly short of the step target. Both leave a checkpoint
+    and a gen_status.json behind, so the next launch resumes rather than
+    restarts; neither is a failure.
+    """
     steps_per_gen = int(steps_per_gen if steps_per_gen is not None else steps)
     if steps_per_gen % write_interval:
         raise ValueError(
