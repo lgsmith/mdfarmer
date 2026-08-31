@@ -10,14 +10,15 @@ exact continuation: grompp -t reads coordinates, velocities and box size and
 nothing else, which silently zeroes the Nose-Hoover and Parrinello-Rahman
 integrals at every generation boundary. The chain also keeps step and time
 counting from the start of the run rather than restarting at zero, which is what
-lets gmx trjcat put the generations back together in order.
+lets the generations be put back together in order.
 
 Each launch writes its own prod.partNNNN.xtc, because mdrun -cpi will not append
-into a directory that does not already hold the files its checkpoint names. The
-parts are merged with trjcat when the generation finishes; where two parts cover
-the same time, trjcat keeps the later file's frames, so a part left behind by a
-rewound relaunch is moved aside before mdrun runs rather than left for trjcat to
-prefer over the branch that actually continued.
+into a directory that does not already hold the files its checkpoint names.
+concat_parts merges them when the generation finishes, reading and writing with
+mdtraj so every frame keeps its own step, time and box. Where two parts cover
+the same steps the later one's frames survive, so a part left behind by a
+rewound relaunch is moved aside before mdrun runs rather than left to outrank
+the branch that actually continued.
 
 Whether a generation is finished is read from the checkpoint's step counter, not
 by counting frames. GROMACS writes a frame at step 0 too, so frame counting is
@@ -37,6 +38,8 @@ import shutil
 import signal
 import subprocess as sp
 from pathlib import Path
+
+import numpy as np
 
 from . import utilities as util
 
@@ -83,6 +86,17 @@ PREEMPT_POLL_SECONDS = 5
 
 # Default binary. Sites with an MPI-only build have gmx_mpi instead.
 GMX_BIN = 'gmx'
+
+# Trajectory suffixes the part merge carries over without losing anything; a
+# .trr would arrive with velocities and forces mdtraj does not read back out.
+MERGEABLE_SUFFIXES = ('.xtc',)
+
+# Frames read per chunk while merging, so a multi-GB part is never resident.
+CONCAT_CHUNK = 200
+
+# Coordinate agreement the merge demands of its own output, nm. Far under the
+# 5e-4 nm a silent drop to mdtraj's fixed 1e-3 xtc precision would cost.
+CONCAT_ATOL_NM = 1e-6
 
 
 class Preempted(Exception):
@@ -258,27 +272,153 @@ def _move_aside_stale_parts(gen_dir, resume_part, deffnm=DEFFNM,
             part.rename(part.with_name(prefix + part.name))
 
 
+def _first_frame_step(part_p):
+    """The MD step stamped on a part's first frame."""
+    import mdtraj
+    with mdtraj.open(str(part_p)) as handle:
+        step = handle.read(1)[2]
+    if not len(step):
+        raise ValueError(f'{part_p} holds no frames to merge')
+    return int(step[0])
+
+
+def part_cutoffs(parts):
+    """The step each part hands over to the next at; None for the last one.
+
+    Where two parts cover the same steps the later one wins, so a part's frames
+    are kept only while their step is below the step the next part begins at.
+    """
+    starts = [_first_frame_step(p) for p in parts]
+    for index in range(1, len(starts)):
+        if starts[index] < starts[index - 1]:
+            raise ValueError(
+                f'{parts[index].name} starts at step {starts[index]}, before '
+                f'{parts[index - 1].name} starts at {starts[index - 1]}. Parts '
+                'are merged in the order mdrun wrote them, so one that begins '
+                'earlier than the part before it means a branch this run '
+                'rewound past is still on the merge glob.')
+    return starts[1:] + [None]
+
+
+def _kept_frames(parts, chunk=CONCAT_CHUNK):
+    """(xyz, time, step, box) chunks holding the frames a merge of parts keeps.
+
+    Reads one part at a time, so a multi-GB generation never has to be resident.
+    """
+    import mdtraj
+    for part_p, cutoff in zip(parts, part_cutoffs(parts)):
+        with mdtraj.open(str(part_p)) as handle:
+            while True:
+                xyz, time, step, box = handle.read(chunk)
+                if not len(step):
+                    break
+                n_kept = len(step) if cutoff is None else int(
+                    np.count_nonzero(np.asarray(step) < cutoff))
+                if n_kept:
+                    yield (xyz[:n_kept], time[:n_kept], step[:n_kept],
+                           box[:n_kept])
+                if n_kept < len(step):
+                    break        # steps only rise, so the rest is overlap too
+
+
+def _write_merged(parts, out_p, chunk=CONCAT_CHUNK):
+    """Stream the kept frames of these parts into out_p; returns how many."""
+    from mdtraj.formats import XTCTrajectoryFile
+    n_written = 0
+    with XTCTrajectoryFile(str(out_p), 'w') as handle:
+        for xyz, time, step, box in _kept_frames(parts, chunk=chunk):
+            handle.write(xyz, time=time, step=step, box=box)
+            n_written += len(step)
+    return n_written
+
+
+def _check_clock(merged_p, what, got, expected, first_frame):
+    """Raise unless this axis of a merged chunk came back exactly as written."""
+    got, expected = np.asarray(got), np.asarray(expected)
+    if np.array_equal(got, expected):
+        return
+    row = int(np.argwhere(got != expected)[0][0])
+    raise RuntimeError(
+        f'{merged_p}: the {what} of frame {first_frame + row} reads '
+        f'{got[row]!r}, not the {expected[row]!r} its source part carries. '
+        'The generation chain is spliced on that clock, so a merge that does '
+        'not preserve it exactly is refused.')
+
+
+def verify_merge(parts, merged_p, chunk=CONCAT_CHUNK, atol_nm=CONCAT_ATOL_NM):
+    """Read a merge back and check every frame against the part it came from.
+
+    Coordinates that come back moved mean the rewrite requantised them, which
+    is what happens when the run wrote at a compressed-x-precision finer than
+    the 1000 mdtraj's xtc writer is fixed at. Returns the frames checked.
+    """
+    import mdtraj
+    n_checked = 0
+    with mdtraj.open(str(merged_p)) as handle:
+        for xyz, time, step, box in _kept_frames(parts, chunk=chunk):
+            got_xyz, got_time, got_step, got_box = handle.read(len(step))
+            if len(got_step) != len(step):
+                raise RuntimeError(
+                    f'{merged_p} stops after {n_checked + len(got_step)} '
+                    f'frames, but the parts it was merged from still have '
+                    f'{len(step) - len(got_step)} more to contribute.')
+            _check_clock(merged_p, 'MD step', got_step, step, n_checked)
+            _check_clock(merged_p, 'frame time', got_time, time, n_checked)
+            _check_clock(merged_p, 'box', got_box, box, n_checked)
+            moved = float(np.abs(np.asarray(got_xyz)
+                                 - np.asarray(xyz)).max())
+            if moved > atol_nm:
+                raise RuntimeError(
+                    f'{merged_p}: coordinates moved by up to {moved:.2e} nm '
+                    f'between the source parts and the merge, from frame '
+                    f'{n_checked} on. mdtraj writes an .xtc at a fixed '
+                    f'precision of 1000 (1e-3 nm), so a run whose .mdp asks '
+                    f'for a finer compressed-x-precision cannot be merged '
+                    f'without being coarsened. Set compressed-x-precision to '
+                    f'1000, or merge these parts with a writer that can hold '
+                    f'your precision.')
+            n_checked += len(step)
+        if len(handle.read(1)[2]):
+            raise RuntimeError(
+                f'{merged_p} carries frames past the {n_checked} its source '
+                'parts account for.')
+    return n_checked
+
+
 def concat_parts(gen_dir, out_fn, deffnm=DEFFNM, traj_suffix='.xtc',
-                 gmx_bin=GMX_BIN):
+                 verify=True, chunk=CONCAT_CHUNK, atol_nm=CONCAT_ATOL_NM,
+                 mergeable_suffixes=MERGEABLE_SUFFIXES):
     """Merge a generation's parts into the one trajectory the orchestrator wants.
 
-    trjcat sorts by time and, where two parts cover the same time, keeps the
-    later file's frames. That is only correct because callers move any part
-    left behind by a rewound relaunch aside before it ever reaches this glob.
+    Every frame keeps its own step, time and box: the generation chain is
+    spliced on that clock. Where two parts cover the same steps the later part's
+    frames are the ones that survive, which is only correct because callers move
+    any part left behind by a rewound relaunch aside before it reaches this glob.
+
+    verify reads the merge back and compares it against the parts it came from.
     """
+    if traj_suffix.lower() not in mergeable_suffixes:
+        raise ValueError(
+            f'{traj_suffix} parts cannot be merged without losing something: '
+            f'mdfarmer reads them with mdtraj, which does not carry over the '
+            f'velocities and forces a .trr holds. Run with traj_suffix in '
+            f'{list(mergeable_suffixes)}.')
     parts = part_files(gen_dir, deffnm=deffnm, traj_suffix=traj_suffix)
+    # A launch killed before its first write leaves a part with nothing in it.
+    parts = [p for p in parts if p.stat().st_size]
     if not parts:
         raise FileNotFoundError(
             f'no {deffnm}.partNNNN{traj_suffix} files in {gen_dir} to merge')
     out_p = Path(out_fn)
-    # Temp name (suffix kept; gmx reads the format from it), renamed when built.
-    tmp_p = out_p.with_name(f'{out_p.stem}.trjcat-tmp{out_p.suffix}')
+    # Temp name, suffix kept so the writer reads the format from it.
+    tmp_p = out_p.with_name(f'{out_p.stem}.concat-tmp{out_p.suffix}')
     if len(parts) == 1:
         # Copy, not rename, so re-running is idempotent and the part survives.
         shutil.copy(parts[0], tmp_p)
     else:
-        _run([gmx_bin, 'trjcat', '-f', *[str(p) for p in parts],
-              '-o', str(tmp_p)], gen_dir)
+        _write_merged(parts, tmp_p, chunk=chunk)
+        if verify:
+            verify_merge(parts, tmp_p, chunk=chunk, atol_nm=atol_nm)
     tmp_p.replace(out_p)
     return out_p
 
@@ -591,8 +731,7 @@ def gmx_generation(traj_dir_top_level: str,
             f'(mdrun -maxh, or the scheduler stopped it). It will resume from '
             f'{own_cpt} on the next launch.')
 
-    concat_parts(gen_dir, traj, deffnm=deffnm, traj_suffix=traj_suffix,
-                 gmx_bin=gmx_bin)
+    concat_parts(gen_dir, traj, deffnm=deffnm, traj_suffix=traj_suffix)
     write_gen_status(gen_dir, target_step=target_step, reached_step=reached,
                      complete=True, gen_status_name=gen_status_name,
                      traj_fn=traj)
@@ -747,7 +886,7 @@ def gmx_try_recover_gen(gen_path: Path, *,
     Sorts a generation directory into done, partial or never started, and
     returns (gen_index, seed_fn, steps_to_run, append), or None to fall back to
     an older generation. No trajectory has to be trimmed: mdrun -cpi resumes
-    from the checkpoint and trjcat drops the overlap. The one thing it must
+    from the checkpoint and concat_parts drops the overlap. The one thing it must
     never do is call a generation complete before its checkpoint reaches the
     step target, which would rewind the trajectory at the boundary.
     """
