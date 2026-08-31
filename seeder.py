@@ -367,34 +367,24 @@ class Clone:
         self.scheduler_log_dir = None
         self.scheduler_script_p = None  # always redefined each run
 
-    # Construct a Clone by walking the on-disk state for (seed_index,
-    # clone_index) under tdir. Decides which gen to run next, what to seed
-    # it from, and whether to append or start fresh. Falls through extant
-    # gens newest -> oldest, then falls back to initial_seed_fn if nothing
-    # is recoverable.
     @classmethod
     def from_disk(cls,
                   tdir: Path,
                   seed_index: int,
                   clone_index: int,
                   *,
-                  # The user-provided initial structure for this seed. Used
-                  # when no on-disk gen is recoverable.
+                  # This seed's starting structure, used when no gen recovers.
                   initial_seed_fn: str,
                   # Resolved, validated top and system paths for this seed.
                   top_fn: str,
                   system_fn: str,
-                  # The .gro or .pdb this seed's generation 0 starts from.
-                  # Per seed, since one shared value can only suit one of them.
-                  # None keeps whatever the template says.
+                  # The .gro or .pdb this seed's generation 0 starts from. Per
+                  # seed, since one shared value can only suit one of them.
                   structure_fn: str = None,
-                  # Config entries laid over the shared template for this
-                  # seed, for seeds that differ in more than their files, such
-                  # as in mdrun_args or write_interval. May not name a key
-                  # from_disk works out per clone.
+                  # Config entries laid over the template for this seed. May
+                  # not name a key from_disk works out per clone.
                   config_overrides: dict = None,
-                  # The Farmer's full config_template. Read-only here; we
-                  # deepcopy before mutating.
+                  # The Farmer's config_template. Deepcopied before mutation.
                   config_template: dict,
                   # Scheduler context (passed straight through to __init__).
                   scheduler: str,
@@ -409,20 +399,23 @@ class Clone:
                   preemption_checker=None,
                   node_blocklist=None,
                   restarts_per_gen=3,
-                  # 0-based index of this clone's final generation, passed
-                  # straight through to Clone.__init__. None means no limit.
+                  # Passed through to __init__; None means no generation limit.
                   last_gen_index=None,
-                  # GROMACS support hooks. None -> OpenMM defaults:
-                  #   recover_fn -> _try_recover_gen (state.xml/DCD recovery)
-                  #   run_script -> Clone's default_run_script (omm runner)
+                  # GROMACS hooks. None gives the OpenMM defaults, which are
+                  # _try_recover_gen and default_run_script.
                   recover_fn=None,
                   run_script=None,
                   progress_fn=None,
-                  # (seed, clone, gen) -> jid for jobs currently in the
-                  # scheduler queue, so we can re-associate after an
-                  # orchestrator restart.
+                  # (seed, clone, gen) -> jid for jobs currently queued, so they
+                  # can be re-associated after an orchestrator restart.
                   rep_dict: dict = None,
                   dry_run: bool = False):
+        """Build a Clone from the on-disk state for one seed and clone index.
+
+        Decides which gen to run next, what to seed it from, and whether to
+        append or start fresh, by falling through the extant gens newest to
+        oldest and then back to initial_seed_fn if none is recoverable.
+        """
         if rep_dict is None:
             rep_dict = {}
         append_mode = config_template['append']
@@ -431,18 +424,15 @@ class Clone:
         clone_dir = util.dir_seeds_clones(
             tdir, seed_index, clone_index, dirname_pad, sep=sep, mkdir=False)
         if clone_dir.is_dir():
-            # Sorted by generation number, not by name: sorting by name only
-            # agrees once every index is the same width, so gen-999 would come
-            # after gen-1000. Names that do not parse sort last.
+            # By generation number, not by name: names only sort right at equal
+            # width, so gen-999 would come after gen-1000. Unparseable go last.
             gen_paths = sorted(clone_dir.iterdir(),
                                key=lambda p: _gen_sort_key(p, sep))
         else:
             gen_paths = []
 
-        # A generation whose job is still running is never recovered. Recovery
-        # trims and renames files that job still holds open, and it is the
-        # normal case at boot: that is what rep_dict is for. Bind to the live
-        # job instead and let check_start_gen see it is alive.
+        # A gen whose job is still running is never recovered: recovery trims
+        # and renames files that job holds open. Bind to the live job instead.
         live_gens = sorted(gen for six, cix, gen in rep_dict
                            if (six, cix) == (seed_index, clone_index))
         _recover = recover_fn if recover_fn is not None else _try_recover_gen
@@ -517,13 +507,11 @@ class Clone:
 
         jid = rep_dict.get((seed_index, clone_index, gen_index))
 
-        # steps_per_gen is the untouched full generation length; the GROMACS
-        # runner needs it to compute an absolute cumulative step target even
-        # when config['steps'] has been narrowed to a remainder.
+        # The full generation length: the GROMACS runner needs it for an
+        # absolute step target even when config['steps'] is only a remainder.
         config['steps_per_gen'] = steps_per_gen
 
-        # OpenMM callers pass nothing and get the OpenMM runner; GROMACS
-        # callers pass their own.
+        # OpenMM callers pass nothing and get the OpenMM runner.
         if run_script is None:
             run_script = default_run_script
         return cls(
