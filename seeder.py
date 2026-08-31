@@ -28,33 +28,34 @@ class ConfigError(ValueError):
     """
 
 
-# Config entries Clone.from_disk computes for each clone from the disk state.
-# A per-seed override naming one of these would be silently overwritten, so it
-# is refused instead.
+# Config entries from_disk works out per clone. A seed override naming one would
+# be silently overwritten, so it is refused instead.
 CLONE_DERIVED_CONFIG_KEYS = frozenset((
     'seed_index', 'clone_index', 'gen_index', 'steps', 'steps_per_gen',
     'append', 'new_velocities', 'seed_fn', 'top_fn', 'system_fn'))
 
 
-# Sort key that orders gen directories numerically. Anything that isn't
-# '<prefix><sep><digits>' sorts to the end, keyed by name so the order is still
-# deterministic.
 def _gen_sort_key(path, sep):
+    """Sort key ordering gen directories numerically.
+
+    Anything that is not '<prefix><sep><digits>' sorts to the end, keyed by
+    name so the order is still deterministic.
+    """
     tail = path.name.rsplit(sep, 1)[-1]
     if tail.isdigit():
         return (0, int(tail), '')
     return (1, 0, path.name)
 
 
-# Trim the velocity and force trajectories back to the frame count positions
-# were just truncated to.
-#
-# True once every tandem trajectory the config names is aligned. False when one
-# cannot be: a format that cannot be truncated, a header that will not read, a
-# truncation that missed its target, or a tandem BEHIND positions, whose missing
-# frames cannot be fabricated without a matching checkpoint. The caller cascades
-# on False, which redoes this gen -- safe, since it is a dead gen either way.
 def _align_tandem_dcds(gen_path: Path, prev_config: dict, target_nset: int):
+    """Trim the velocity and force trajectories to target_nset frames.
+
+    True once every tandem trajectory the config names is aligned. False when
+    one cannot be: an untruncatable format, an unreadable header, a truncation
+    that missed its target, or a tandem behind positions, whose missing frames
+    cannot be fabricated without a matching checkpoint. The caller cascades on
+    False and redoes the gen, which is dead either way.
+    """
     for name_key, suffix_key, default_name in (
             ('velocity_name', 'velocity_traj_suffix', 'velocities'),
             ('force_name', 'force_traj_suffix', 'forces')):
@@ -97,35 +98,6 @@ def _align_tandem_dcds(gen_path: Path, prev_config: dict, target_nset: int):
     return True
 
 
-# Examine one gen directory and decide whether it can seed the next launch.
-#
-# Returns (gen_index, seed_fn, steps_to_run, append) on success:
-#   - gen_index: which gen the next launch is for (may equal this dir's
-#     gen, or be one higher if this gen is complete and we advance).
-#   - seed_fn: absolute path to the state.xml to load from.
-#   - steps_to_run: how many sim steps the next launch should take.
-#   - append: whether trajectory reporters should open in append mode.
-#
-# Returns None if this gen is unrecoverable. Caller cascades to an older
-# gen, then falls back to the initial seed.
-#
-# Two failures collapse into "unrecoverable" (β policy — prune & redo):
-#   1. state.xml unparseable or missing — torn-mid-write or never landed.
-#   2. state.xml stepCount doesn't sit on a DCD frame boundary — header
-#      doesn't match the checkpoint, both probably bad.
-#
-# For state-behind-DCD (kill between DCDReporter and CheckpointReporter,
-# expected single-frame drift), we truncate the DCD to align and resume.
-# For state-ahead-of-DCD (buffered DCD frames lost at kill before
-# flush-per-frame existed), we accept state.xml as authoritative and
-# advance to the next gen — the lost DCD tail is unrecoverable but the
-# integrator state is intact and the next gen can seed from it.
-#
-# Note on the gen-relative step math: OpenMM's DCDReporter hard-codes the
-# DCD header's istart to reportInterval, regardless of cumulative
-# simulation step. state.xml's stepCount, by contrast, accumulates across
-# gens. So we derive the absolute step at gen start from gen_index and
-# total_steps rather than trusting the DCD header's istart.
 def _try_recover_gen(gen_path: Path, *,
                      append_mode: bool,
                      restart_name: str,
@@ -134,6 +106,26 @@ def _try_recover_gen(gen_path: Path, *,
                      write_interval: int,
                      total_steps: int,
                      top_fn: str):
+    """Decide whether one gen directory can seed the next launch.
+
+    Returns (gen_index, seed_fn, steps_to_run, append): the gen the launch is
+    for, which is one higher than this directory's if this gen is complete;
+    the state.xml to load; the steps to take; and whether the trajectory
+    reporters open in append mode. Returns None if the gen is unrecoverable,
+    and the caller cascades to an older gen, then to the initial seed.
+
+    Unrecoverable means prune and redo: a state.xml that is missing or will
+    not parse, or a stepCount that does not sit on a trajectory frame
+    boundary, where header and checkpoint disagree and both are suspect. A
+    state behind the trajectory is the expected drift from a kill between the
+    two reporters, so the trajectory is trimmed to match. A state ahead of it
+    loses the trajectory tail but keeps an intact integrator state, so it
+    advances to the next gen and seeds from there.
+
+    The step at gen start is derived from gen_index and total_steps rather
+    than read from the DCD header: OpenMM's DCDReporter hard-codes istart to
+    reportInterval, while state.xml's stepCount accumulates across gens.
+    """
     config_p = gen_path / 'config.json'
     if not config_p.is_file():
         return None
@@ -159,9 +151,8 @@ def _try_recover_gen(gen_path: Path, *,
         # No traj yet for this gen. Start it now from this state.
         return gen_index, seed_fn, total_steps, False
 
-    # Only DCD has a header we can read and rewrite. An XTC has to be counted
-    # instead, and cannot be trimmed, so an XTC that ran past its checkpoint is
-    # redone rather than cut back.
+    # Only DCD has a header we can read and rewrite; an XTC has to be counted
+    # instead, and one that ran past its checkpoint is redone rather than cut.
     is_dcd = traj_suffix == '.dcd'
     if is_dcd:
         try:
@@ -192,14 +183,11 @@ def _try_recover_gen(gen_path: Path, *,
     target_nset = state_offset // nsavc
 
     if target_nset > nset:
-        # State ahead of DCD — legacy preempt-buffer-drift from before
-        # FlushingDCDReporter existed. state.xml's integrator state is
-        # intact; advance and let the next gen seed from it.
+        # State ahead of the DCD: the integrator state is intact, so advance.
         return gen_index + 1, seed_fn, total_steps, False
     if target_nset < nset and not is_dcd:
-        # Trajectory past its checkpoint, in a format we cannot trim. Going
-        # on would leave frames the next generation re-simulates, which reads
-        # as time running backwards. Redo it instead.
+        # Untrimmable: going on leaves frames the next gen re-simulates, which
+        # reads as time running backwards. Redo the gen instead.
         print(f'_try_recover_gen: {traj_p} has {nset} frames but state.xml is '
               f'at frame {target_nset}, and {traj_suffix} cannot be truncated; '
               f'cascading so this gen is redone rather than left discontiguous.')
@@ -219,10 +207,8 @@ def _try_recover_gen(gen_path: Path, *,
                   f'target {target_nset}; cascading.')
             return None
         nset = actual
-        # Only from here, the position-truncation branch: a healthy in-flight
-        # gen has positions and state in step, takes the target_nset == nset
-        # path above, and so never reaches this. That is what keeps a live
-        # clone's tandem files from being rewritten under it.
+        # Reached only once positions were trimmed; a healthy in-flight gen
+        # takes the target_nset == nset path, so its tandems are left alone.
         if not _align_tandem_dcds(gen_path, prev_config, target_nset):
             return None
 
