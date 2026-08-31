@@ -10,19 +10,16 @@ from pathlib import Path
 from os import environ
 
 
-# Subclass that pushes Python's user-space buffer to the kernel after each
-# frame write. A SIGKILL from Slurm preempt otherwise loses bytes still
-# sitting in the BufferedWriter; flushing promotes them to the kernel page
-# cache, which survives the process death (node stays up). flush() is
-# microseconds and never blocks on disk — the kernel writes to disk
-# asynchronously, on its own schedule, independent of the simulation loop.
-#
-# Don't be tempted to substitute buffering=0 on the underlying open():
-# DCDFile.writeModel emits many small struct.pack writes per frame, each
-# of which would become its own syscall under buffering=0, slowing the
-# write loop dramatically. Buffered writes + explicit flush is the
-# correct combination.
 class FlushingDCDReporter(app.DCDReporter):
+    """DCDReporter that pushes Python's buffer to the kernel after each frame.
+
+    A SIGKILL from Slurm preempt loses bytes still sitting in the BufferedWriter;
+    the kernel page cache they are flushed into survives the process death.
+    flush() costs microseconds and never blocks on disk. Do not reach for
+    buffering=0 instead: DCDFile.writeModel emits many small struct.pack writes
+    per frame, each of which would then become its own syscall.
+    """
+
     def report(self, simulation, state):
         super().report(simulation, state)
         try:
@@ -45,18 +42,15 @@ def _flush_dcd_file(reporter):
         )
 
 
-# Tandem-file reporters: write velocity or force vectors into the position
-# slot of a DCD or XTC file that rides alongside the position trajectory,
-# frame-for-frame. The semantic abuse is intentional — DCD and XTC carry no
-# velocity/force fields, so we repurpose the position slot. Callers are
-# responsible for knowing what the file contains.
-#
-# describeNextReport returns the new dict format (OpenMM 8.x).  The
-# 'include' list controls which quantities getState() populates; we request
-# only what we need and never positions.
-
 class _TandemDCDReporter:
-    """Write velocities or forces into the position slot of a DCD file."""
+    """Write velocities or forces into the position slot of a DCD file.
+
+    DCD carries no velocity or force field, so the position slot is repurposed
+    and the file rides alongside the position trajectory frame-for-frame. The
+    numbers on disk are in the quantity's native units — nm/ps for velocities,
+    kJ/(mol·nm) for forces — but labelled nanometers, so a reader has to know
+    which quantity a given file holds.
+    """
 
     def __init__(self, file, reportInterval, quantity, append=False,
                  enforcePeriodicBox=None):
@@ -75,6 +69,7 @@ class _TandemDCDReporter:
         self._out = open(file, 'r+b' if append else 'wb')
 
     def describeNextReport(self, simulation):
+        # OpenMM 8.x dict format; 'include' limits what getState() populates.
         steps = self._reportInterval - simulation.currentStep % self._reportInterval
         return {'steps': steps, 'periodic': self._enforcePeriodicBox,
                 'include': [self._quantity]}
@@ -86,13 +81,8 @@ class _TandemDCDReporter:
                 simulation.integrator.getStepSize(),
                 self._reportInterval, self._reportInterval, self._append
             )
-        # DCDFile.writeModel dimension-checks its input via
-        # .value_in_unit(nanometers), which dies for velocity (nm/ps) or
-        # force (kJ/(mol·nm)) Quantities. DCD has no on-disk unit
-        # metadata, so we strip to the raw numeric array in the
-        # quantity's native units and re-tag as nanometers — the numbers
-        # in the file are unchanged; the file just *claims* nm. Readers
-        # must know it's velocities (nm/ps) or forces (kJ/mol/nm).
+        # writeModel dimension-checks via .value_in_unit(nanometers), which dies
+        # on velocity/force Quantities, so re-tag the raw numbers as nanometers.
         if self._quantity == 'velocities':
             raw = state.getVelocities(asNumpy=True).value_in_unit(
                 unit.nanometer / unit.picosecond)
@@ -108,7 +98,14 @@ class _TandemDCDReporter:
 
 
 class _TandemXTCReporter:
-    """Write velocities or forces into the position slot of an XTC file."""
+    """Write velocities or forces into the position slot of an XTC file.
+
+    Same repurposing and same unit labelling as _TandemDCDReporter, but XTC's
+    writer additionally requires abs(value) * 1000 to fit in int32 (~2.1e6 nm
+    after scaling). Velocities (a few nm/ps) and bonded forces (up to ~1e5
+    kJ/mol/nm) both clear that bound, but XTC compression is lossy — use .dcd
+    if you need full precision on saved velocities or forces.
+    """
 
     def __init__(self, file, reportInterval, quantity, append=False,
                  enforcePeriodicBox=None):
@@ -135,13 +132,7 @@ class _TandemXTCReporter:
                 simulation.integrator.getStepSize(),
                 self._reportInterval, self._reportInterval, self._append
             )
-        # XTCFile.writeModel also calls .value_in_unit(nanometers) on
-        # its input and additionally checks that abs(values)*1000 fits
-        # in int32 (XTC's compressed-position range, ~2.1e6 nm post-
-        # scaling). Velocities (~few nm/ps) and bonded forces (up to
-        # ~1e5 kJ/mol/nm) both clear that bound, but XTC's lossy
-        # compression *will* truncate precision — use .dcd if you need
-        # full precision on saved velocities/forces.
+        # writeModel calls .value_in_unit(nanometers) here too; re-tag as above.
         if self._quantity == 'velocities':
             raw = state.getVelocities(asNumpy=True).value_in_unit(
                 unit.nanometer / unit.picosecond)
@@ -152,11 +143,12 @@ class _TandemXTCReporter:
         self._xtc.writeModel(vectors, periodicBoxVectors=state.getPeriodicBoxVectors())
 
 
-# HDF5 tandem reporter: velocities go into the velocities field (native
-# support); forces are shoehorned into the coordinates field because
-# HDF5TrajectoryFile.write has no forces kwarg.
 class _TandemHDF5Reporter:
-    """Write velocities or forces to an HDF5 trajectory file."""
+    """Write velocities or forces to an HDF5 trajectory file.
+
+    Velocities go into the native velocities field; forces are shoehorned into
+    the coordinates field, since HDF5TrajectoryFile.write has no forces kwarg.
+    """
 
     def __init__(self, file, reportInterval, quantity, append=False,
                  enforcePeriodicBox=None):
@@ -193,8 +185,7 @@ class _TandemHDF5Reporter:
             self._traj_file.write(coordinates=vels_nm_ps, velocities=None)
         else:
             forces = state.getForces(asNumpy=True)
-            # kJ/(mol·nm) — store in coordinate slot in native HDF5 distance units (nm).
-            # This is a semantic repurposing; callers must know the file holds forces.
+            # kJ/(mol·nm) numbers, written into the coordinate slot.
             forces_kj = forces.value_in_unit(unit.kilojoule_per_mole / unit.nanometer)
             self._traj_file.write(coordinates=forces_kj)
         if hasattr(self._traj_file, 'flush'):
@@ -208,17 +199,13 @@ _TANDEM_REPORTER_CLS = {
     '.dcd': _TandemDCDReporter,
     '.xtc': _TandemXTCReporter,
     '.h5':  _TandemHDF5Reporter,
-    # .trr: mdtraj's TRRTrajectoryFile.write() only accepts xyz (positions);
-    # there is no velocities or forces argument in the current mdtraj API.
-    # Until mdtraj exposes that, .trr is not supported for tandem files.
+    # No .trr: mdtraj's TRRTrajectoryFile.write() accepts only xyz (positions).
 }
 
 _SUPPORTED_TANDEM_SUFFIXES = set(_TANDEM_REPORTER_CLS)
 
 
-# Sentinel file the bash SIGTERM trap touches when Slurm preempts the job.
-# SentinelReporter watches for it on each write_interval cycle and raises
-# Preempted, which unwinds the simulation loop cleanly.
+# Touched by the batch script's SIGTERM trap when Slurm preempts the job.
 PREEMPT_SENTINEL_NAME = 'PREEMPT_SIGTERM'
 
 
@@ -227,10 +214,12 @@ class Preempted(Exception):
 
 
 class SentinelReporter:
-    """Detects a Slurm-preempt SIGTERM via a sentinel file written by the
-    batch script's trap handler. Appended LAST in the reporter list so the
-    position / state / data writers for the current cycle have already
-    fired and produced aligned on-disk output before we raise."""
+    """Raise Preempted once the batch script's trap handler drops the sentinel.
+
+    Checked on each write_interval cycle, and appended LAST in the reporter list
+    so the position / state / data writers for that cycle have already fired and
+    produced aligned on-disk output before the simulation loop unwinds.
+    """
 
     def __init__(self, reportInterval, sentinel_path=None):
         self._reportInterval = reportInterval
@@ -243,10 +232,6 @@ class SentinelReporter:
     def report(self, simulation, state):
         if self._sentinel.is_file():
             raise Preempted(f'preempt sentinel detected at {self._sentinel.resolve()}')
-
-
-# This function is written so that you could use jug's 'Task' class to uplift
-# instances of calls. It returns the path to the trajectory written.
 
 
 def omm_generation(traj_dir_top_level: str,
@@ -281,8 +266,6 @@ def omm_generation(traj_dir_top_level: str,
                    # Given 0.004 ps dt, 10 ps write freq.
                    write_interval=2500,
                    # If true, run minimizeEnergy on simulation before taking steps.
-                   # simulation parameters below here; standard values for normal solvated protein inserted.
-                   # Note units in comments
                    minimize_first=False,
                    # Integrator parameters
                    temperature=None,  # kelvin
@@ -291,27 +274,31 @@ def omm_generation(traj_dir_top_level: str,
                    velocity_name='velocities',
                    # Basename for the parallel force trajectory (no suffix).
                    force_name='forces',
-                   # Write velocities into the main trajectory file.
-                   # Only supported for traj_suffix='.h5' (mdtraj HDF5Reporter).
+                   # Embed velocities in the main trajectory; needs traj_suffix='.h5'.
                    embed_velocities=False,
-                   # Writing forces into the main trajectory is not supported by any
-                   # mdtraj reporter; always raises ValueError if True.
+                   # Unsupported by every mdtraj reporter; always raises ValueError.
                    embed_forces=False,
-                   # Extension for a parallel velocity file. One of '.dcd', '.xtc', '.h5'.
-                   # None means no parallel velocity file is written.
+                   # Parallel velocity file: '.dcd', '.xtc', '.h5', or None for none.
                    velocity_traj_suffix=None,
-                   # Extension for a parallel force file. One of '.dcd', '.xtc', '.h5'.
-                   # None means no parallel force file is written.
+                   # Parallel force file: '.dcd', '.xtc', '.h5', or None for none.
                    force_traj_suffix=None,
-                   # If True, install a SentinelReporter that watches for a
-                   # PREEMPT_SIGTERM file in cwd (touched by the batch
-                   # script's SIGTERM trap on Slurm preempt) and raises
-                   # Preempted at the next write_interval cycle. Requires the
-                   # batch script to install the trap and background+wait
-                   # the python invocation; see basic_scheduler_fstrings_preempt.
+                   # If True, install a SentinelReporter watching cwd for PREEMPT_SIGTERM.
                    handle_preempt=False,
                    ):
+    """Run one generation of MD and return the path to the trajectory written.
 
+    Parameters are documented inline in the signature above. Every reporter
+    writes on the same write_interval, so the trajectory, state.xml and .out
+    file stay frame-aligned on disk and an interrupted generation can be picked
+    up later with append=True.
+
+    With handle_preempt, Preempted is raised at the first reporter cycle after
+    the batch script's SIGTERM trap touches PREEMPT_SIGTERM in cwd; this needs a
+    batch script that installs that trap and background+waits the python
+    invocation (see basic_scheduler_fstrings_preempt).
+
+    Written so calls can be uplifted with jug's 'Task' class.
+    """
     # Validate embedded-output requests up front.
     if embed_forces:
         raise ValueError(
@@ -366,8 +353,7 @@ def omm_generation(traj_dir_top_level: str,
     try:
         if traj_suffix == '.h5':
             h5_cls = reporters['.h5']
-            # HDF5Reporter does not accept append via init kwarg — open in append
-            # mode by passing an already-open HDF5TrajectoryFile if appending.
+            # HDF5Reporter has no append kwarg; pass an already-open file instead.
             if traj_path.is_file() and append:
                 from mdtraj.formats import HDF5TrajectoryFile
                 h5_file = HDF5TrajectoryFile(str(traj_path), 'a')
@@ -414,22 +400,19 @@ def omm_generation(traj_dir_top_level: str,
         write_interval,
         writeState=True)
 
-    # Build tandem velocity/force reporters if requested. On a resume
-    # (append=True), only activate the tandem reporter if its file is
-    # frame-aligned with the position trajectory — same frame count.
-    # Skip cases:
-    #   - file doesn't exist (pre-velocity gen).
-    #   - file exists but has fewer frames than the position traj
-    #     (crashed mid-gen — e.g. the 0-frame `velocities.dcd` left by
-    #     the nm/ps-vs-nm units bug). Appending would write frame N of
-    #     velocity while position writes frame N+k, permanently offset
-    #     for the rest of the gen.
-    # Skipping preserves the user's invariant that velocity frame N
-    # corresponds to position frame N. Next fresh gen creates a clean
-    # from-frame-0 tandem file.
+    # Tandem velocity/force reporters, activated on resume only if aligned.
     extra_reporters = []
 
     def _tandem_aligned(tandem_path):
+        """True if tandem_path exists and has as many frames as traj_path.
+
+        A tandem file that is absent (a gen predating this option) or short (a
+        gen that crashed partway) must not be appended to on a resume: from then
+        on it would write its frame N alongside position frame N+k and stay
+        permanently offset, breaking the invariant that tandem frame N goes with
+        position frame N. The caller skips the reporter instead, and the next
+        fresh gen starts a clean tandem file from frame 0.
+        """
         if not tandem_path.is_file():
             return False
         if not traj_path.is_file():
@@ -476,15 +459,8 @@ def omm_generation(traj_dir_top_level: str,
                                     platform=platform)
     simulation.loadState(seed_fn)
 
-    # CUDA context warmup. When several GPU jobs initialize concurrently
-    # on a shared node, the first getState(getPositions=True) readback
-    # can race with kernel completion and return uninitialized device
-    # memory — observed as a single garbage frame at frame 0 in
-    # clone-{028,030,031,032}/gen-000 and clone-{046..049}/gen-001 of
-    # the antifreeze dataset (four H200 jobs per node, same SLURM job
-    # ID block). Pulling positions back here forces the device→host
-    # sync before any reporter fires, so DCDReporter's first frame is
-    # from a settled context.
+    # CUDA warmup: with several GPU jobs starting at once, the first readback can
+    # race with kernel completion and hand back device garbage as frame 0.
     _ = simulation.context.getState(getPositions=True)
 
     if new_velocities:
@@ -493,10 +469,8 @@ def omm_generation(traj_dir_top_level: str,
     if minimize_first:
         print('Performing energy minimization...')
         simulation.minimizeEnergy()
-    # Equilibration runs only when starting a generation from scratch. On a
-    # resume (append=True) the eq has already been done; re-running it would
-    # also wind simulation.currentStep backwards, desyncing reporter triggers
-    # from the loaded state.
+    # Equilibrate only on a fresh gen: a resume has already done it, and redoing
+    # it would wind currentStep backwards and desync the reporter triggers.
     if eq_steps and not append:
         print('Equilibrating...')
         simulation.step(eq_steps)
@@ -509,12 +483,10 @@ def omm_generation(traj_dir_top_level: str,
     simulation.reporters.append(restart_reporter)
     for r in extra_reporters:
         simulation.reporters.append(r)
-    # SentinelReporter must be appended LAST so DCD / state.xml / .out
-    # writes for the current cycle have already landed on disk before it
-    # raises. Stale sentinel from a previous preempted run in this gen
-    # dir would fire immediately, so clear it first.
+    # Appended last, so this cycle's writes land on disk before it can raise.
     if handle_preempt:
         sentinel_p = Path(PREEMPT_SENTINEL_NAME)
+        # A sentinel left in this gen dir by an earlier preempt would fire at once.
         if sentinel_p.exists():
             sentinel_p.unlink()
         simulation.reporters.append(SentinelReporter(write_interval))
@@ -524,16 +496,18 @@ def omm_generation(traj_dir_top_level: str,
         print(f'Preempt received: {exc}; exiting cleanly at last reporter '
               f'cycle. The partial gen will resume via append on next launch.')
         raise
-    # The CheckpointReporter writes at every write_interval, so the most
-    # recent state.xml on disk already aligns with the trajectory's last
-    # frame. Writing one final state at a non-write_interval boundary
-    # desyncs state.xml from the traj frame count, breaking the next
-    # resume's calx_remaining_steps math.
     print('Done!')
     return traj_path.resolve()
 
 
 def omm_basic_sim_block_json(config):
+    """Run one generation from a JSON config, appending its path to traj_list.
+
+    A preempted generation is incomplete, so nothing is appended and the process
+    returns normally — Slurm then records the job as cancelled rather than
+    failed, and the orchestrator finds the partial trajectory on its next boot
+    and resumes it in append mode.
+    """
     with open(config, 'r') as f:
         conf_dict = json.load(f)
 
@@ -554,9 +528,7 @@ def omm_basic_sim_block_json(config):
     try:
         new_traj_path = omm_generation(**conf_dict)
     except Preempted:
-        # Skip the traj_list append: the gen is incomplete. The orchestrator
-        # will detect the partial DCD on the next boot and resume in append
-        # mode. Exit 0 so Slurm records the job as cancelled, not failed.
+        # Incomplete gen: leave it off traj_list.
         return
     with traj_list_path.open('a') as tl:
         tl.write(str(new_traj_path) + '\n')
