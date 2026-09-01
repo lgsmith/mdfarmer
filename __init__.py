@@ -2,7 +2,7 @@ from . import harvester
 from .harvester import (Harvester, HarvestError, harvest_generation,
                         check_commensurability, unharvested_gen_dirs,
                         verify_dry_chain, select_backend, resolve_subset,
-                        expected_counts)
+                        frame_plan, expected_counts)
 from .farmer import *
 from .utilities import *
 from .simulate import *
@@ -34,7 +34,7 @@ __all__ = ['fdir', 'dir_seeds_clones', 'dir_seeds_clones_gens', 'omm_generation'
            'harvester', 'HarvestError', 'harvest_generation',
            'check_commensurability', 'unharvested_gen_dirs',
            'verify_dry_chain', 'select_backend', 'resolve_subset',
-           'expected_counts',
+           'frame_plan', 'expected_counts',
            'strip_and_downsample', 'strip_ds_mdtraj',
            'default_straight_sampling_config_template',
            'default_straight_sampling_init_config',

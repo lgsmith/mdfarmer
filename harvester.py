@@ -169,12 +169,23 @@ def keeps_frame(local_index, first_global_index, downsample_frq, skip_first):
     return True, ((first_global_index + local_index) % downsample_frq == 0)
 
 
-def expected_counts(n_orig, first_global_index, downsample_frq, skip_first):
-    """(n_dry, n_downsample) the plan will produce. Computed, never observed."""
-    n_dry = n_down = 0
+def frame_plan(n_orig, first_global_index, downsample_frq, skip_first):
+    """Yield (local_index, write_dry, write_downsample) for every frame.
+
+    Answers "which frames would this harvest keep?" without harvesting, which
+    is the cheapest way to check a downsample phase before spending a run on it.
+    """
     for local in range(n_orig):
         dry, down = keeps_frame(local, first_global_index, downsample_frq,
                                 skip_first)
+        yield local, dry, down
+
+
+def expected_counts(n_orig, first_global_index, downsample_frq, skip_first):
+    """(n_dry, n_downsample) the plan will produce. Computed, never observed."""
+    n_dry = n_down = 0
+    for _, dry, down in frame_plan(n_orig, first_global_index, downsample_frq,
+                                   skip_first):
         n_dry += dry
         n_down += down
     return n_dry, n_down
