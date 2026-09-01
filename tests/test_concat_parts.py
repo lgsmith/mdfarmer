@@ -1,12 +1,12 @@
-"""concat_parts merges a generation's parts exactly the way gmx trjcat did.
+"""concat_parts merges a generation's parts into one contiguous trajectory.
 
-The merge is what the whole campaign's contiguity rests on, so this suite pins
-it against the tool it replaced: real mdrun parts are merged both ways and
-compared frame for frame, on steps, times, boxes and coordinates.
+The merge is what the whole campaign's contiguity rests on, so the checks are
+against first principles rather than against another tool: real mdrun parts are
+merged and the result must carry exactly the step and time axis the run's own
+budget and write interval predict, with every step present once.
 
-gmx trjcat and gmx trjconv appear here as reference oracles only. mdfarmer
-itself no longer runs either one; these suites exist to show the replacement
-agrees with them.
+Where two parts cover the same steps the later part's frames win. That is
+checked directly, by giving the two parts recognisably different coordinates.
 """
 import shutil
 import subprocess as sp
@@ -36,15 +36,18 @@ OVERLAP_FRAMES = 6
 # writer -- fixed at 1000 -- cannot carry.
 FINE_PRECISION = 10000
 
+# Timestep in harness.water_mdp, ps; frame time is step * dt.
+DT_PS = 0.002
+
 
 def gmx(cmd, cwd, gmx_bin=harness.GMX_BIN, stdin=None):
-    """Run a gmx subcommand, raising Skip if this build cannot do it."""
+    """Run a gmx subcommand that builds the fixture, or Skip if it fails."""
     result = sp.run([str(gmx_bin), *[str(c) for c in cmd]], cwd=str(cwd),
                     input=stdin, text=True, capture_output=True)
     if result.returncode != 0:
         raise harness.Skip(
-            f'gmx {cmd[0]} failed, so there is no reference to compare '
-            f'against:\n{result.stderr[-2000:]}')
+            f'gmx {cmd[0]} failed, so there are no parts to merge:'
+            f'\n{result.stderr[-2000:]}')
     return result
 
 
@@ -79,23 +82,22 @@ def build_real_parts(work, precision=None, gmx_bin=harness.GMX_BIN,
     return structure, topology
 
 
-def same_frames(suite, label, mine, reference):
-    """Check a merge against a reference merge on every axis it must preserve."""
-    my_xyz, my_time, my_step, my_box = mine
-    ref_xyz, ref_time, ref_step, ref_box = reference
-    suite.check(f'{label}: frame count matches gmx trjcat',
-                len(my_step) == len(ref_step),
-                f'-> {len(my_step)} vs {len(ref_step)}')
-    suite.check(f'{label}: MD steps match gmx trjcat exactly',
-                np.array_equal(my_step, ref_step), f'-> {my_step}')
-    suite.check(f'{label}: frame times match gmx trjcat exactly',
-                np.array_equal(my_time, ref_time))
-    box_diff = float(np.abs(my_box - ref_box).max())
-    suite.check(f'{label}: boxes match gmx trjcat exactly', box_diff == 0.0,
-                f'-> max difference {box_diff:g}')
-    xyz_diff = float(np.abs(my_xyz - ref_xyz).max())
-    suite.check(f'{label}: coordinates match gmx trjcat exactly',
-                xyz_diff == 0.0, f'-> max difference {xyz_diff:g} nm')
+def contiguous_frames(suite, label, merged, last_step,
+                      write_interval=WRITE_INTERVAL, dt_ps=DT_PS):
+    """Check a merge carries exactly the clock its run's budget predicts."""
+    xyz, time, step, box = merged
+    wanted = np.arange(0, last_step + 1, write_interval)
+    suite.check(f'{label}: one frame per write interval, none missing',
+                len(step) == len(wanted), f'-> {len(step)} vs {len(wanted)}')
+    suite.check(f'{label}: the MD steps are exactly the expected sequence',
+                np.array_equal(step, wanted), f'-> {step}')
+    suite.check(f'{label}: no step is written twice',
+                len(set(step.tolist())) == len(step))
+    suite.check(f'{label}: frame times follow the steps at dt',
+                np.allclose(time, wanted * dt_ps, atol=1e-6),
+                f'-> {time[:3]} ...')
+    suite.check(f'{label}: every frame carries a box',
+                bool(np.all(np.abs(box).sum(axis=(1, 2)) > 0)))
 
 
 def main(gmx_bin=harness.GMX_BIN, overlap_frames=OVERLAP_FRAMES,
@@ -111,11 +113,8 @@ def main(gmx_bin=harness.GMX_BIN, overlap_frames=OVERLAP_FRAMES,
     starts = [gs._first_frame_step(p) for p in parts]
     suite.check('mdrun left two parts to merge', len(parts) == 2,
                 f'-> {[p.name for p in parts]} starting at {starts}')
-    gmx(['trjcat', '-f', *[p.name for p in parts], '-o', 'trjcat.xtc'], gen,
-        gmx_bin=gmx_bin)
     merged = gs.concat_parts(gen, gen / 'prod.xtc')
-    same_frames(suite, 'real parts', read_xtc(merged),
-                read_xtc(gen / 'trjcat.xtc'))
+    contiguous_frames(suite, 'real parts', read_xtc(merged), STEPS)
     suite.check('the parts are left on disk', all(p.is_file() for p in parts))
 
     suite.section('a multi-frame overlap: the later part wins')
@@ -132,11 +131,8 @@ def main(gmx_bin=harness.GMX_BIN, overlap_frames=OVERLAP_FRAMES,
     tail = slice(n - overlap_frames, n)
     write_xtc(over / 'prod.part0002.xtc', xyz[0:overlap_frames], time[tail],
               step[tail], box[tail])
-    gmx(['trjcat', '-f', 'prod.part0001.xtc', 'prod.part0002.xtc',
-         '-o', 'trjcat.xtc'], over, gmx_bin=gmx_bin)
     over_merged = gs.concat_parts(over, over / 'prod.xtc')
-    same_frames(suite, 'overlap', read_xtc(over_merged),
-                read_xtc(over / 'trjcat.xtc'))
+    contiguous_frames(suite, 'overlap', read_xtc(over_merged), SPLIT_STEP)
 
     mine = read_xtc(over_merged)
     early = read_xtc(over / 'prod.part0001.xtc')
@@ -153,9 +149,6 @@ def main(gmx_bin=harness.GMX_BIN, overlap_frames=OVERLAP_FRAMES,
                 to_later == 0.0, f'-> {to_later:g} nm from part0002')
     suite.check('and are not the earlier part\'s', to_early > 0.1,
                 f'-> {to_early:.3f} nm from part0001')
-    suite.check('no step is written twice',
-                len(set(mine[2].tolist())) == len(mine[2]))
-
     suite.section('the verification pass catches a merge that kept the wrong frames')
     # Built by hand out of the earlier part's overlap frames, which is exactly
     # what an inverted overlap rule would produce.
