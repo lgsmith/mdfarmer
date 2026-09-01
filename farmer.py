@@ -550,7 +550,7 @@ class Farmer:
             return True
         return False
 
-    def launch(self, update_jids=True):
+    def launch(self, sleep=None, update_jids=True):
         """One tick: advance, finish or fail every clone the queues still hold.
 
         Returns one flat True/False per clone looked at, True meaning it is
@@ -572,6 +572,10 @@ class Farmer:
             survivors = []
             for clone in clone_list:
                 print('starting into clone loop for', clone.get_tag())
+                # Seconds to wait between clones, so a big campaign does not
+                # hand the scheduler every submission at once.
+                if sleep:
+                    time.sleep(sleep)
                 # This probably shouldn't happen, but it's worth checking for
                 if clone in self.finished_clones or \
                         clone in self.failed_clone_set:
@@ -622,7 +626,7 @@ class Farmer:
             self.priority_ordered_clones[queue_index] = survivors
         return still_running
 
-    def start_tending_fields(self, update_interval=120):
+    def start_tending_fields(self, update_interval=120, sleep=None):
         """Mind the whole campaign: launch every clone and keep it going.
 
         Whether you are starting or restarting, this is probably what you
@@ -637,7 +641,7 @@ class Farmer:
                 'No clones could be set up; nothing to tend. Check the '
                 'per-clone setup errors printed above (missing structure, '
                 'topology, .mdp, or an unreadable checkpoint).')
-        still_running = self.launch(update_jids=False)
+        still_running = self.launch(sleep=sleep, update_jids=False)
         brake_file_p = Path('stop')
         print('still_running:', *still_running, flush=True)
         # If dry run, short circuit the tending loop.
@@ -652,7 +656,7 @@ class Farmer:
             time.sleep(update_interval)
             # Losing the tender leaves every running job unminded.
             try:
-                still_running = self.launch()
+                still_running = self.launch(sleep=sleep)
             except Exception as exc:
                 print(f'ERROR in tending loop: {type(exc).__name__}: {exc}')
                 traceback.print_exc()
