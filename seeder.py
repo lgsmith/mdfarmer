@@ -569,15 +569,28 @@ class Clone:
     def check_copy_set_restart_seed(self):
         """Put a copy of this clone's seed in the current gen directory.
 
-        A no-op when the seed already lives there. The copy becomes the seed
-        the config names, so the launched job finds it beside itself.
+        A no-op when the seed already lives there, and when the directory holds
+        a restart file newer than the seed. That file is this generation's own
+        progress, and an older seed copied over it rewinds the generation to
+        its start; after a tender restart the seed is the campaign's opening
+        structure, so the copy would throw away every step run so far. Remove
+        the restart file first to reseed such a directory deliberately.
+
+        The copy becomes the seed the config names, so the launched job finds
+        it beside itself.
         """
         seed_p = self.current_seed
-        seed_dir = seed_p.parent
-        if seed_dir != self.current_gen_dir:
-            cg_seed_p = self.current_gen_dir/self.config['restart_name']
-            shutil.copy(seed_p, cg_seed_p)
+        if seed_p.parent == self.current_gen_dir:
+            return
+        cg_seed_p = self.current_gen_dir / self.config['restart_name']
+        if (cg_seed_p.is_file() and cg_seed_p.stat().st_size
+                and cg_seed_p.stat().st_mtime > seed_p.stat().st_mtime):
+            print(f'{cg_seed_p} is newer than the seed {seed_p}; keeping it, '
+                  'since copying over it would rewind this generation.')
             self.set_seed(cg_seed_p)
+            return
+        shutil.copy(seed_p, cg_seed_p)
+        self.set_seed(cg_seed_p)
 
     def was_preempted(self):
         """True if the scheduler reports this clone's last job was preempted.
