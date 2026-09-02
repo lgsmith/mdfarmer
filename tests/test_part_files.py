@@ -8,7 +8,7 @@ point after part0001 (the same failure mode as a cascade that restores an
 older checkpoint over state.cpt) and the generation is relaunched. The
 relaunch's own part0002 overwrites the old one, but nothing about mdrun
 touches the abandoned part0003 -- it is still sitting there, still matching
-the glob, and trjcat prefers its frames wherever the two branches' times
+the glob, and the merge prefers its frames wherever the two branches' steps
 overlap.
 """
 import shutil
@@ -42,7 +42,7 @@ SEP = '-'
 BRANCH_A_ARGS = ('-nb', 'cpu', '-pme', 'cpu', '-ntomp', '2')
 BRANCH_B_ARGS = ('-nb', 'cpu', '-pme', 'cpu', '-ntomp', '1')
 
-# trjcat round-trips through compressed .xtc, which costs a bit of precision.
+# The merge round-trips through compressed .xtc, which costs a bit of precision.
 COORD_ATOL_NM = 2e-3
 # Far above that round-trip noise, far below the ~0.3-1 nm the two branches
 # reach once chaos has had BRANCH_STEP*2 steps to amplify a rounding
