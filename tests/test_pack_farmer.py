@@ -3,8 +3,10 @@
 Needs no GROMACS: every launch is a dry run, so the referenced files only have
 to exist.
 """
+import io
 import json
 import sys
+from contextlib import redirect_stdout
 from pathlib import Path
 
 import harness
@@ -213,15 +215,20 @@ def main(cpus=CPUS, pack_size=PACK_SIZE, member_cores=MEMBER_CORES,
         dry_run=True)
     scheduler_kws = dict(gpu_line='', queue_name='gpu', exclude_nodes='',
                          cpus=cpus, run_script_name='run.py')
-    try:
-        ClonePack(members, work / 'pack-uneven', 'sbatch',
-                  util.basic_scheduler_fstrings_mps['slurm'], scheduler_kws,
-                  **pack_kwargs)
-        suite.check('unequal steps are refused', False, '-> no exception')
-    except ValueError as exc:
-        suite.check('unequal steps are refused', True, f'-> {str(exc)[:50]}')
-        suite.check('the message names the escape hatch',
-                    'wallclock_matched' in str(exc))
+    # Noted, not refused: the cost is a straggler and a harvest that needs its
+    # own Harvester, neither of which is a reason to stop the campaign.
+    noted = io.StringIO()
+    with redirect_stdout(noted):
+        uneven = ClonePack(members, work / 'pack-uneven', 'sbatch',
+                           util.basic_scheduler_fstrings_mps['slurm'],
+                           scheduler_kws, **pack_kwargs)
+    said = noted.getvalue()
+    suite.check('unequal steps still build a pack', uneven is not None)
+    suite.check('unequal steps are called out at boot',
+                'NOTE' in said and 'steps per generation' in said,
+                f'-> {said.strip()[:60]}')
+    suite.check('and the note says which Harvester problem it causes',
+                'Harvester' in said)
     pack = ClonePack(members, work / 'pack-wallclock', 'sbatch',
                      util.basic_scheduler_fstrings_mps['slurm'], scheduler_kws,
                      wallclock_matched=True, **pack_kwargs)

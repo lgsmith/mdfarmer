@@ -859,9 +859,9 @@ class ClonePack:
     so a packed generation and a solo generation prepare identically. Only the
     submission is shared.
 
-    Members must come from ONE condition and system, with identical steps:
-    the job holds the card until its slowest member finishes, so mismatched
-    per-step costs waste GPU time.
+    Members must come from ONE condition and system, and preferably run
+    identical steps: the job holds the card until its slowest member finishes,
+    so mismatched per-step costs waste GPU time.
 
     That rule is about straggler cost, not data safety. Failure is per-member
     (gmx_pack collects K outcomes and the tender fails exactly one clone) and
@@ -877,8 +877,8 @@ class ClonePack:
                  pack_manifest_name='pack.json',
                  run_script_name='run.py',
                  member_cores=None,
-                 # Unequal steps are refused: the job holds the card until its
-                 # slowest member finishes. True if every launch ends at -maxh.
+                 # If True, unequal steps per generation are not even noted:
+                 # you are saying every launch ends at -maxh, not at a target.
                  wallclock_matched=False,
                  sep=None,
                  job_name_elements=('{title}', '{seed_index}',
@@ -887,12 +887,12 @@ class ClonePack:
             raise ValueError('a ClonePack needs at least one Clone')
         steps = {c.total_steps for c in clones}
         if len(steps) != 1 and not wallclock_matched:
-            raise ValueError(
-                f'pack members run {sorted(steps)} steps per generation. Equal '
-                'steps keep the card busy: the job holds it until its slowest '
-                'member finishes, so a shorter member leaves it idle. Pass '
-                'wallclock_matched=True if every launch ends at -maxh instead '
-                'of at a step target, which is when no member waits on another.')
+            print(f'NOTE: pack members run {sorted(steps)} steps per '
+                  'generation. The job holds the card until its slowest member '
+                  'finishes, and one Harvester cannot serve two step lengths: '
+                  'a clone whose steps_per_gen disagrees with the harvester '
+                  'config loses that harvest silently. Give each step length '
+                  'its own Harvester.')
         self.clones = list(clones)
         self.pack_dir = Path(pack_dir)
         self.pack_dir.mkdir(parents=True, exist_ok=True)
