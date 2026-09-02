@@ -50,6 +50,14 @@ SCAN_CHUNK = 200
 # LOOS reads and writes Angstroms; GROMACS .gro/.xtc are nm.
 ANGSTROM_PER_NM = 10.0
 
+# Coordinate precision an .xtc is written at, in reciprocal nm. GROMACS and
+# LOOS both default to this; a run that asked for finer says so in its frames.
+XTC_PRECISION = 1000.0
+
+# Placeholders for LOOS's own clock, which every frame here overrides.
+LOOS_WRITER_DT = 1.0
+LOOS_WRITER_STEPS_PER_FRAME = 1
+
 
 class BoxTypeError(ValueError):
     """Raised when a backend is asked to handle a cell it cannot represent."""
@@ -401,7 +409,9 @@ def reimage_with_loos(traj_fn, structure_fn, out_fn, top_fn=None,
             raise ValueError(
                 f'center_selection {center_selection!r} matched no atoms')
 
-    writer = _loos_writer(out_p)
+    # A run that asked for a finer compressed-x-precision must not be
+    # quantised back to the default on its way through LOOS.
+    writer = _loos_writer(out_p, precision=source_precision(traj_p))
     timing = util.frame_timing(traj_p)
     traj = pyloos.Trajectory(str(traj_p), model)
     n_written = 0
@@ -474,10 +484,17 @@ def _verify_reimaged(out_p, top_fn=None, include_dir=None, ranges=None,
               'to have it verified.', flush=True)
 
 
-def _loos_writer(out_p):
+def source_precision(traj_p, default=XTC_PRECISION):
+    """The .xtc precision a trajectory was written at, or the default."""
+    from . import gmx_simulate
+    found = gmx_simulate.xtc_precision(traj_p)
+    return default if found is None else found
+
+
+def _loos_writer(out_p, precision=XTC_PRECISION):
     suffix = out_p.suffix.lower()
     if suffix == '.xtc':
-        return loos_xtc_writer(out_p)
+        return loos_xtc_writer(out_p, precision=precision)
     if suffix == '.dcd':
         import loos
         return loos.DCDWriter(str(out_p))
@@ -486,9 +503,13 @@ def _loos_writer(out_p):
         '.dcd')
 
 
-def loos_xtc_writer(out_p):
+def loos_xtc_writer(out_p, precision=XTC_PRECISION,
+                    steps_per_frame=LOOS_WRITER_STEPS_PER_FRAME,
+                    dt=LOOS_WRITER_DT):
+    """An .xtc writer holding this precision. Frames carry their own step and
+    time, so dt and steps_per_frame only feed the unused 1-argument form."""
     import loos
-    return loos.XTCWriter(str(out_p))
+    return loos.XTCWriter(str(out_p), dt, steps_per_frame, float(precision))
 
 
 class _MdtrajWriter:
