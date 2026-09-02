@@ -29,6 +29,7 @@ check that and trim it.
 """
 
 import inspect
+import json
 import os
 import struct
 from pathlib import Path
@@ -643,6 +644,70 @@ class BadNodeRegistry:
             print(f'BadNodeRegistry: node {node!r} (already excluded) hit '
                   f'pattern {matched!r} again; logged in {self.persist_path}.')
         return node
+
+
+# Where a campaign records what each seed index means.
+SEED_MAP_NAME = 'seed_map.json'
+
+
+def read_seed_map(seed_map_p: Path):
+    """The recorded {seed index: label}, or {} when nothing is recorded yet."""
+    seed_map_p = Path(seed_map_p)
+    if not seed_map_p.is_file():
+        return {}
+    return {int(index): label
+            for index, label in json.loads(seed_map_p.read_text()).items()}
+
+
+def write_seed_map(seed_map_p: Path, seed_map: dict):
+    """Write {seed index: label}, under a temp name so no boot reads a torn file."""
+    seed_map_p = Path(seed_map_p)
+    seed_map_p.parent.mkdir(parents=True, exist_ok=True)
+    tmp_p = seed_map_p.with_name(seed_map_p.name + '.tmp')
+    tmp_p.write_text(json.dumps(
+        {str(index): label for index, label in sorted(seed_map.items())},
+        indent=2))
+    tmp_p.replace(seed_map_p)
+    return seed_map_p
+
+
+def changed_seed_labels(recorded: dict, seed_labels):
+    """Recorded indices whose label has changed, as {index: (was, now)}."""
+    return {index: (recorded[index], label)
+            for index, label in enumerate(seed_labels)
+            if index in recorded and recorded[index] != label}
+
+
+def check_seed_map(seed_map_p: Path, seed_labels):
+    """Bind each seed index to its label, refusing a boot that re-indexes one.
+
+    A seed index is an on-disk identity: it names the seed directory, appears
+    in job names, and is the key running jobs are re-associated by. Every label
+    already recorded must still mean the same thing; indices past the end of
+    the record are new seeds and are added to it. Returns the merged mapping.
+    """
+    seed_labels = list(seed_labels)
+    duplicated = sorted({label for label in seed_labels
+                         if seed_labels.count(label) > 1})
+    if duplicated:
+        raise ValueError(
+            f'seed_labels repeats {duplicated}. A label is a seed\'s identity, '
+            'so two seeds sharing one make a swap between them undetectable.')
+    recorded = read_seed_map(seed_map_p)
+    changed = changed_seed_labels(recorded, seed_labels)
+    if changed:
+        detail = '; '.join(f'seed {index} was {was!r} and is now {now!r}'
+                           for index, (was, now) in sorted(changed.items()))
+        raise ValueError(
+            f'seed_labels disagrees with {seed_map_p}: {detail}. That index '
+            'already names a directory of finished data and any job still '
+            'queued for it, so booting would run this seed into another '
+            "replica's trajectory. Put the seed lists back in their recorded "
+            'order, or, if the re-index is deliberate, move the existing '
+            f'data aside and delete {seed_map_p}.')
+    merged = {**recorded, **dict(enumerate(seed_labels))}
+    write_seed_map(seed_map_p, merged)
+    return merged
 
 
 def select_platform(platform_name=None, platform_properties=None):
