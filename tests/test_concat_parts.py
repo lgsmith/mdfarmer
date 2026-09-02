@@ -7,8 +7,16 @@ budget and write interval predict, with every step present once.
 
 Where two parts cover the same steps the later part's frames win. That is
 checked directly, by giving the two parts recognisably different coordinates.
+
+Which writer does the merging follows from the parts' own compressed-x-precision:
+mdtraj at the default 1000, LOOS above it. Both are checked by breaking one
+writer and merging, and the grid each merge lands on is measured rather than
+assumed.
 """
+import contextlib
+import io
 import shutil
+import struct
 import subprocess as sp
 import sys
 from pathlib import Path
@@ -35,6 +43,20 @@ OVERLAP_FRAMES = 6
 # compressed-x-precision a campaign might raise to, and which mdtraj's xtc
 # writer -- fixed at 1000 -- cannot carry.
 FINE_PRECISION = 10000
+
+# How far a measured coordinate grid may sit from 1 / precision and still count.
+QUANTUM_RTOL = 0.01
+
+# Byte offset and length of the 3x3 box in an .xtc frame: it follows the magic
+# number, the atom count, the step and the time.
+XTC_BOX_OFFSET = 16
+XTC_BOX_BYTES = 36
+
+# Off-diagonal box element, nm, that makes a copied cell unmistakably triclinic.
+BOX_SHEAR_NM = 0.5
+
+# Atoms dropped to build a structure that is not the system the parts hold.
+SHORT_STRUCTURE_DROP = 3
 
 # Timestep in harness.water_mdp, ps; frame time is step * dt.
 DT_PS = 0.002
@@ -80,6 +102,89 @@ def build_real_parts(work, precision=None, gmx_bin=harness.GMX_BIN,
     gmx(common + ['-nsteps', str(split_step)], work, gmx_bin=gmx_bin)
     gmx(common + ['-cpi', 'prod.cpt'], work, gmx_bin=gmx_bin)
     return structure, topology
+
+
+def coordinate_quantum(xyz):
+    """The smallest gap between distinct coordinate values, nm.
+
+    An .xtc stores coordinates as integers divided by its precision, so with
+    this many atoms the occupied values land densely enough on that grid for
+    the closest pair to be one quantum apart.
+    """
+    values = np.unique(np.asarray(xyz, dtype=np.float64).ravel())
+    gaps = np.diff(values)
+    return float(gaps[gaps > 0].min())
+
+
+def expected_frames(early, later):
+    """The frames a merge of two overlapping parts should carry, and no others."""
+    keep = early[2] < later[2][0]
+    return tuple(np.concatenate([e[keep], l]) for e, l in zip(early, later))
+
+
+def shear_boxes(src, dst, shear_nm=BOX_SHEAR_NM, box_offset=XTC_BOX_OFFSET,
+                box_bytes=XTC_BOX_BYTES):
+    """Copy an .xtc frame by frame, tilting every cell and touching nothing else.
+
+    The compressed coordinate block of each frame is carried over byte for byte,
+    so the copy is triclinic at exactly the precision the source was written at.
+    """
+    with XTCTrajectoryFile(str(src)) as handle:
+        offsets = [int(o) for o in handle.offsets]
+    raw = src.read_bytes()
+    out = bytearray()
+    for start, stop in zip(offsets, offsets[1:] + [len(raw)]):
+        frame = bytearray(raw[start:stop])
+        box = list(struct.unpack('>9f', frame[box_offset:box_offset + box_bytes]))
+        box[3] = shear_nm            # yx, which no rectangular cell carries
+        frame[box_offset:box_offset + box_bytes] = struct.pack('>9f', *box)
+        out += frame
+    dst.write_bytes(bytes(out))
+
+
+def short_structure(src, dst, drop=SHORT_STRUCTURE_DROP):
+    """Copy a .gro without its last few atoms, so it is a different system."""
+    lines = src.read_text().splitlines()
+    kept = lines[2:-1][:-drop]
+    dst.write_text('\n'.join([lines[0], str(len(kept)), *kept, lines[-1]]) + '\n')
+
+
+def refuses(suite, label, call, wanted, exc_type=Exception):
+    """Check a call raises, and that the message says which constraint bit."""
+    try:
+        call()
+    except exc_type as exc:
+        message = str(exc)
+        print(f'   {message}', flush=True)
+        suite.check(label, all(w in message for w in wanted),
+                    f'-> {message[:80]}')
+        return
+    suite.check(label, False, '-> no exception')
+
+
+@contextlib.contextmanager
+def broken(module, name):
+    """Swap a module attribute for a raiser, to prove it is never reached."""
+    def refuse(*args, **kwargs):
+        raise AssertionError(f'{name} was called')
+    original = getattr(module, name)
+    setattr(module, name, refuse)
+    try:
+        yield
+    finally:
+        setattr(module, name, original)
+
+
+def merged_without(suite, label, name, call, module=gs):
+    """Merge with one writer broken, checking it was not the one that ran."""
+    try:
+        with broken(module, name):
+            result = call()
+    except AssertionError:
+        suite.check(label, False, f'-> {name} did the merge')
+        return call()
+    suite.check(label, True)
+    return result
 
 
 def contiguous_frames(suite, label, merged, last_step,
@@ -202,21 +307,94 @@ def main(gmx_bin=harness.GMX_BIN, overlap_frames=OVERLAP_FRAMES,
         suite.check('a .trr is refused rather than silently stripped',
                     'velocities' in str(exc), f'-> {str(exc)[:60]}')
 
-    suite.section(f'a run at compressed-x-precision {fine_precision} says so')
+    suite.section('the default merge is mdtraj\'s, and bit exact')
+    default_want = expected_frames(read_xtc(parts[0]), read_xtc(parts[1]))
+    suite.check('every axis of the merge is the parts\' own bytes',
+                all(np.array_equal(g, w)
+                    for g, w in zip(read_xtc(merged), default_want)))
+    suite.check(f'the parts read back at precision {gs.MDTRAJ_XTC_PRECISION:g}',
+                gs.xtc_precision(parts[0]) == gs.MDTRAJ_XTC_PRECISION)
+    merged_without(suite, 'and it never reaches the LOOS writer',
+                   '_write_merged_loos',
+                   lambda: gs.concat_parts(gen, gen / 'again.xtc'))
+
+    suite.section(f'a run at compressed-x-precision {fine_precision} keeps it')
     fine = work / 'fine'
-    build_real_parts(fine, precision=fine_precision, gmx_bin=gmx_bin)
-    try:
-        gs.concat_parts(fine, fine / 'prod.xtc')
-        suite.check('a precision mdtraj cannot write is refused', False,
-                    '-> no exception')
-    except RuntimeError as exc:
-        message = str(exc)
-        print(f'   {message}', flush=True)
-        suite.check('a precision mdtraj cannot write is refused', True)
-        suite.check('the message names compressed-x-precision',
-                    'compressed-x-precision' in message)
-    suite.check('and nothing was published under the trajectory name',
-                not (fine / 'prod.xtc').is_file())
+    structure, _ = build_real_parts(fine, precision=fine_precision,
+                                    gmx_bin=gmx_bin)
+    fine_parts = gs.part_files(fine)
+    suite.check('the precision is read out of the part header',
+                gs.xtc_precision(fine_parts[0]) == fine_precision,
+                f'-> {gs.xtc_precision(fine_parts[0])}')
+    source_quantum = coordinate_quantum(read_xtc(fine_parts[0])[0])
+    suite.check('and the parts really do sit on that finer grid',
+                np.isclose(source_quantum, 1 / fine_precision,
+                           rtol=QUANTUM_RTOL), f'-> {source_quantum:.3e} nm')
+
+    gs._warned_precisions.clear()
+    said = io.StringIO()
+    with contextlib.redirect_stdout(said):
+        fine_merged = gs.concat_parts(fine, fine / 'prod.xtc',
+                                      structure_fn=structure)
+    warning = said.getvalue()
+    print(f'   {warning.strip()}', flush=True)
+    suite.check('the merge asks whether the finer grid is really wanted',
+                'Are you sure' in warning)
+    suite.check('and says what the accuracy is being spent on',
+                'force field' in warning and 'noise' in warning)
+    said = io.StringIO()
+    with contextlib.redirect_stdout(said):
+        gs.concat_parts(fine, fine / 'twice.xtc', structure_fn=structure)
+    suite.check('the warning is said once, not once per generation',
+                'Are you sure' not in said.getvalue())
+    merged_without(suite, 'and the merge never reaches the mdtraj writer',
+                   '_write_merged',
+                   lambda: gs.concat_parts(fine, fine / 'loos-only.xtc',
+                                           structure_fn=structure))
+
+    merged_quantum = coordinate_quantum(read_xtc(fine_merged)[0])
+    suite.check('the merge lands on the same grid the parts did',
+                np.isclose(merged_quantum, 1 / fine_precision,
+                           rtol=QUANTUM_RTOL), f'-> {merged_quantum:.3e} nm')
+    contiguous_frames(suite, 'fine parts', read_xtc(fine_merged), STEPS)
+    fine_want = expected_frames(read_xtc(fine_parts[0]), read_xtc(fine_parts[1]))
+    fine_got = read_xtc(fine_merged)
+    for axis, name in enumerate(('coordinates', 'frame times', 'MD steps',
+                                 'boxes')):
+        suite.check(f'the merged {name} are the parts\' own, exactly',
+                    np.array_equal(fine_got[axis], fine_want[axis]))
+
+    suite.section('what the fine-precision writer cannot do, it refuses')
+    refuses(suite, 'a fine merge with no structure to write frames out of',
+            lambda: gs.concat_parts(fine, fine / 'nostructure.xtc'),
+            ['structure_fn', 'compressed-x-precision'], ValueError)
+    suite.check('and published nothing',
+                not (fine / 'nostructure.xtc').is_file()
+                and not list(fine.glob('nostructure*concat-tmp*')))
+
+    short = fine / 'short.gro'
+    short_structure(structure, short)
+    refuses(suite, 'a structure that is not the system the parts hold',
+            lambda: gs.concat_parts(fine, fine / 'mismatch.xtc',
+                                    structure_fn=short),
+            ['atoms', 'compressed-x-grps'], ValueError)
+
+    tric = work / 'triclinic'
+    tric.mkdir()
+    for part in fine_parts:
+        shear_boxes(part, tric / part.name)
+    suite.check('the sheared copies kept the precision they were written at',
+                gs.xtc_precision(tric / fine_parts[0].name) == fine_precision)
+    suite.check('and are triclinic',
+                not gs.is_orthorhombic(read_xtc(tric / fine_parts[0].name)[3][0]))
+    refuses(suite, 'a triclinic cell at a precision no writer holds',
+            lambda: gs.concat_parts(tric, tric / 'prod.xtc',
+                                    structure_fn=structure),
+            ['non-orthorhombic', 'compressed-x-precision', 'three numbers'],
+            gs.BoxTypeError)
+    suite.check('and published nothing',
+                not (tric / 'prod.xtc').is_file()
+                and not list(tric.glob('*concat-tmp*')))
 
     return suite.report()
 
