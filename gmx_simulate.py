@@ -14,11 +14,13 @@ lets the generations be put back together in order.
 
 Each launch writes its own prod.partNNNN.xtc, because mdrun -cpi will not append
 into a directory that does not already hold the files its checkpoint names.
-concat_parts merges them when the generation finishes, reading and writing with
-mdtraj so every frame keeps its own step, time and box. Where two parts cover
-the same steps the later one's frames survive, so a part left behind by a
-rewound relaunch is moved aside before mdrun runs rather than left to outrank
-the branch that actually continued.
+concat_parts merges them when the generation finishes, reading with mdtraj so
+every frame keeps its own step, time and box, and writing with mdtraj unless the
+run's compressed-x-precision is finer than the 1000 that writer is fixed at, in
+which case LOOS writes instead. Where two parts cover the same steps the later
+one's frames survive, so a part left behind by a rewound relaunch is moved aside
+before mdrun runs rather than left to outrank the branch that actually
+continued.
 
 Whether a generation is finished is read from the checkpoint's step counter, not
 by counting frames. GROMACS writes a frame at step 0 too, so frame counting is
@@ -36,12 +38,14 @@ import os
 import re
 import shutil
 import signal
+import struct
 import subprocess as sp
 from pathlib import Path
 
 import numpy as np
 
 from . import utilities as util
+from .reimage import ANGSTROM_PER_NM, TRICLINIC_RTOL, BoxTypeError, is_orthorhombic
 
 
 # Preempt sentinel the SIGTERM trap touches; same name as simulate's.
@@ -97,6 +101,21 @@ CONCAT_CHUNK = 200
 # Coordinate agreement the merge demands of its own output, nm. Far under the
 # 5e-4 nm a silent drop to mdtraj's fixed 1e-3 xtc precision would cost.
 CONCAT_ATOL_NM = 1e-6
+
+# The only precision mdtraj's .xtc writer emits; it takes no parameter.
+MDTRAJ_XTC_PRECISION = 1000.0
+
+# Byte offset of the precision in an .xtc frame: magic, atom count, step and
+# time, then nine box floats, then the count that opens the coordinate block.
+XTC_PRECISION_OFFSET = 56
+
+# Atoms at or under which GROMACS stores coordinates raw, with no precision.
+XTC_UNCOMPRESSED_ATOMS = 9
+
+# Nominal clock LOOS's XTCWriter stamps frames with when it is not told one.
+# Every frame here is written with its own step and time, so it is never used.
+LOOS_WRITER_DT = 1.0
+LOOS_WRITER_STEPS_PER_FRAME = 1
 
 
 class Preempted(Exception):
@@ -321,6 +340,92 @@ def _kept_frames(parts, chunk=CONCAT_CHUNK):
                     break        # steps only rise, so the rest is overlap too
 
 
+def xtc_precision(traj_fn, offset=XTC_PRECISION_OFFSET,
+                  uncompressed_atoms=XTC_UNCOMPRESSED_ATOMS):
+    """The compressed-x-precision stamped on an .xtc's first frame, or None.
+
+    GROMACS writes the precision into every frame, at the head of the
+    compressed coordinate block. None means there is no precision to read: a
+    system of nine atoms or fewer is stored raw, and so loses nothing whichever
+    writer the merge picks.
+    """
+    with open(traj_fn, 'rb') as handle:
+        head = handle.read(offset + 4)
+    if len(head) < offset + 4:
+        return None
+    n_atoms = struct.unpack('>i', head[offset - 4:offset])[0]
+    if n_atoms <= uncompressed_atoms:
+        return None
+    return float(struct.unpack('>f', head[offset:offset + 4])[0])
+
+
+def _refuse_triclinic(box, frame, precision, mdtraj_precision=MDTRAJ_XTC_PRECISION,
+                      triclinic_rtol=TRICLINIC_RTOL):
+    """Raise unless this cell is one the fine-precision writer can represent."""
+    if is_orthorhombic(box, triclinic_rtol=triclinic_rtol):
+        return
+    raise BoxTypeError(
+        f'frame {frame} has a non-orthorhombic box:\n'
+        f'{np.array2string(np.asarray(box), precision=4)}\n'
+        f'and the parts were written at compressed-x-precision {precision:g}. '
+        f'No writer holds both: mdtraj writes an .xtc only at '
+        f'{mdtraj_precision:g}, and LOOS, which does take a precision, stores '
+        f'a periodic box as three numbers and would silently keep just the '
+        f'diagonal of this one. Set compressed-x-precision = '
+        f'{mdtraj_precision:g} for a triclinic cell.')
+
+
+def _loos_model(structure_fn, n_atoms):
+    """The LOOS AtomicGroup each merged frame is stamped onto before writing."""
+    import loos
+    if structure_fn is None:
+        raise ValueError(
+            'merging these parts needs the LOOS writer, which builds every '
+            'frame out of a model, so concat_parts needs structure_fn. Pass '
+            'the .gro the run was built from, or set compressed-x-precision to '
+            f'{MDTRAJ_XTC_PRECISION:g} so mdtraj can do the merge.')
+    model = loos.createSystem(str(structure_fn))
+    if len(model) != n_atoms:
+        raise ValueError(
+            f'{structure_fn} has {len(model)} atoms but the parts hold '
+            f'{n_atoms}; LOOS writes a frame out of the model, so the two have '
+            'to be the same system. A compressed-x-grps subset cannot be '
+            'merged at this precision.')
+    return model
+
+
+def _write_merged_loos(parts, out_p, structure_fn, precision, chunk=CONCAT_CHUNK,
+                       angstrom_per_nm=ANGSTROM_PER_NM, writer_dt=LOOS_WRITER_DT,
+                       steps_per_frame=LOOS_WRITER_STEPS_PER_FRAME):
+    """Stream the kept frames into out_p through LOOS; returns how many.
+
+    LOOS's XTCWriter takes a precision, which mdtraj's does not, so this is the
+    path for parts written finer than 1e-3 nm. mdtraj still does the reading:
+    LOOS's XTC reader is not wrapped for Python and cannot report the per-frame
+    step and time the generation chain is spliced on.
+
+    LOOS works in Angstroms and divides by ten again on the way out, so
+    coordinates and box go in scaled up -- in float64, because scaling the
+    float32 arrays mdtraj hands back would return a box a rounding step away
+    from the one the source part carries.
+    """
+    import loos
+    model, n_written = None, 0
+    writer = loos.XTCWriter(str(out_p), writer_dt, steps_per_frame,
+                            float(precision))
+    for xyz, time, step, box in _kept_frames(parts, chunk=chunk):
+        if model is None:
+            model = _loos_model(structure_fn, xyz.shape[1])
+        for index in range(len(step)):
+            _refuse_triclinic(box[index], n_written, precision)
+            model.setCoords(np.asarray(xyz[index], dtype=float) * angstrom_per_nm)
+            model.periodicBox(loos.GCoord(
+                *(np.diag(box[index]).astype(float) * angstrom_per_nm)))
+            writer.writeFrame(model, int(step[index]), float(time[index]))
+            n_written += 1
+    return n_written
+
+
 def _write_merged(parts, out_p, chunk=CONCAT_CHUNK):
     """Stream the kept frames of these parts into out_p; returns how many."""
     from mdtraj.formats import XTCTrajectoryFile
@@ -349,8 +454,8 @@ def verify_merge(parts, merged_p, chunk=CONCAT_CHUNK, atol_nm=CONCAT_ATOL_NM):
     """Read a merge back and check every frame against the part it came from.
 
     Coordinates that come back moved mean the rewrite requantised them, which
-    is what happens when the run wrote at a compressed-x-precision finer than
-    the 1000 mdtraj's xtc writer is fixed at. Returns the frames checked.
+    is what a writer coarser than the parts' own compressed-x-precision does.
+    Returns the frames checked.
     """
     import mdtraj
     n_checked = 0
@@ -371,12 +476,10 @@ def verify_merge(parts, merged_p, chunk=CONCAT_CHUNK, atol_nm=CONCAT_ATOL_NM):
                 raise RuntimeError(
                     f'{merged_p}: coordinates moved by up to {moved:.2e} nm '
                     f'between the source parts and the merge, from frame '
-                    f'{n_checked} on. mdtraj writes an .xtc at a fixed '
-                    f'precision of 1000 (1e-3 nm), so a run whose .mdp asks '
-                    f'for a finer compressed-x-precision cannot be merged '
-                    f'without being coarsened. Set compressed-x-precision to '
-                    f'1000, or merge these parts with a writer that can hold '
-                    f'your precision.')
+                    f'{n_checked} on, so the rewrite requantised them or kept '
+                    f'the wrong frames. The parts carry '
+                    f'compressed-x-precision {xtc_precision(parts[0])}; the '
+                    f'merge has to be written by a writer that holds it.')
             n_checked += len(step)
         if len(handle.read(1)[2]):
             raise RuntimeError(
@@ -386,14 +489,19 @@ def verify_merge(parts, merged_p, chunk=CONCAT_CHUNK, atol_nm=CONCAT_ATOL_NM):
 
 
 def concat_parts(gen_dir, out_fn, deffnm=DEFFNM, traj_suffix='.xtc',
-                 verify=True, chunk=CONCAT_CHUNK, atol_nm=CONCAT_ATOL_NM,
-                 mergeable_suffixes=MERGEABLE_SUFFIXES):
+                 structure_fn=None, verify=True, chunk=CONCAT_CHUNK,
+                 atol_nm=CONCAT_ATOL_NM, mergeable_suffixes=MERGEABLE_SUFFIXES,
+                 mdtraj_precision=MDTRAJ_XTC_PRECISION):
     """Merge a generation's parts into the one trajectory the orchestrator wants.
 
     Every frame keeps its own step, time and box: the generation chain is
     spliced on that clock. Where two parts cover the same steps the later part's
     frames are the ones that survive, which is only correct because callers move
     any part left behind by a rewound relaunch aside before it reaches this glob.
+
+    mdtraj writes the merge, at its fixed precision of 1000. Parts written finer
+    than that go to LOOS instead, which takes a precision but builds each frame
+    out of structure_fn and cannot represent a triclinic box.
 
     verify reads the merge back and compares it against the parts it came from.
     """
@@ -412,13 +520,23 @@ def concat_parts(gen_dir, out_fn, deffnm=DEFFNM, traj_suffix='.xtc',
     out_p = Path(out_fn)
     # Temp name, suffix kept so the writer reads the format from it.
     tmp_p = out_p.with_name(f'{out_p.stem}.concat-tmp{out_p.suffix}')
-    if len(parts) == 1:
-        # Copy, not rename, so re-running is idempotent and the part survives.
-        shutil.copy(parts[0], tmp_p)
-    else:
-        _write_merged(parts, tmp_p, chunk=chunk)
-        if verify:
-            verify_merge(parts, tmp_p, chunk=chunk, atol_nm=atol_nm)
+    precision = xtc_precision(parts[0])
+    fine = precision is not None and precision > mdtraj_precision
+    try:
+        if len(parts) == 1:
+            # Copy, not rename, so re-running is idempotent and the part survives.
+            shutil.copy(parts[0], tmp_p)
+        else:
+            if fine:
+                _write_merged_loos(parts, tmp_p, structure_fn, precision,
+                                   chunk=chunk)
+            else:
+                _write_merged(parts, tmp_p, chunk=chunk)
+            if verify:
+                verify_merge(parts, tmp_p, chunk=chunk, atol_nm=atol_nm)
+    except BaseException:
+        tmp_p.unlink(missing_ok=True)   # a refused merge leaves nothing behind
+        raise
     tmp_p.replace(out_p)
     return out_p
 
@@ -579,7 +697,8 @@ def gmx_generation(traj_dir_top_level: str,
                    title: str,
                    # gen 0: the starting .gro; gen N: the seed state.cpt.
                    seed_fn: str,
-                   # constant starting structure (.gro) for grompp -c at gen 0.
+                   # Constant starting structure (.gro): grompp -c at gen 0, and
+                   # the model a fine-precision part merge writes frames out of.
                    structure_fn: str = None,
                    # base .mdp; only generation 0 uses it.
                    mdp_fn: str = None,
@@ -731,7 +850,8 @@ def gmx_generation(traj_dir_top_level: str,
             f'(mdrun -maxh, or the scheduler stopped it). It will resume from '
             f'{own_cpt} on the next launch.')
 
-    concat_parts(gen_dir, traj, deffnm=deffnm, traj_suffix=traj_suffix)
+    concat_parts(gen_dir, traj, deffnm=deffnm, traj_suffix=traj_suffix,
+                 structure_fn=structure_fn)
     write_gen_status(gen_dir, target_step=target_step, reached_step=reached,
                      complete=True, gen_status_name=gen_status_name,
                      traj_fn=traj)
