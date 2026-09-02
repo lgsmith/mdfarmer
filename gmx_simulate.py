@@ -359,6 +359,29 @@ def xtc_precision(traj_fn, offset=XTC_PRECISION_OFFSET,
     return float(struct.unpack('>f', head[offset:offset + 4])[0])
 
 
+# Precisions already remarked on, so a packed job says it once, not per gen.
+_warned_precisions = set()
+
+
+def warn_fine_precision(precision, mdtraj_precision=MDTRAJ_XTC_PRECISION,
+                        warned=_warned_precisions):
+    """Print, once per precision per process, that a finer grid is being paid for."""
+    if precision in warned:
+        return
+    warned.add(precision)
+    print(f'[gmx] compressed-x-precision is {precision:g}, '
+          f'{precision / mdtraj_precision:g}x finer than the '
+          f'{mdtraj_precision:g} GROMACS defaults to. Are you sure about this? '
+          f'A {1 / precision:g} nm grid is far below the accuracy the force '
+          f'field itself has, so the extra digits store integrator noise, not '
+          f'signal, and every frame of the campaign pays for them. It also '
+          f'costs the merge its default writer: mdtraj cannot hold this '
+          f'precision, so parts are merged with LOOS, which needs a structure '
+          f'file and refuses a triclinic box. Set compressed-x-precision = '
+          f'{mdtraj_precision:g} unless you truly need the finer grid.',
+          flush=True)
+
+
 def _refuse_triclinic(box, frame, precision, mdtraj_precision=MDTRAJ_XTC_PRECISION,
                       triclinic_rtol=TRICLINIC_RTOL):
     """Raise unless this cell is one the fine-precision writer can represent."""
@@ -522,6 +545,8 @@ def concat_parts(gen_dir, out_fn, deffnm=DEFFNM, traj_suffix='.xtc',
     tmp_p = out_p.with_name(f'{out_p.stem}.concat-tmp{out_p.suffix}')
     precision = xtc_precision(parts[0])
     fine = precision is not None and precision > mdtraj_precision
+    if fine:
+        warn_fine_precision(precision, mdtraj_precision=mdtraj_precision)
     try:
         if len(parts) == 1:
             # Copy, not rename, so re-running is idempotent and the part survives.

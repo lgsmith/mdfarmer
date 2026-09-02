@@ -14,6 +14,7 @@ writer and merging, and the grid each merge lands on is measured rather than
 assumed.
 """
 import contextlib
+import io
 import shutil
 import struct
 import subprocess as sp
@@ -330,8 +331,22 @@ def main(gmx_bin=harness.GMX_BIN, overlap_frames=OVERLAP_FRAMES,
                 np.isclose(source_quantum, 1 / fine_precision,
                            rtol=QUANTUM_RTOL), f'-> {source_quantum:.3e} nm')
 
-    fine_merged = gs.concat_parts(fine, fine / 'prod.xtc',
-                                  structure_fn=structure)
+    gs._warned_precisions.clear()
+    said = io.StringIO()
+    with contextlib.redirect_stdout(said):
+        fine_merged = gs.concat_parts(fine, fine / 'prod.xtc',
+                                      structure_fn=structure)
+    warning = said.getvalue()
+    print(f'   {warning.strip()}', flush=True)
+    suite.check('the merge asks whether the finer grid is really wanted',
+                'Are you sure' in warning)
+    suite.check('and says what the accuracy is being spent on',
+                'force field' in warning and 'noise' in warning)
+    said = io.StringIO()
+    with contextlib.redirect_stdout(said):
+        gs.concat_parts(fine, fine / 'twice.xtc', structure_fn=structure)
+    suite.check('the warning is said once, not once per generation',
+                'Are you sure' not in said.getvalue())
     merged_without(suite, 'and the merge never reaches the mdtraj writer',
                    '_write_merged',
                    lambda: gs.concat_parts(fine, fine / 'loos-only.xtc',
