@@ -133,11 +133,11 @@ and the seeds. `nsteps` is the campaign-absolute step a generation must reach,
 so `init-step` is pinned to 0; a base `.mdp` that sets it gets a note on stdout
 and is overridden. Everything else is inherited verbatim.
 
-Every launch writes its own `prod.partNNNN.xtc`, merged with `gmx trjcat` when
-the generation finishes. Where two parts cover the same time trjcat keeps the
-**later** file's frames, so a part left behind by a relaunch that rewound to an
-earlier checkpoint is renamed out of the way first — otherwise trjcat would
-splice the abandoned branch into the one that actually continued.
+Every launch writes its own `prod.partNNNN.xtc`, merged with `concat_parts` when
+the generation finishes. Where two parts cover the same steps the **later**
+file's frames are the ones kept, so a part left behind by a relaunch that
+rewound to an earlier checkpoint is renamed out of the way first — otherwise the
+merge would splice the abandoned branch into the one that actually continued.
 
 Generation 0 is built with `grompp -c` from `seed_fn` when that is a structure
 file, falling back to `structure_fn`. That is what lets seeds differ in
