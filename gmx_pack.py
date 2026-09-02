@@ -31,8 +31,14 @@ from pathlib import Path
 from . import gmx_simulate as gmx
 
 
-# mdrun pinning stride. 1 keeps a replica's threads on consecutive cores.
+# mdrun pinning stride. 1 keeps a replica's threads on consecutive cores, which
+# holds only where a logical core is a physical core; a node exposing
+# hyperthreads wants 2. Configurable because GROMACS has no '-pin inherit'.
 PIN_STRIDE = 1
+
+# mdrun -pin mode. 'on' is right where the offsets are cpuset-relative, which is
+# what a partial allocation gives; a whole-node job may want 'off' instead.
+PIN_MODE = 'on'
 
 # Manifest a packed job's run.py reads: which generation directories to advance.
 PACK_MANIFEST_NAME = 'pack.json'
@@ -108,9 +114,13 @@ def member_core_layout(cpus_per_task, n_replicas, member_cores=None):
 
 
 def replica_mdrun_args(base_args, replica_index, n_replicas, cpus_per_task,
-                       pin_stride=PIN_STRIDE, ntmpi=NTMPI, member_cores=None,
+                       pin_mode=PIN_MODE, pin_stride=PIN_STRIDE, ntmpi=NTMPI,
+                       member_cores=None,
                        per_replica_flags=PER_REPLICA_MDRUN_FLAGS):
     """This replica's mdrun flags: the shared ones, plus its own core block.
+
+    pin_mode and pin_stride are what '-pin' and '-pinstride' become, so a node
+    that exposes hyperthreads or hands over every core can say so.
 
     Raises rather than handing out more cores than the job holds, which is the
     silent slowdown this exists to prevent.
@@ -134,7 +144,7 @@ def replica_mdrun_args(base_args, replica_index, n_replicas, cpus_per_task,
     # ntmpi=None means "this build cannot take the flag"; see NTMPI above.
     rank_args = [] if ntmpi is None else ['-ntmpi', str(ntmpi)]
     return stripped + rank_args + [
-        '-ntomp', str(ntomp), '-pin', 'on',
+        '-ntomp', str(ntomp), '-pin', str(pin_mode),
         '-pinoffset', str(offset),
         '-pinstride', str(pin_stride)]
 
@@ -236,6 +246,7 @@ def _resolve_cpus_per_task(manifest):
 
 def gmx_pack_sim_block_json(manifest_fn=PACK_MANIFEST_NAME,
                             poll_seconds=POLL_SECONDS,
+                            pin_mode=PIN_MODE,
                             pin_stride=PIN_STRIDE,
                             pack_status_name=PACK_STATUS_NAME,
                             ntmpi=NTMPI,
@@ -304,7 +315,7 @@ def gmx_pack_sim_block_json(manifest_fn=PACK_MANIFEST_NAME,
                 conf.pop(key, None)
             conf['mdrun_args'] = replica_mdrun_args(
                 conf.get('mdrun_args'), index, n_replicas, cpus_per_task,
-                pin_stride=pin_stride, ntmpi=ntmpi,
+                pin_mode=pin_mode, pin_stride=pin_stride, ntmpi=ntmpi,
                 member_cores=member_cores)
             traj = gmx.gmx_generation(**runtime_kwargs, **conf)
         except gmx.Preempted as exc:

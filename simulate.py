@@ -47,9 +47,13 @@ class _TandemDCDReporter:
 
     DCD carries no velocity or force field, so the position slot is repurposed
     and the file rides alongside the position trajectory frame-for-frame. The
-    numbers on disk are in the quantity's native units — nm/ps for velocities,
-    kJ/(mol·nm) for forces — but labelled nanometers, so a reader has to know
-    which quantity a given file holds.
+    native numbers — nm/ps for velocities, kJ/(mol·nm) for forces — are handed
+    to DCDFile.writeModel labelled nanometers, and writeModel stores 10*x, so
+    the bytes on disk are ten times native. What a reader hands back therefore
+    depends on the reader: mdtraj.load reads DCD as angstroms and divides,
+    returning native values, while LOOS keeps angstroms and returns ten times
+    native, so LOOS output has to be divided by 10. Nothing in the file records
+    which quantity it holds.
     """
 
     def __init__(self, file, reportInterval, quantity, append=False,
@@ -100,11 +104,15 @@ class _TandemDCDReporter:
 class _TandemXTCReporter:
     """Write velocities or forces into the position slot of an XTC file.
 
-    Same repurposing and same unit labelling as _TandemDCDReporter, but XTC's
-    writer additionally requires abs(value) * 1000 to fit in int32 (~2.1e6 nm
-    after scaling). Velocities (a few nm/ps) and bonded forces (up to ~1e5
-    kJ/mol/nm) both clear that bound, but XTC compression is lossy — use .dcd
-    if you need full precision on saved velocities or forces.
+    Same repurposing as _TandemDCDReporter, but not the same bytes: XTCFile
+    stores the number it is given, so an XTC holds native nm/ps or kJ/(mol·nm)
+    where the DCD holds ten times that. Readers land in the same place as for
+    the DCD, for the opposite reason — mdtraj.load reads XTC as nanometers and
+    returns native values, LOOS converts nm to angstroms and returns ten times
+    native. XTC's writer additionally requires abs(value) * 1000 to fit in int32
+    (~2.1e6 nm after scaling). Velocities (a few nm/ps) and bonded forces (up to
+    ~1e5 kJ/mol/nm) both clear that bound, but XTC compression is lossy — it
+    keeps three decimals — so use .dcd if you need full precision.
     """
 
     def __init__(self, file, reportInterval, quantity, append=False,
@@ -144,10 +152,16 @@ class _TandemXTCReporter:
 
 
 class _TandemHDF5Reporter:
-    """Write velocities or forces to an HDF5 trajectory file.
+    """Write velocities or forces into the coordinates field of an HDF5 file.
 
-    Velocities go into the native velocities field; forces are shoehorned into
-    the coordinates field, since HDF5TrajectoryFile.write has no forces kwarg.
+    Both quantities go into coordinates: HDF5TrajectoryFile.write has no forces
+    kwarg, and velocities are passed with velocities=None, so the file carries
+    no /velocities node at all — only /coordinates and /topology. Unlike the DCD
+    and XTC cases there is no unit tell, so a reader cannot see from the numbers
+    that they are not positions. Those numbers are native, nm/ps for velocities
+    and kJ/(mol·nm) for forces, and mdtraj.load returns them unchanged; LOOS
+    does not read this format. omm_generation's embed_velocities is the path
+    that writes a real /velocities node, alongside genuine positions.
     """
 
     def __init__(self, file, reportInterval, quantity, append=False,
@@ -180,7 +194,7 @@ class _TandemHDF5Reporter:
             self._initialize(simulation)
         if self._quantity == 'velocities':
             vels = state.getVelocities(asNumpy=True)
-            # nm/ps — matches HDF5TrajectoryFile's expected velocity units
+            # nm/ps numbers, written into the coordinate slot like the forces.
             vels_nm_ps = vels.value_in_unit(unit.nanometer / unit.picosecond)
             self._traj_file.write(coordinates=vels_nm_ps, velocities=None)
         else:
