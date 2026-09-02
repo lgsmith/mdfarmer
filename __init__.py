@@ -46,4 +46,4 @@ __all__ = ['fdir', 'dir_seeds_clones', 'dir_seeds_clones_gens', 'omm_generation'
            'gmx_pack', 'gmx_pack_sim_block_json', 'replica_mdrun_args',
            'write_pack_manifest', 'default_gmx_pack_run_script',
            'ClonePack', 'basic_scheduler_fstrings_mps',
-           'missing_seed_inputs', 'ready_seed_count']
+           'missing_seed_inputs', 'ready_seed_count', 'check_seed_map']

@@ -78,7 +78,7 @@ class Farmer:
                  'pack_cpus_per_task', 'pack_scheduler_fstring',
                  'pack_run_script', 'pack_member_cores',
                  'seed_config_overrides', 'submit_failure_limit',
-                 'submit_failures')
+                 'submit_failures', 'seed_labels')
 
     def update_jids(self):
         """Refresh the set of job ids the scheduler says are ours and alive.
@@ -109,6 +109,21 @@ class Farmer:
             return p
         else:
             raise FileNotFoundError(p)
+
+    def check_seed_map(self, tdir, seed_map_name=util.SEED_MAP_NAME):
+        """Check this boot's seed labels against the campaign's record of them.
+
+        Without seed_labels nothing is bound, but a record left by an earlier
+        boot means the guard was in use and is now off, which is worth saying.
+        """
+        seed_map_p = Path(tdir) / seed_map_name
+        if self.seed_labels is None:
+            if seed_map_p.is_file():
+                print(f'WARNING: {seed_map_p} records what each seed index '
+                      'means, but this boot passed no seed_labels, so a '
+                      'reordered seed_structure_fns will not be caught.')
+            return None
+        return util.check_seed_map(seed_map_p, self.seed_labels)
 
     def mark_clone_failed(self, clone):
         """Move a clone off the active list and onto the failed one."""
@@ -333,6 +348,9 @@ class Farmer:
                  pack_member_cores=None,
                  # One dict per seed, laid over config_template. n_seeds long.
                  seed_config_overrides=None,
+                 # One label per seed, checked against the campaign's record of
+                 # what each seed index means. n_seeds long; None checks nothing.
+                 seed_labels=None,
                  sep='-',
                  seeds_first=True,
                  job_name_elements=(
@@ -374,6 +392,7 @@ class Farmer:
         self.pack_member_cores = pack_member_cores
         self.seed_config_overrides = seed_slice(
             'seed_config_overrides', seed_config_overrides, n_seeds)
+        self.seed_labels = seed_slice('seed_labels', seed_labels, n_seeds)
         # gen-seed is base + stride * seed_index + clone_index.
         gen_seed_stride = config_template.get('gen_seed_stride',
                                               gmx.GEN_SEED_STRIDE)
@@ -440,6 +459,8 @@ class Farmer:
             str(self.check_path(Path(s).resolve()))
             for s in seed_slice('seed_structure_fns', seed_structure_fns,
                                 n_seeds)]
+        # Before any directory is made, so a re-index refuses rather than runs.
+        self.check_seed_map(self.config_template['traj_dir_top_level'])
 
         self.sep = sep
         self.config_template['sep'] = self.sep
