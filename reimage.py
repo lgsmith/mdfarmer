@@ -6,19 +6,20 @@ is wrong: radius of gyration, RMSD, contacts, a picture.
 
 Two backends. LOOS handles rectangular boxes and is refused anything else, since
 its periodic box is three numbers and it keeps only the diagonal of a triclinic
-one without complaining. Anything else goes to gmx trjconv, which does triclinic
-correctly. reimage_trajectory reads the box and picks for you.
+one without complaining. Anything else goes to mdtraj, which carries the full
+3x3 cell. reimage_trajectory reads the box and picks for you.
 
 Which atoms make up a molecule always comes from the GROMACS topology, never
-from LOOS. A .gro carries no bonds, and LOOS treats a model with no bonds as one
-single molecule, so reimaging would quietly become one system-wide shift.
+from the structure file. A .gro carries no bonds; LOOS treats a model with no
+bonds as one single molecule, so reimaging would quietly become one system-wide
+shift, and mdtraj's find_molecules() makes every atom its own molecule, so
+reimaging would become a per-atom wrap that breaks molecules irrecoverably.
 
 Nothing here overwrites its input: the orchestrator counts frames in the raw
 trajectory to decide whether a generation has finished.
 """
 
 import os
-import subprocess as sp
 from pathlib import Path
 
 import numpy as np
@@ -33,18 +34,7 @@ TRICLINIC_RTOL = 1e-6
 # Backend selectors for reimage_trajectory.
 BACKEND_AUTO = 'auto'
 BACKEND_LOOS = 'loos'
-BACKEND_TRJCONV = 'trjconv'
-
-# trjconv flags. '-pbc mol' makes each molecule whole and puts its centre of
-# mass in the box; '-ur compact' gives a dodecahedron its compact shape.
-TRJCONV_PBC = 'mol'
-TRJCONV_UR = 'compact'
-
-# Default GROMACS binary. Sites that build an MPI-only GROMACS have gmx_mpi.
-GMX_BIN = 'gmx'
-
-# What the runner calls a generation's tpr, when its config does not say.
-TPR_NAME = 'prod.tpr'
+BACKEND_MDTRAJ = 'mdtraj'
 
 # Appended to the input stem to name the output, e.g. prod.xtc -> prod-whole.xtc.
 OUTPUT_TAG = '-whole'
@@ -56,9 +46,6 @@ MAX_BOND = 0.25
 # Frames read per chunk when scanning a trajectory, so a multi-GB .xtc never
 # has to be resident.
 SCAN_CHUNK = 200
-
-# Index group fed to trjconv on stdin. 0 is 'System' in the default group set.
-TRJCONV_OUTPUT_GROUP = '0'
 
 # LOOS reads and writes Angstroms; GROMACS .gro/.xtc are nm.
 ANGSTROM_PER_NM = 10.0
@@ -297,7 +284,8 @@ def check_anchor_distances(traj_fn, ranges, structure_fn=None,
     molecule's first atom, so it is right only while no atom is more than half a
     box edge away. This says whether that holds, which is a question about the
     LOOS backend rather than about the trajectory: a molecule is allowed to be
-    bigger than half the box, but then trjconv has to do the reimaging.
+    bigger than half the box, but then the mdtraj backend has to do the
+    reimaging, since it walks the bonds instead.
 
     It also catches an unbonded atom stranded far from its molecule, which every
     bond-length check misses because it has no bonds to be long.
@@ -377,8 +365,7 @@ def reimage_with_loos(traj_fn, structure_fn, out_fn, top_fn=None,
             f'{traj_p} has a non-orthorhombic box:\n{np.array2string(box, precision=4)}\n'
             'LOOS represents a periodic box as three numbers and would silently '
             'keep only the diagonal, making every minimum-image result wrong. '
-            f'Use the {BACKEND_TRJCONV!r} backend (gmx trjconv -pbc mol -ur '
-            'compact) for this cell.')
+            f'Use the {BACKEND_MDTRAJ!r} backend for this cell.')
 
     if ranges is None:
         if top_fn is None:
@@ -450,12 +437,12 @@ def reimage_with_loos(traj_fn, structure_fn, out_fn, top_fn=None,
 
 def _verify_reimaged(out_p, top_fn=None, include_dir=None, ranges=None,
                      structure_fn=None, max_bond=MAX_BOND):
-    """Check a just-reimaged trajectory, since LOOS can fail quietly.
+    """Check a just-reimaged trajectory, since imaging can fail quietly.
 
-    Two independent checks. A bond longer than max_bond says a molecule is still
-    split. The anchor margin says whether mergeImage() was even entitled to an
-    answer, and is the only one that catches an atom with no bonds stranded from
-    its own molecule, which no bond length can be long enough to reveal.
+    A bond longer than max_bond says a molecule is still split, whichever
+    backend wrote the file. Given ranges it also measures the anchor margin,
+    which says whether LOOS's mergeImage() was entitled to an answer and is the
+    only check that catches an unbonded atom stranded from its own molecule.
     """
     margin = None
     if ranges is not None:
@@ -466,7 +453,7 @@ def _verify_reimaged(out_p, top_fn=None, include_dir=None, ranges=None,
         f'axis {margin["axis"]} from its molecule\'s anchor atom, past the '
         f'{margin["limit"]:.3f} nm half-edge limit mergeImage() assumes, so '
         f'this system is outside the LOOS backend\'s safe regime. Use the '
-        f'{BACKEND_TRJCONV!r} backend.')
+        f'{BACKEND_MDTRAJ!r} backend.')
 
     if top_fn is not None:
         n_bad, violations = check_bond_lengths(
@@ -504,95 +491,173 @@ def loos_xtc_writer(out_p):
     return loos.XTCWriter(str(out_p))
 
 
-def reimage_with_trjconv(traj_fn, tpr_fn, out_fn, gmx_bin=GMX_BIN,
-                         pbc=TRJCONV_PBC, ur=TRJCONV_UR,
-                         output_group=TRJCONV_OUTPUT_GROUP,
-                         center_group=None, index_fn=None,
-                         skip_first_frame=False, output_tag=OUTPUT_TAG):
-    """Make molecules whole with gmx trjconv, for any box including triclinic.
+class _MdtrajWriter:
+    """Writer that appends, which Trajectory.save() cannot do."""
 
-    -pbc mol needs the .tpr, which is where molecule definitions live. There is
-    deliberately no -fit option: GROMACS cannot combine it with -pbc in one pass
-    and gives a wrong answer if asked to, so fit in a second call.
+    def __init__(self, out_p, angstrom_per_nm=ANGSTROM_PER_NM):
+        import mdtraj as md
+        self.suffix = out_p.suffix.lower()
+        self.angstrom_per_nm = angstrom_per_nm
+        if self.suffix == '.xtc':
+            self.fh = md.formats.XTCTrajectoryFile(str(out_p), 'w')
+        elif self.suffix == '.dcd':
+            self.fh = md.formats.DCDTrajectoryFile(str(out_p), 'w')
+        else:
+            raise ValueError(
+                f'{out_p.suffix} is not a format the mdtraj backend writes; '
+                'use .xtc or .dcd')
+
+    def write(self, traj, step=None):
+        if self.suffix == '.xtc':
+            # Without an explicit step mdtraj writes the frame index, which
+            # silently replaces the MD step counter with a small integer.
+            self.fh.write(traj.xyz, time=traj.time, step=step,
+                          box=traj.unitcell_vectors)
+        else:
+            self.fh.write(traj.xyz * self.angstrom_per_nm,
+                          cell_lengths=(None if traj.unitcell_lengths is None
+                                        else traj.unitcell_lengths
+                                        * self.angstrom_per_nm),
+                          cell_angles=traj.unitcell_angles)
+
+    def close(self):
+        self.fh.close()
+
+
+def mdtraj_topology(top_fn, include_dir=None):
+    """The mdtraj Topology for a GROMACS .top, carrying its molecules and bonds."""
+    import mdtraj as md
+    return md.Topology.from_openmm(
+        gromacs_topology(top_fn, include_dir=include_dir))
+
+
+def molecule_atoms(topology, ranges):
+    """One list of mdtraj Atom objects per molecule block in ranges."""
+    atoms = list(topology.atoms)
+    if len(atoms) != ranges[-1][1]:
+        raise ValueError(
+            f'the topology has {len(atoms)} atoms but the molecule ranges '
+            f'cover {ranges[-1][1]}; they do not describe the same system.')
+    return [atoms[start:stop] for start, stop in ranges]
+
+
+def largest_molecule(ranges):
+    """Index of the molecule block with the most atoms, the solute if there is one."""
+    return int(np.argmax([stop - start for start, stop in ranges]))
+
+
+def check_bonds_within_molecules(pairs, ranges):
+    """Raise unless every bond joins two atoms of the same molecule block.
+
+    The analogue of the LOOS backend's splitByMolecule() count check: a bond
+    crossing a block means the blocks being imaged are not the molecules, and
+    wrapping them per block would tear a real molecule apart.
     """
+    counts = [stop - start for start, stop in ranges]
+    molecule_of = np.repeat(np.arange(len(ranges)), counts)
+    if pairs.max() >= len(molecule_of):
+        raise ValueError(
+            f'a bond names atom {pairs.max()} but the molecule ranges cover '
+            f'only {len(molecule_of)} atoms.')
+    crossing = molecule_of[pairs[:, 0]] != molecule_of[pairs[:, 1]]
+    if crossing.any():
+        i, j = pairs[int(np.argmax(crossing))]
+        raise ValueError(
+            f'bond {i}-{j} joins two different molecule blocks '
+            f'({int(molecule_of[i])} and {int(molecule_of[j])}) of the '
+            f'{len(ranges)} the topology declares; refusing to reimage against '
+            'a grouping that does not match the bonds.')
+
+
+def _step_numbers(timing, index):
+    """MD step of each frame at index, or None for a format that keeps its own."""
+    return None if timing is None else timing[0] + index * timing[1]
+
+
+def reimage_with_mdtraj(traj_fn, top_fn, out_fn, ranges=None, pairs=None,
+                        include_dir=None, anchor_index=None,
+                        skip_first_frame=False, verify=True,
+                        max_bond=MAX_BOND, output_tag=OUTPUT_TAG,
+                        scan_chunk=SCAN_CHUNK):
+    """Make molecules whole and wrap them per molecule, with mdtraj.
+
+    Any cell, triclinic included, which is the reason this backend exists.
+    Molecules and bonds are read from top_fn and handed to image_molecules
+    explicitly: left to itself mdtraj calls find_molecules(), which strands
+    every unbonded atom in a molecule of its own and images the system atom by
+    atom, and no later pass can put those molecules back together.
+
+    anchor_index names the molecule centred in the box, the largest by default.
+    One anchor is what keeps the wrap tight and is far cheaper than anchoring
+    on every molecule.
+
+    Returns (out_p, n_written).
+    """
+    import mdtraj as md
     traj_p, out_p = Path(traj_fn), Path(out_fn)
     if out_p.resolve() == traj_p.resolve():
         raise ValueError(
-            f'refusing to reimage {traj_p} onto itself; write to a new file '
-            f'(e.g. {traj_p.stem}{output_tag}{traj_p.suffix}).')
-    if tpr_fn is None or not Path(tpr_fn).is_file():
-        raise FileNotFoundError(
-            f'{tpr_fn}: gmx trjconv -pbc {pbc} needs the run .tpr for molecule '
-            'definitions')
-
-    cmd = [gmx_bin, 'trjconv', '-s', str(tpr_fn), '-f', str(traj_p),
-           '-o', str(out_p), '-pbc', pbc, '-ur', ur]
-    if index_fn:
-        cmd += ['-n', str(index_fn)]
-    if center_group is not None:
-        cmd += ['-center']
-    if skip_first_frame:
-        # -b is a time, and trjconv's own frame 0 is the duplicate of the
-        # previous generation's last frame; ask for everything strictly after it.
-        first_time = _first_frame_time(traj_p)
-        cmd += ['-b', repr(first_time + _frame_spacing(traj_p))]
-
-    groups = [] if center_group is None else [str(center_group)]
-    groups.append(str(output_group))
-    stdin = '\n'.join(groups) + '\n'
-
-    print('[reimage]', ' '.join(cmd), f'<<< {groups}', flush=True)
-    result = sp.run(cmd, input=stdin, text=True, capture_output=True)
-    if result.returncode != 0:
-        raise RuntimeError(
-            f'gmx trjconv exited {result.returncode}\n'
-            f'--- stdout ---\n{result.stdout}\n--- stderr ---\n{result.stderr}')
-    if not out_p.is_file() or out_p.stat().st_size == 0:
-        raise RuntimeError(
-            f'gmx trjconv reported success but {out_p} is missing or empty\n'
-            f'{result.stderr}')
-    return out_p
-
-
-def _frame_times(traj_p, limit=2):
-    """First limit frame times (ps) of an .xtc."""
-    import mdtraj
-    if traj_p.suffix.lower() != '.xtc':
+            f'refusing to reimage {traj_p} onto itself; the orchestrator counts '
+            f'frames in the raw trajectory to decide whether a generation is '
+            f'complete. Write to a new file (e.g. {traj_p.stem}{output_tag}'
+            f'{traj_p.suffix}).')
+    if top_fn is None:
         raise ValueError(
-            f'{traj_p.suffix}: frame times for skip_first_frame are only read '
-            'from .xtc')
-    with mdtraj.open(str(traj_p)) as fh:
-        frame = fh.read(limit)
-    return np.asarray(frame[1], dtype=float)
+            'reimage_with_mdtraj needs top_fn: the GROMACS topology is the '
+            'only place molecule blocks and bonds are recorded, and mdtraj '
+            'would otherwise image this trajectory atom by atom.')
 
+    topology = mdtraj_topology(top_fn, include_dir=include_dir)
+    if ranges is None:
+        ranges = molecule_ranges(top_fn, include_dir=include_dir)
+    if pairs is None:
+        pairs = bond_pairs(top_fn, include_dir=include_dir)
+    check_bonds_within_molecules(pairs, ranges)
 
-def _first_frame_time(traj_p):
-    times = _frame_times(traj_p, limit=1)
-    if times.size < 1:
-        raise ValueError(f'{traj_p} has no frames')
-    return float(times[0])
+    molecules = molecule_atoms(topology, ranges)
+    if anchor_index is None:
+        anchor_index = largest_molecule(ranges)
+    anchor = molecules[anchor_index]
+    others = molecules[:anchor_index] + molecules[anchor_index + 1:]
 
+    with md.open(str(traj_p)) as fh:
+        timing = util.frame_timing(traj_p, n_frames=len(fh))
 
-def _frame_spacing(traj_p):
-    times = _frame_times(traj_p, limit=2)
-    if times.size < 2:
-        raise ValueError(
-            f'{traj_p} has fewer than two frames; cannot infer frame spacing '
-            'to skip the duplicate boundary frame')
-    return float(times[1] - times[0])
+    writer = _MdtrajWriter(out_p)
+    n_read = n_written = 0
+    try:
+        for chunk in md.iterload(str(traj_p), top=topology, chunk=scan_chunk):
+            index = np.arange(n_read, n_read + chunk.n_frames)
+            keep = (index > 0) if skip_first_frame else np.ones(len(index), bool)
+            chunk.image_molecules(inplace=True, anchor_molecules=[anchor],
+                                  other_molecules=others, make_whole=True)
+            if keep.any():
+                writer.write(chunk[keep],
+                             step=_step_numbers(timing, index[keep]))
+                n_written += int(keep.sum())
+            n_read += chunk.n_frames
+    finally:
+        writer.close()
+
+    if verify:
+        # No ranges: the anchor margin measures the half-edge assumption in
+        # LOOS's mergeImage(), which walking the bonds does not make.
+        _verify_reimaged(out_p, top_fn=top_fn, include_dir=include_dir,
+                         max_bond=max_bond)
+    return out_p, n_written
 
 
 def reimage_trajectory(traj_fn, out_fn=None, structure_fn=None, top_fn=None,
-                       tpr_fn=None, backend=BACKEND_AUTO, include_dir=None,
-                       center_selection=None, center_group=None,
-                       index_fn=None, skip_first_frame=False,
-                       gmx_bin=GMX_BIN, triclinic_rtol=TRICLINIC_RTOL,
-                       output_tag=OUTPUT_TAG, pbc=TRJCONV_PBC, ur=TRJCONV_UR):
+                       backend=BACKEND_AUTO, include_dir=None,
+                       center_selection=None, anchor_index=None,
+                       skip_first_frame=False, triclinic_rtol=TRICLINIC_RTOL,
+                       output_tag=OUTPUT_TAG):
     """Reimage a trajectory, choosing the backend from its own box.
 
-    'auto' sends a rectangular box to LOOS and anything else to gmx trjconv.
-    Force 'trjconv' when there is no .top, or to match someone else's pipeline.
-    Returns the output path, and never touches the input.
+    'auto' sends a rectangular box to LOOS and anything else to mdtraj, which
+    is the only backend here that can represent a triclinic cell. Force
+    'mdtraj' when there is no structure file, or when a molecule is larger than
+    half a box edge. Returns the output path, and never touches the input.
     """
     traj_p = Path(traj_fn)
     if out_fn is None:
@@ -601,14 +666,14 @@ def reimage_trajectory(traj_fn, out_fn=None, structure_fn=None, top_fn=None,
     if backend == BACKEND_AUTO:
         box = box_vectors(traj_fn=traj_p, structure_fn=structure_fn)
         orthorhombic = is_orthorhombic(box, triclinic_rtol=triclinic_rtol)
-        backend = BACKEND_LOOS if orthorhombic else BACKEND_TRJCONV
+        backend = BACKEND_LOOS if orthorhombic else BACKEND_MDTRAJ
         print(f'[reimage] box is '
               f'{"orthorhombic" if orthorhombic else "triclinic"}; '
               f'using the {backend} backend', flush=True)
         if backend == BACKEND_LOOS and structure_fn is None:
             print('[reimage] no structure_fn given for the LOOS backend; '
-                  'falling back to trjconv', flush=True)
-            backend = BACKEND_TRJCONV
+                  'falling back to mdtraj', flush=True)
+            backend = BACKEND_MDTRAJ
 
     if backend == BACKEND_LOOS:
         out_p, _ = reimage_with_loos(
@@ -617,21 +682,21 @@ def reimage_trajectory(traj_fn, out_fn=None, structure_fn=None, top_fn=None,
             skip_first_frame=skip_first_frame,
             triclinic_rtol=triclinic_rtol, output_tag=output_tag)
         return out_p
-    if backend == BACKEND_TRJCONV:
-        return reimage_with_trjconv(
-            traj_p, tpr_fn, out_fn, gmx_bin=gmx_bin, pbc=pbc, ur=ur,
-            center_group=center_group, index_fn=index_fn,
-            skip_first_frame=skip_first_frame, output_tag=output_tag)
+    if backend == BACKEND_MDTRAJ:
+        out_p, _ = reimage_with_mdtraj(
+            traj_p, top_fn, out_fn, include_dir=include_dir,
+            anchor_index=anchor_index, skip_first_frame=skip_first_frame,
+            output_tag=output_tag)
+        return out_p
     raise ValueError(
         f'unknown backend {backend!r}; choose from '
-        f'{[BACKEND_AUTO, BACKEND_LOOS, BACKEND_TRJCONV]}')
+        f'{[BACKEND_AUTO, BACKEND_LOOS, BACKEND_MDTRAJ]}')
 
 
 def reimage_gen_dir(gen_dir, config=None, backend=BACKEND_AUTO,
-                    include_dir=None, center_selection=None, center_group=None,
-                    skip_first_frame=None, gmx_bin=GMX_BIN,
-                    output_tag=OUTPUT_TAG, triclinic_rtol=TRICLINIC_RTOL,
-                    tpr_name=TPR_NAME):
+                    include_dir=None, center_selection=None, anchor_index=None,
+                    skip_first_frame=None, output_tag=OUTPUT_TAG,
+                    triclinic_rtol=TRICLINIC_RTOL):
     """Reimage one generation directory, writing beside the raw trajectory.
 
     Reads config.json for the trajectory name, topology, structure and, when
@@ -653,15 +718,13 @@ def reimage_gen_dir(gen_dir, config=None, backend=BACKEND_AUTO,
     if skip_first_frame is None:
         skip_first_frame = config.get('gen_index', 0) > 0
 
-    tpr_p = gen_p / config.get('tpr_name', tpr_name)
     return reimage_trajectory(
         traj_p,
         structure_fn=config.get('structure_fn'),
         top_fn=config.get('top_fn'),
-        tpr_fn=tpr_p if tpr_p.is_file() else None,
         backend=backend, include_dir=include_dir,
-        center_selection=center_selection,
-        center_group=center_group, skip_first_frame=skip_first_frame,
-        gmx_bin=gmx_bin, triclinic_rtol=triclinic_rtol, output_tag=output_tag)
+        center_selection=center_selection, anchor_index=anchor_index,
+        skip_first_frame=skip_first_frame,
+        triclinic_rtol=triclinic_rtol, output_tag=output_tag)
 
 

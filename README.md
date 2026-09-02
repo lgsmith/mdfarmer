@@ -133,11 +133,11 @@ and the seeds. `nsteps` is the campaign-absolute step a generation must reach,
 so `init-step` is pinned to 0; a base `.mdp` that sets it gets a note on stdout
 and is overridden. Everything else is inherited verbatim.
 
-Every launch writes its own `prod.partNNNN.xtc`, merged with `gmx trjcat` when
-the generation finishes. Where two parts cover the same time trjcat keeps the
-**later** file's frames, so a part left behind by a relaunch that rewound to an
-earlier checkpoint is renamed out of the way first — otherwise trjcat would
-splice the abandoned branch into the one that actually continued.
+Every launch writes its own `prod.partNNNN.xtc`, merged with `concat_parts` when
+the generation finishes. Where two parts cover the same steps the **later**
+file's frames are the ones kept, so a part left behind by a relaunch that
+rewound to an earlier checkpoint is renamed out of the way first — otherwise the
+merge would splice the abandoned branch into the one that actually continued.
 
 Generation 0 is built with `grompp -c` from `seed_fn` when that is a structure
 file, falling back to `structure_fn`. That is what lets seeds differ in
@@ -261,7 +261,7 @@ from mdfarmer import reimage
 
 # picks the backend from the box actually recorded in the trajectory
 reimage.reimage_trajectory('prod.xtc', structure_fn='start.gro',
-                           top_fn='topol.top', tpr_fn='prod.tpr')
+                           top_fn='topol.top')
 # -> prod-whole.xtc   (the raw prod.xtc is never touched)
 ```
 
@@ -270,9 +270,9 @@ reimage.reimage_trajectory('prod.xtc', structure_fn='start.gro',
   raising* — hand it a rhombic dodecahedron and it reports a rectangular cell
   and every minimum-image result downstream is quietly wrong. So this backend
   refuses a non-orthorhombic cell rather than producing plausible garbage.
-* **`'trjconv'` — any cell, and the only option for triclinic.** Shells out to
-  `gmx trjconv -pbc mol -ur compact`, which needs the run's `.tpr` because that
-  is where molecule definitions live.
+* **`'mdtraj'` — any cell, and the only option for triclinic.** Carries the full
+  3x3 box, makes each molecule whole along its bonds and wraps it in beside an
+  anchor molecule — the largest by default, so the solute stays centred.
 
 Two things worth knowing:
 
@@ -281,14 +281,17 @@ bonds, and a bondless LOOS model makes `splitByMolecule()` return *one group
 containing the whole system* — reimaging then degenerates into a single global
 translation that looks like it worked. Bonds alone are not enough either: a
 TIP4P-ice virtual site is bonded to nothing, so connected components over bonds
-strand every `MW` in its own "molecule". Molecule blocks are therefore read from
-the GROMACS `.top` through `openmm.app.GromacsTopFile`, whose chains reproduce
-the `[ molecules ]` section exactly.
+strand every `MW` in its own "molecule" — which is also what mdtraj's
+`find_molecules()` does on a topology with no bonds at all, turning imaging into
+a per-atom wrap that no later pass can undo. Molecule blocks are therefore read
+from the GROMACS `.top` through `openmm.app.GromacsTopFile`, whose chains
+reproduce the `[ molecules ]` section exactly, and handed to whichever backend
+runs.
 
 **Reimaging is checked, not trusted.** There are many ways imaging-by-atom goes
-wrong quietly, so the LOOS backend verifies its own output against a physical
+wrong quietly, so both backends verify their own output against a physical
 invariant — bond lengths, computed *without* the minimum-image convention,
-against LOOS's `long-bond-finder` cutoff of 2.5 Å — and raises if any bond is
+against LOOS's `long-bond-finder` cutoff of 2.5 Å — and raise if any bond is
 still overlong. You can run the same checks yourself:
 
 ```python
@@ -301,7 +304,7 @@ margin = reimage.check_anchor_distances('prod-whole.xtc', ranges)
 it is only correct while no atom is more than half a box edge from that anchor.
 Folded trp-cage in a 4.67 nm box already uses **89%** of that margin — an
 extended conformation will exceed it, at which point the LOOS backend is outside
-its safe regime and you want `backend='trjconv'`, which walks the bond graph
+its safe regime and you want `backend='mdtraj'`, which walks the bond graph
 instead. The check reports the margin as a fraction so you can watch it.
 
 ### Harvesting (reducing a finished generation, safely)

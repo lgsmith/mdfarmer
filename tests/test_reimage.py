@@ -133,24 +133,30 @@ def main(steps=STEPS, write_interval=WRITE_INTERVAL,
         suite.check('reimaging outside the safe regime raises',
                     'safe regime' in str(exc), f'-> {str(exc)[:50]}')
         suite.check('the message names the backend that can do it',
-                    reimage.BACKEND_TRJCONV in str(exc))
+                    reimage.BACKEND_MDTRAJ in str(exc))
     # Measured on the reimaged output: the raw trajectory's molecules are still
     # split, so its atoms really are a box length from their anchors.
     margin = reimage.check_anchor_distances(out, ranges)
     suite.check('whole molecules are comfortably inside it',
                 margin['loos_safe'], f"-> {margin['max_anchor_offset']:.3f} nm")
 
-    suite.section('a missing tpr says so')
+    suite.section('the mdtraj backend never guesses what a molecule is')
     try:
-        reimage.reimage_with_trjconv(traj, None, str(work / 'no-tpr.xtc'))
-        suite.check('no tpr at all is reported as such', False,
+        reimage.reimage_with_mdtraj(traj, None, str(work / 'no-top.xtc'))
+        suite.check('no topology at all is reported as such', False,
                     '-> no exception')
-    except FileNotFoundError as exc:
-        suite.check('no tpr at all is reported as such', True,
-                    f'-> {str(exc)[:50]}')
+    except ValueError as exc:
+        suite.check('no topology at all is reported as such',
+                    'top_fn' in str(exc), f'-> {str(exc)[:50]}')
     except TypeError as exc:
-        suite.check('no tpr at all is reported as such', False,
+        suite.check('no topology at all is reported as such', False,
                     f'-> TypeError instead: {exc}')
+    # One molecule per atom is what mdtraj falls back to on a bondless
+    # topology, and it is the grouping that breaks a trajectory for good.
+    per_atom = [(i, i + 1) for i in range(ranges[-1][1])]
+    suite.check('a grouping that cuts through bonds is refused',
+                _refuses(reimage.check_bonds_within_molecules, pairs,
+                         per_atom))
 
     return suite.report()
 
