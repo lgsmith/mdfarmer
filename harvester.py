@@ -418,6 +418,7 @@ def harvest_generation(config_fn, harvester_config_fn,
                        dry_topology_name=DRY_TOPOLOGY_NAME,
                        iterload_chunk=ITERLOAD_CHUNK,
                        triclinic_rtol=reimage.TRICLINIC_RTOL,
+                       default_syntax=SYNTAX_LOOS,
                        backends=None):
     """Harvest one generation directory. Safe to re-run and safe to interrupt.
 
@@ -486,7 +487,7 @@ def harvest_generation(config_fn, harvester_config_fn,
                             triclinic_rtol=triclinic_rtol)
     subset_spec = resolve_subset(
         structure_fn, hconfig.get('harvester_subset'),
-        syntax=hconfig.get('harvester_subset_syntax', SYNTAX_LOOS))
+        syntax=hconfig.get('harvester_subset_syntax', default_syntax))
 
     print(f'[harvest] {gen_dir}: {n_orig} frames, backend={chosen}, '
           f'global frames {first_global_index}..'
