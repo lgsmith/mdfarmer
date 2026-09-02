@@ -11,6 +11,59 @@ import time
 # Consecutive failed advances a clone is allowed before it is given up on.
 SUBMIT_FAILURE_LIMIT = 3
 
+# Stands in for a seed index that runs off the end of one of the input lists.
+MISSING_ENTRY = '<no entry>'
+
+
+def missing_seed_inputs(seed_structure_fns, system_fns, top_fns,
+                        missing_entry=MISSING_ENTRY):
+    """Which of each seed's three input files are not on disk yet.
+
+    Maps seed index to the paths missing for it and omits a seed whose inputs
+    are all there, so an empty mapping means the whole campaign can start. An
+    index past the end of one of the lists has no path to name and is reported
+    as missing_entry.
+    """
+    fn_lists = (list(seed_structure_fns), list(system_fns), list(top_fns))
+    missing = {}
+    for seed_index in range(max((len(fns) for fns in fn_lists), default=0)):
+        absent = [missing_entry if seed_index >= len(fns)
+                  else str(fns[seed_index])
+                  for fns in fn_lists
+                  if seed_index >= len(fns)
+                  or not Path(fns[seed_index]).is_file()]
+        if absent:
+            missing[seed_index] = absent
+    return missing
+
+
+def ready_seed_count(seed_structure_fns, system_fns, top_fns):
+    """How many seeds, counting from index 0, have every input in place.
+
+    The leading run and not the total: a seed index is an on-disk identity, so
+    a campaign grows by appending and a gap cannot be closed by renumbering
+    the seeds past it. Pass this as Farmer(n_seeds=...) to run what is ready.
+    """
+    missing = missing_seed_inputs(seed_structure_fns, system_fns, top_fns)
+    n_given = min(len(seed_structure_fns), len(system_fns), len(top_fns))
+    return next((i for i in range(n_given) if i in missing), n_given)
+
+
+def seed_slice(name, values, n_seeds):
+    """The first n_seeds entries of a seed-indexed list, or None for None.
+
+    A list longer than n_seeds is a campaign running a ready prefix; one
+    shorter has no entry for a seed that will be built, which raises here
+    rather than as an IndexError once clone setup reaches that seed.
+    """
+    if values is None:
+        return None
+    values = list(values)
+    if len(values) < n_seeds:
+        raise ValueError(
+            f'{name} has {len(values)} entries for {n_seeds} seeds')
+    return values[:n_seeds]
+
 
 class Farmer:
     __slots__ = ('priority_ordered_clones', 'n_seeds', 'n_clones', 'n_gens', 'runner', 'jids_file',
@@ -303,6 +356,11 @@ class Farmer:
                  bad_node_patterns=None,
                  ):
         self.n_seeds = n_seeds
+        # More inputs than seeds asked for is a campaign running a ready prefix.
+        if len(seed_structure_fns) > n_seeds:
+            print(f'NOTE: {len(seed_structure_fns)} seed structures given for '
+                  f'n_seeds={n_seeds}; running the first {n_seeds} and leaving '
+                  'the rest for a later boot with a larger n_seeds.')
         self.n_clones = n_clones
         self.restarts_per_gen = restarts_per_gen
         self.submit_failure_limit = submit_failure_limit
@@ -314,12 +372,8 @@ class Farmer:
         self.pack_scheduler_fstring = pack_scheduler_fstring
         self.pack_run_script = pack_run_script
         self.pack_member_cores = pack_member_cores
-        if seed_config_overrides is not None and \
-                len(seed_config_overrides) != n_seeds:
-            raise ValueError(
-                f'seed_config_overrides has {len(seed_config_overrides)} '
-                f'entries for {n_seeds} seeds')
-        self.seed_config_overrides = seed_config_overrides
+        self.seed_config_overrides = seed_slice(
+            'seed_config_overrides', seed_config_overrides, n_seeds)
         # gen-seed is base + stride * seed_index + clone_index.
         gen_seed_stride = config_template.get('gen_seed_stride',
                                               gmx.GEN_SEED_STRIDE)
@@ -332,9 +386,10 @@ class Farmer:
         self.config_template = config_template
         # Resolve and check once here, so a bad file fails loudly at boot.
         self.system_fns = [str(self.check_path(Path(p)).resolve())
-                           for p in system_fns]
+                           for p in seed_slice('system_fns', system_fns,
+                                               n_seeds)]
         self.top_fns = [str(self.check_path(Path(p)).resolve())
-                        for p in top_fns]
+                        for p in seed_slice('top_fns', top_fns, n_seeds)]
         self.select_engine(runner, run_script, recover_fn, progress_fn)
         self.seeds_first = seeds_first
         self.scheduler = scheduler
@@ -381,8 +436,10 @@ class Farmer:
                   'flushes the kernel buffer after every frame; remove the '
                   'buffering=0 entry.')
 
-        self.seed_state_fns = [str(self.check_path(Path(s).resolve()))
-                               for s in seed_structure_fns]
+        self.seed_state_fns = [
+            str(self.check_path(Path(s).resolve()))
+            for s in seed_slice('seed_structure_fns', seed_structure_fns,
+                                n_seeds)]
 
         self.sep = sep
         self.config_template['sep'] = self.sep
