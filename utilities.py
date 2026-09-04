@@ -933,6 +933,43 @@ def dir_seeds_clones(top_lvl: Path, seed_index, clone_index, pad, sep='-',
     return p
 
 
+# What every generation directory calls its run record. That file plus the job
+# script is all a rerun of the generation needs.
+CONFIG_NAME = 'config.json'
+
+
+def earlier_gen_configs(top_lvl, seed_index, clone_index, gen_index, pad,
+                        sep='-', config_name=CONFIG_NAME):
+    """The config of every generation before this one, oldest first.
+
+    Each generation records what it actually ran, so the ones before it are
+    counted rather than assumed to match it. A seed may be given a different
+    generation length between boots, and a wallclock-matched run ends its
+    generations wherever the clock ran out.
+    """
+    for earlier in range(gen_index):
+        gen_dir = dir_seeds_clones_gens(Path(top_lvl), seed_index, clone_index,
+                                        earlier, pad, sep=sep, mkdir=False)
+        config_p = gen_dir / config_name
+        if not config_p.is_file():
+            raise FileNotFoundError(
+                f'{config_p} is missing, so there is no record of what '
+                f'generation {earlier} ran. Every later generation is placed by '
+                'counting the ones before it, and assuming they match this one '
+                'would misplace every step and frame from here on. Restore that '
+                "file, or write one recording that generation's steps_per_gen "
+                'and write_interval.')
+        yield json.loads(config_p.read_text())
+
+
+def steps_before(top_lvl, seed_index, clone_index, gen_index, pad, sep='-',
+                 config_name=CONFIG_NAME):
+    """The absolute step this generation starts from."""
+    return sum(c['steps_per_gen'] for c in earlier_gen_configs(
+        top_lvl, seed_index, clone_index, gen_index, pad, sep=sep,
+        config_name=config_name))
+
+
 def dir_seeds_clones_gens(top_lvl: Path, seed_index, clone_index, gen_index, pad,
                           sep='-', padchar='0', mkdir=True):
     p = top_lvl / fdir('seed', seed_index, pad, sep=sep, padchar=padchar) / \
