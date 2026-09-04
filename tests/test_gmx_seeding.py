@@ -67,6 +67,7 @@ def main(steps_per_gen=STEPS_PER_GEN, write_interval=WRITE_INTERVAL,
 
     suite.section('generation 0 follows seed_fn, not structure_fn')
     traj = gs.gmx_generation(gen_index=0, seed_fn=str(other),
+                             target_step=harness.target_step(0, steps_per_gen),
                              new_velocities=True, **common)
     started_at, box = first_frame(traj, structure)
     from_seed, _ = first_frame(other, other)
@@ -82,7 +83,7 @@ def main(steps_per_gen=STEPS_PER_GEN, write_interval=WRITE_INTERVAL,
     suite.section('structure_fn is still the fallback')
     traj = gs.gmx_generation(
         gen_index=0, seed_fn=str(work / 'farm' / 'nothing.cpt'),
-        new_velocities=True,
+        target_step=harness.target_step(0, steps_per_gen), new_velocities=True,
         **dict(common, clone_index=1, traj_dir_top_level=str(work / 'farm2')))
     started_at, box = first_frame(traj, structure)
     gap_seed = image_gap(started_at, from_seed, box)
@@ -97,6 +98,7 @@ def main(steps_per_gen=STEPS_PER_GEN, write_interval=WRITE_INTERVAL,
     try:
         gs.gmx_generation(
             gen_index=0, seed_fn='', new_velocities=True,
+            target_step=harness.target_step(0, steps_per_gen),
             **dict(common, clone_index=2, structure_fn=None,
                    traj_dir_top_level=str(work / 'farm3')))
         suite.check('a missing structure is refused', False, '-> no exception')

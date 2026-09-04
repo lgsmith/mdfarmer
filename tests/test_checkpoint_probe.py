@@ -33,8 +33,11 @@ CPU_ARGS = ('-nb', 'cpu', '-pme', 'cpu', '-ntomp', '2')
 def run_gen(config, **overrides):
     """gmx_generation with these overrides; None if it left the generation
     incomplete, else the trajectory it returned."""
+    conf = dict(config, **overrides)
+    conf['target_step'] = harness.target_step(conf['gen_index'],
+                                              conf['steps_per_gen'])
     try:
-        return gs.gmx_generation(**dict(config, **overrides))
+        return gs.gmx_generation(**conf)
     except gs.GenIncomplete:
         return None
 

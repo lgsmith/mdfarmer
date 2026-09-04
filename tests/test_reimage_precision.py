@@ -33,6 +33,7 @@ def main(gmx_bin=harness.GMX_BIN, fine_precision=FINE_PRECISION):
         seed_fn=str(structure), structure_fn=str(structure), mdp_fn=str(mdp),
         dirname_pad=2, sep='-', traj_name='prod', traj_suffix='.xtc',
         restart_name='state.cpt', steps=STEPS, steps_per_gen=STEPS,
+        target_step=harness.target_step(0, STEPS),
         write_interval=WRITE_INTERVAL, temperature=300, gen_seed_base=1,
         gmx_bin=gmx_bin, grompp_maxwarn=3, new_velocities=True, append=False,
         mdrun_args=CPU_ARGS)

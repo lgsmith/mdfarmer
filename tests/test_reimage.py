@@ -37,6 +37,7 @@ def main(steps=STEPS, write_interval=WRITE_INTERVAL,
         seed_fn=str(structure), structure_fn=str(structure), mdp_fn=str(mdp),
         dirname_pad=2, sep='-', traj_name='prod', traj_suffix='.xtc',
         restart_name='state.cpt', steps=steps, steps_per_gen=steps,
+        target_step=harness.target_step(0, steps),
         write_interval=write_interval, temperature=300, gen_seed_base=7,
         gmx_bin=gmx_bin, grompp_maxwarn=3, new_velocities=True, append=False,
         mdrun_args=('-nb', 'cpu', '-pme', 'cpu', '-ntomp', '2'))

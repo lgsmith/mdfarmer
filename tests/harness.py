@@ -119,6 +119,15 @@ def workdir(name, scratch_root=SCRATCH_ROOT):
     return path
 
 
+def target_step(gen_index, steps_per_gen):
+    """The absolute step a generation of uniform length ends at.
+
+    Clone counts this from the chain's earlier configs; a suite calling a runner
+    directly has to work it out, and these all use one length throughout.
+    """
+    return (gen_index + 1) * steps_per_gen
+
+
 def water_mdp(cutoff_nm=WATER_CUTOFF_NM, nstlist=WATER_NSTLIST):
     """An NPT mdp for the water box: Nose-Hoover and Parrinello-Rahman, which
     is the coupling whose state a generation chain has to carry across."""

@@ -233,7 +233,7 @@ def main(n_gens=N_GENS, pack_n_gens=PACK_N_GENS, steps_per_gen=STEPS_PER_GEN):
     suite.section('_try_recover_gen cascades instead of raising on a corrupt DCD')
     position_dir = work / 'corrupt_position'
     position_dir.mkdir()
-    (position_dir / 'config.json').write_text(json.dumps({'gen_index': 0}))
+    (position_dir / 'config.json').write_text(json.dumps(base_config(work)))
     (position_dir / 'state.cpt').write_text('ckpt\n')
     (position_dir / 'prod.dcd').write_bytes(b'not a real dcd, just nonempty')
 
@@ -248,8 +248,8 @@ def main(n_gens=N_GENS, pack_n_gens=PACK_N_GENS, steps_per_gen=STEPS_PER_GEN):
 
     tandem_dir = work / 'corrupt_tandem'
     tandem_dir.mkdir()
-    (tandem_dir / 'config.json').write_text(json.dumps({
-        'gen_index': 0, 'velocity_traj_suffix': '.dcd', 'velocity_name': 'vel'}))
+    (tandem_dir / 'config.json').write_text(json.dumps(dict(
+        base_config(work), velocity_traj_suffix='.dcd', velocity_name='vel')))
     (tandem_dir / 'state.cpt').write_text('ckpt\n')
     (tandem_dir / 'prod.dcd').write_bytes(b'placeholder positions')
     (tandem_dir / 'vel.dcd').write_bytes(b'placeholder velocities')

@@ -44,6 +44,7 @@ def main(gmx_bin=harness.GMX_BIN, halt_step=HALT_STEP,
         mdp_fn=str(mdp), dirname_pad=DIRNAME_PAD, sep=SEP, traj_name='prod',
         traj_suffix='.xtc', restart_name='state.cpt', steps=steps_per_gen,
         steps_per_gen=steps_per_gen, write_interval=write_interval,
+        target_step=harness.target_step(0, steps_per_gen),
         temperature=300, gen_seed_base=4, gmx_bin=gmx_bin, grompp_maxwarn=3,
         new_velocities=True, append=False, mdrun_args=CPU_ARGS)
 

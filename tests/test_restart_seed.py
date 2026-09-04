@@ -60,6 +60,7 @@ def main(gmx_bin=harness.GMX_BIN):
         gs.gmx_generation(**dict(
             template, seed_index=SEED_INDEX, clone_index=CLONE_INDEX,
             gen_index=0, seed_fn=str(structure), top_fn=str(topology),
+            target_step=harness.target_step(0, STEPS_PER_GEN),
             new_velocities=True,
             mdrun_args=CPU_ARGS + ('-nsteps', str(PARTIAL_STEPS))))
     except gs.GenIncomplete:

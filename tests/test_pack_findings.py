@@ -85,6 +85,7 @@ def main(cpus=CPUS, pack_cpus=PACK_CPUS, n_replicas=N_REPLICAS,
         gen_dir.mkdir(parents=True)
         config = dict(template, seed_index=0, clone_index=clone_index,
                       gen_index=0, seed_fn=str(structure),
+                      target_step=harness.target_step(0, steps_per_gen),
                       new_velocities=True, append=False)
         config_p = gen_dir / 'config.json'
         config_p.write_text(json.dumps(config, indent=2))

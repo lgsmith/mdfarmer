@@ -50,6 +50,7 @@ def main(gmx_bin=harness.GMX_BIN, init_step=INHERITED_INIT_STEP):
 
     suite.section('generation 0 runs its whole budget, not none of it')
     traj = gs.gmx_generation(gen_index=0, seed_fn=str(structure),
+                             target_step=harness.target_step(0, STEPS_PER_GEN),
                              new_velocities=True, **common)
     reached = gs.checkpoint_step(gen_dir(0) / common['restart_name'],
                                  gmx_bin=gmx_bin)
@@ -70,6 +71,7 @@ def main(gmx_bin=harness.GMX_BIN, init_step=INHERITED_INIT_STEP):
     seed = gen_one / common['restart_name']
     seed.write_bytes((gen_dir(0) / common['restart_name']).read_bytes())
     traj = gs.gmx_generation(gen_index=1, seed_fn=str(seed),
+                             target_step=harness.target_step(1, STEPS_PER_GEN),
                              new_velocities=False, **common)
     reached = gs.checkpoint_step(gen_one / common['restart_name'],
                                  gmx_bin=gmx_bin)

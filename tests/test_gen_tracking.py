@@ -5,6 +5,7 @@ comment on plow_harrow_plant tells them to do. Anything that tracked the
 generation separately would go stale the moment they did, and a stale value is
 what decides whether a clone retires.
 """
+import json
 import sys
 
 import harness
@@ -52,6 +53,10 @@ def main(steps_per_gen=STEPS_PER_GEN, last_gen_index=LAST_GEN_INDEX,
 
     suite.section('start_next moves both together')
     (clone.current_gen_dir / clone.config['restart_name']).write_text('ckpt\n')
+    # The record generation 0's launch would have left, which is what the next
+    # generation counts its step target from.
+    (clone.current_gen_dir / 'config.json').write_text(
+        json.dumps(clone.config, indent=4))
     clone.start_next()
     suite.check('current_gen still matches the config',
                 clone.current_gen == clone.config['gen_index'] == 1,
