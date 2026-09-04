@@ -737,8 +737,12 @@ def gmx_generation(traj_dir_top_level: str,
                    restart_name: str = 'state.cpt',
                    # A resume shrinks this to the remainder still owed.
                    steps: int = 500000,
-                   # Full generation length; what the tpr's nsteps counts to.
+                   # Full generation length. Unread here, but recorded in
+                   # config.json, which is what the harvest counts frames from.
                    steps_per_gen: int = None,
+                   # The absolute step this generation ends at, counted by
+                   # Clone from what the earlier generations recorded.
+                   target_step: int = None,
                    # xtc stride; steps must be a whole number of these.
                    write_interval: int = 50000,
                    temperature=None,            # gen-temp for gen-0 velocities (K)
@@ -774,13 +778,12 @@ def gmx_generation(traj_dir_top_level: str,
     and a gen_status.json behind, so the next launch resumes rather than
     restarts; neither is a failure.
     """
-    steps_per_gen = int(steps_per_gen if steps_per_gen is not None else steps)
-    if steps_per_gen % write_interval:
+    if target_step is None:
         raise ValueError(
-            f'steps_per_gen={steps_per_gen} is not a whole number of '
-            f'write_interval={write_interval} steps. The last frame of a '
-            'generation would not land on its final step, so the frame spacing '
-            'across the generation boundary would be irregular.')
+            'gmx_generation needs target_step, the absolute step this '
+            'generation ends at. Clone.target_step counts it from the chain; '
+            'a direct caller has to work it out and pass it.')
+    target_step = int(target_step)
 
     print('starting', title, seed_index, clone_index, gen_index, flush=True)
     gen_dir = util.dir_seeds_clones_gens(
@@ -792,8 +795,6 @@ def gmx_generation(traj_dir_top_level: str,
     seed_cpt = gen_dir / seed_cpt_name
 
     # Absolute: -cpi resumes at the checkpoint's step and runs to the tpr's.
-    target_step = (gen_index + 1) * steps_per_gen
-
     # -cpi on another run's checkpoint, or on a .gro, is fatal: move seed aside.
     if not seed_cpt.exists() and own_cpt.exists() and not tpr.is_file():
         # No tpr yet => mdrun has not run here => restart_name is the seed.
