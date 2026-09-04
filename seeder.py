@@ -122,8 +122,8 @@ def _try_recover_gen(gen_path: Path, *,
     loses the trajectory tail but keeps an intact integrator state, so it
     advances to the next gen and seeds from there.
 
-    The step at gen start is derived from gen_index and total_steps rather
-    than read from the DCD header: OpenMM's DCDReporter hard-codes istart to
+    The step at gen start is counted from the earlier generations' own configs,
+    not read from the DCD header: OpenMM's DCDReporter hard-codes istart to
     reportInterval, while state.xml's stepCount accumulates across gens.
     """
     config_p = gen_path / 'config.json'
@@ -173,7 +173,10 @@ def _try_recover_gen(gen_path: Path, *,
     if nset == 0:
         return gen_index, seed_fn, total_steps, False
 
-    gen_start_step = gen_index * total_steps
+    gen_start_step = util.steps_before(
+        prev_config['traj_dir_top_level'], prev_config['seed_index'],
+        prev_config['clone_index'], gen_index, prev_config['dirname_pad'],
+        sep=prev_config['sep'])
     state_offset = state_step - gen_start_step
     if state_offset <= 0 or state_offset % nsavc != 0:
         print(f'_try_recover_gen: state stepCount={state_step} not aligned '
@@ -572,6 +575,14 @@ class Clone:
                 and restart_p.stat().st_mtime
                 > self.current_seed.stat().st_mtime)
 
+    def target_step(self):
+        """The absolute step this generation ends at, counted from the chain."""
+        return util.steps_before(
+            self.config['traj_dir_top_level'], self.config['seed_index'],
+            self.config['clone_index'], self.config['gen_index'],
+            self.config['dirname_pad'], sep=self.config['sep']
+        ) + self.total_steps
+
     def check_copy_set_restart_seed(self):
         """Put a copy of this clone's seed in the current gen directory.
 
@@ -623,6 +634,10 @@ class Clone:
         )
         # A fresh directory needs the previous seed copied into it.
         self.check_copy_set_restart_seed()
+        # The absolute step this generation must reach. Counted here, not in a
+        # runner: the Clone is what knows where this generation sits in the
+        # chain, and the runners are handed the number.
+        self.config['target_step'] = self.target_step()
         # Rewritten even when overwrite is False: a stale config on disk would
         # relaunch a half-finished gen from scratch. Temp name, so no torn read.
         config_p = self.current_gen_dir / 'config.json'
