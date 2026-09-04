@@ -31,6 +31,9 @@ DOWNSAMPLE_PREFIX = 'downsample'
 # later, get_traj_len's LOOS fallback included, has a matching atom count.
 DRY_TOPOLOGY_NAME = 'dry-top.pdb'
 
+# What every generation directory calls its run record.
+CONFIG_NAME = util.CONFIG_NAME
+
 # Backend selectors for harvest_generation.
 BACKEND_AUTO = 'auto'
 BACKEND_LOOS = 'loos'
@@ -105,6 +108,22 @@ class Harvester:
                                         result.stdout, result.stderr)
         print('harvester scheduler return:', result.stdout)
         return result.stdout
+
+
+def frames_before(config, downsample_frq, config_name=CONFIG_NAME):
+    """Frames the generations before this one wrote, from their own configs.
+
+    Counted, not multiplied by this generation's length: a seed may be given a
+    different generation length between boots, and a wallclock-matched scheme
+    ends generations wherever the clock ran out.
+    """
+    return sum(
+        check_commensurability(earlier['steps_per_gen'],
+                               earlier['write_interval'], downsample_frq)
+        for earlier in util.earlier_gen_configs(
+            config['traj_dir_top_level'], config['seed_index'],
+            config['clone_index'], config['gen_index'], config['dirname_pad'],
+            sep=config['sep'], config_name=config_name))
 
 
 def check_commensurability(steps_per_gen, write_interval, downsample_frq):
@@ -462,7 +481,7 @@ def harvest_generation(config_fn, harvester_config_fn,
     steps_per_gen = _steps_per_gen(config, hconfig)
     frames_per_gen = check_commensurability(
         steps_per_gen, write_interval, downsample_frq)
-    first_global_index = gen_index * frames_per_gen
+    first_global_index = frames_before(config, downsample_frq)
 
     # A symlink with no sentinel is a harvest that deleted the original and
     # then died. Writing again here would read and write one file at once.
