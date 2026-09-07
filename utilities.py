@@ -864,6 +864,27 @@ def truncate_dcd_to_nframes(p: Path, target_nframes: int) -> int:
     return achievable
 
 
+def check_whole_frames(total_steps, write_interval, source='config_template'):
+    """Refuse a step count that is not a whole number of write_intervals.
+
+    The leftover steps write no frame and no checkpoint, so the run passes its
+    last report and never registers as finished: calx_remaining_steps keeps
+    asking for the remainder and every relaunch spends it again.
+
+    source names where the numbers came from, since the Farmer checks a config
+    template and a Clone checks the generation it is about to launch. Either
+    value being absent or zero means there is nothing to check. Returns
+    total_steps, so a caller can validate in place.
+    """
+    if not total_steps or not write_interval or total_steps % write_interval == 0:
+        return total_steps
+    raise ValueError(
+        f'{source} steps={total_steps} is not a whole number of '
+        f'write_interval={write_interval} steps. The remaining '
+        f'{total_steps % write_interval} would write no frame and no '
+        'checkpoint, so the generation would never finish.')
+
+
 def calx_remaining_steps(traj_fn, top_fn, total_steps, write_interval):
     """Steps a generation still owes, from the frames already on disk.
 

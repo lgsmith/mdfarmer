@@ -132,6 +132,40 @@ def check_config_from_signature(suite):
                 f'-> {type(exc).__name__}: {exc}')
 
 
+def check_whole_frames(suite):
+    """One implementation of "steps has to land on a write_interval", so the
+    Farmer's template check and an engine's per-generation check cannot drift.
+    """
+    suite.section('a step count off the write_interval grid')
+    suite.check('a whole number of intervals passes through unchanged',
+                util.check_whole_frames(10000, 500) == 10000)
+    suite.check('one interval exactly is still whole',
+                util.check_whole_frames(500, 500) == 500)
+
+    exc = raises(util.check_whole_frames, 10001, 500)
+    suite.check('a remainder is a ValueError, which the Farmer cascades on',
+                isinstance(exc, ValueError), f'-> {type(exc).__name__}')
+    suite.check('the message names both numbers and the leftover',
+                exc is not None and all(s in str(exc)
+                                        for s in ('10001', '500', '1')),
+                f'-> {exc}')
+    suite.check('fewer steps than one interval is a remainder too',
+                isinstance(raises(util.check_whole_frames, 250, 500),
+                           ValueError))
+
+    exc = raises(util.check_whole_frames, 10001, 500, source='gen-03 config')
+    suite.check('the caller names where the numbers came from',
+                exc is not None and 'gen-03 config' in str(exc), f'-> {exc}')
+
+    # Neither engine's config template is required to carry both keys.
+    suite.check('a missing steps is nothing to check',
+                util.check_whole_frames(None, 500) is None)
+    suite.check('a missing write_interval is nothing to check',
+                util.check_whole_frames(10001, None) == 10001)
+    suite.check('a zero write_interval does not raise ZeroDivisionError',
+                util.check_whole_frames(10001, 0) == 10001)
+
+
 def check_frame_counting_backend(suite, work):
     """With neither mdtraj nor LOOS every trajectory would measure as empty and
     the orchestrator would delete it, so get_traj_len refuses to answer.
@@ -181,6 +215,7 @@ def main():
     check_state_xml_step_count(suite, work)
     check_harvest_entry_points(suite)
     check_config_from_signature(suite)
+    check_whole_frames(suite)
     check_frame_counting_backend(suite, work)
     return suite.report()
 
