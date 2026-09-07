@@ -497,7 +497,8 @@ def omm_generation(traj_dir_top_level: str,
     simulation.reporters.append(restart_reporter)
     for r in extra_reporters:
         simulation.reporters.append(r)
-    # Appended last, so this cycle's writes land on disk before it can raise.
+    # Appended last, so this cycle's writes land on disk before it can raise:
+    # only traj_reporter asks for positions, so Simulation reports one group.
     if handle_preempt:
         sentinel_p = Path(PREEMPT_SENTINEL_NAME)
         # A sentinel left in this gen dir by an earlier preempt would fire at once.
