@@ -183,38 +183,22 @@ def frame_timing(traj_fn, n_frames=None):
     return step0, steps_per_frame, time0, time_per_frame
 
 
-"""
-The harvest itself lives in harvester.harvest_generation; these two names are
-what existing submit scripts call, and each hands off to it.
-
-hconfig keys:
- - harvester_subset: which atoms the solute trajectory keeps, in LOOS syntax
-   unless harvester_subset_syntax says 'mdtraj'.
- - downsample_frq: keep every Nth frame in the solvated stream.
- - harvester_structure: structure file to build the model from. REQUIRED for
-   GROMACS runs, whose top_fn is a force-field topology that neither LOOS nor
-   mdtraj can build a model from. Defaults to config['top_fn'].
-"""
-
-
 def strip_and_downsample(config_fn, harvester_config_fn):
-    """Old entry point, kept for the harvest.sh scripts already on disk.
+    """The one old entry point, kept for the harvest.sh scripts already on disk.
 
-    The backend is chosen by box shape rather than pinned: LOOS keeps only the
-    diagonal of a triclinic cell, so pinning it here would harvest an old
-    triclinic campaign with a silently wrong box. Which atoms are kept does not
-    depend on the backend, so nothing else about the harvest changes.
+    New scripts call harvester.harvest_generation, which this hands off to with
+    no backend pinned, so the box shape picks one.
+
+    hconfig keys:
+     - harvester_subset: which atoms the solute trajectory keeps, in LOOS syntax
+       unless harvester_subset_syntax says 'mdtraj'.
+     - downsample_frq: keep every Nth frame in the solvated stream.
+     - harvester_structure: structure file to build the model from. REQUIRED for
+       GROMACS runs, whose top_fn is a force-field topology that neither LOOS nor
+       mdtraj can build a model from. Defaults to config['top_fn'].
     """
     from . import harvester
     return harvester.harvest_generation(config_fn, harvester_config_fn)
-
-
-def strip_ds_mdtraj(config_fn, harvester_config_fn):
-    """Old entry point pinning the mdtraj backend, which is right for a box of
-    either shape."""
-    from . import harvester
-    return harvester.harvest_generation(
-        config_fn, harvester_config_fn, backend=harvester.BACKEND_MDTRAJ)
 
 
 # Ready-made job scripts, keyed by scheduler. The module docstring says what a
