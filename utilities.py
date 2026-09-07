@@ -646,6 +646,29 @@ class BadNodeRegistry:
         return node
 
 
+# Indent for the JSON files a runner and the orchestrator share.
+JSON_INDENT = 2
+
+
+def write_json_atomic(path, obj, indent=JSON_INDENT):
+    """Write obj to path as JSON under a temp name, and return path.
+
+    The rename is atomic and the temp name sits in the target's own directory,
+    so a reader racing the write sees either the whole old file or the whole new
+    one. Every file a running job and the orchestrator share is written this
+    way: a generation's config and status, a pack manifest, the seed map.
+
+    indent is a parameter rather than fixed because config.json has always been
+    written at 4 and the rest at 2, and reshaping files already on disk would
+    make a stored config differ from itself on the next boot.
+    """
+    path = Path(path)
+    tmp_p = path.with_name(path.name + '.tmp')
+    tmp_p.write_text(json.dumps(obj, indent=indent))
+    tmp_p.replace(path)
+    return path
+
+
 # Where a campaign records what each seed index means.
 SEED_MAP_NAME = 'seed_map.json'
 
@@ -663,12 +686,9 @@ def write_seed_map(seed_map_p: Path, seed_map: dict):
     """Write {seed index: label}, under a temp name so no boot reads a torn file."""
     seed_map_p = Path(seed_map_p)
     seed_map_p.parent.mkdir(parents=True, exist_ok=True)
-    tmp_p = seed_map_p.with_name(seed_map_p.name + '.tmp')
-    tmp_p.write_text(json.dumps(
-        {str(index): label for index, label in sorted(seed_map.items())},
-        indent=2))
-    tmp_p.replace(seed_map_p)
-    return seed_map_p
+    return write_json_atomic(
+        seed_map_p,
+        {str(index): label for index, label in sorted(seed_map.items())})
 
 
 def changed_seed_labels(recorded: dict, seed_labels):
