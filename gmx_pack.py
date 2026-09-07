@@ -70,6 +70,9 @@ RUNTIME_ONLY_KEYS = gmx.RUNTIME_ONLY_KEYS
 # Seconds between preempt-sentinel polls while the pack runs.
 POLL_SECONDS = 5
 
+# The thread count gmx_simulate._mdrun_env rewrites to match each -ntomp.
+OMP_THREADS_ENV = 'OMP_NUM_THREADS'
+
 # Environment variables the MPS daemon is configured through.
 MPS_PIPE_ENV = 'CUDA_MPS_PIPE_DIRECTORY'
 MPS_LOG_ENV = 'CUDA_MPS_LOG_DIRECTORY'
@@ -206,6 +209,28 @@ def report_mps_state(mps_control_bin=MPS_CONTROL_BIN,
     return state
 
 
+def warn_inherited_omp_threads(layout, omp_threads_env=OMP_THREADS_ENV,
+                               environ=None):
+    """Say once that this job is overriding an inherited thread count.
+
+    Returns the inherited value when it disagrees with the cores some replica
+    is about to be given, and None when there is nothing to say. No OpenMM
+    counterpart: only mdrun refuses to start over this, and a Platform takes
+    its thread count as a property rather than from the environment.
+    """
+    environ = os.environ if environ is None else environ
+    inherited = environ.get(omp_threads_env)
+    ntomps = [str(cores) for cores, _ in layout]
+    if inherited is None or all(n == inherited for n in ntomps):
+        return None
+    print(f'[pack] WARNING: the submitting environment exported '
+          f'{omp_threads_env}={inherited}, but this job gives its replicas '
+          f'{", ".join(ntomps)} cores. {omp_threads_env} is overridden per '
+          f'replica to match its own -ntomp, because mdrun refuses to start '
+          f'when the two disagree.', flush=True)
+    return inherited
+
+
 def write_pack_manifest(pack_dir, member_config_fns, *, cpus_per_task,
                         member_cores=None,
                         pack_manifest_name=PACK_MANIFEST_NAME):
@@ -251,7 +276,8 @@ def gmx_pack_sim_block_json(manifest_fn=PACK_MANIFEST_NAME,
                             pack_status_name=PACK_STATUS_NAME,
                             ntmpi=NTMPI,
                             runtime_only_keys=RUNTIME_ONLY_KEYS,
-                            gmx_bin=None):
+                            gmx_bin=None,
+                            omp_threads_env=OMP_THREADS_ENV):
     """Entry point for a packed job's run.py: advance every member concurrently.
 
     Threads rather than processes: the work is all subprocess waiting, and one
@@ -281,6 +307,7 @@ def gmx_pack_sim_block_json(manifest_fn=PACK_MANIFEST_NAME,
     print(f'[pack] {n_replicas} replicas, {cpus_per_task} cpus, '
           f'cores(offset) ' + ' '.join(f'{c}({o})' for c, o in layout),
           flush=True)
+    warn_inherited_omp_threads(layout, omp_threads_env=omp_threads_env)
     mps_state = report_mps_state()
 
     # Checked once, out here: a mismatch is a mistake in this module, not one
