@@ -29,6 +29,7 @@ import time
 from pathlib import Path
 
 from . import gmx_simulate as gmx
+from . import utilities as util
 
 
 # mdrun pinning stride. 1 keeps a replica's threads on consecutive cores, which
@@ -251,9 +252,7 @@ def write_pack_manifest(pack_dir, member_config_fns, *, cpus_per_task,
         'member_cores': member_cores,
     }
     path = Path(pack_dir) / pack_manifest_name
-    tmp = path.with_name(path.name + '.tmp')
-    tmp.write_text(json.dumps(manifest, indent=2))
-    tmp.replace(path)
+    util.write_json_atomic(path, manifest)
     return path
 
 
@@ -376,9 +375,7 @@ def gmx_pack_sim_block_json(manifest_fn=PACK_MANIFEST_NAME,
     status = {'members': results, 'cpus_per_task': cpus_per_task,
               'n_replicas': n_replicas, **mps_state}
     status_p = pack_dir / pack_status_name
-    tmp = status_p.with_name(status_p.name + '.tmp')
-    tmp.write_text(json.dumps(status, indent=2))
-    tmp.replace(status_p)
+    util.write_json_atomic(status_p, status)
 
     for outcome in results:
         print(f'[pack] replica {outcome["replica"]}: {outcome["status"]}'

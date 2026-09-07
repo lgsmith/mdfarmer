@@ -575,9 +575,7 @@ def write_gen_status(gen_dir, *, target_step, reached_step, complete,
     if traj_fn is not None:
         status['traj'] = str(traj_fn)
     path = Path(gen_dir) / gen_status_name
-    tmp = path.with_name(path.name + '.tmp')
-    tmp.write_text(json.dumps(status, indent=2))
-    tmp.replace(path)            # atomic, so a reader never sees a torn file
+    util.write_json_atomic(path, status)
     return status
 
 
