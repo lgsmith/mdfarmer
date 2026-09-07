@@ -133,10 +133,17 @@ def check_config_from_signature(suite):
                 f'-> {type(exc).__name__}: {exc}')
 
 
-def check_frame_counting_backend(suite):
-    """With neither mdtraj nor LOOS, every trajectory measures as empty and the
-    orchestrator deletes it, so importing at all has to fail."""
+def check_frame_counting_backend(suite, work):
+    """With neither mdtraj nor LOOS every trajectory would measure as empty and
+    the orchestrator would delete it, so get_traj_len refuses to answer.
+
+    The refusal is at count time rather than import time: a scheduler-only
+    install never counts a frame, and failing its `import mdfarmer` would cost
+    it the whole package for a backend it does not use.
+    """
     suite.section('an install with no way to count frames')
+    traj_p = work / 'has-frames.dcd'
+    traj_p.write_bytes(b'not a real dcd, but it is a file with bytes in it')
     script = '\n'.join((
         'import importlib.util, sys',
         # None in sys.modules is what makes an import raise ImportError.
@@ -144,8 +151,11 @@ def check_frame_counting_backend(suite):
         "sys.modules['loos'] = None",
         f"spec = importlib.util.spec_from_file_location('u', {UTILITIES!r})",
         'module = importlib.util.module_from_spec(spec)',
+        'spec.loader.exec_module(module)',
+        "print('IMPORTED')",
+        f"print('MISSING:', module.get_traj_len({str(work / 'gone.dcd')!r}, None))",
         'try:',
-        '    spec.loader.exec_module(module)',
+        f'    module.get_traj_len({str(traj_p)!r}, None)',
         'except ImportError as exc:',
         "    print('REFUSED:', exc)",
         '    sys.exit(0)',
@@ -153,9 +163,16 @@ def check_frame_counting_backend(suite):
     ))
     result = sp.run([sys.executable, '-c', script], capture_output=True,
                     text=True)
-    suite.check('importing utilities fails rather than warning',
-                result.returncode == 0,
-                f'-> {(result.stdout + result.stderr).strip()[-90:]}')
+    output = (result.stdout + result.stderr).strip()
+    suite.check('importing utilities still works, so the scheduler side runs',
+                'IMPORTED' in result.stdout, f'-> {output[-90:]}')
+    suite.check('a trajectory that is not there is still 0, not an error',
+                'MISSING: 0' in result.stdout, f'-> {output[-90:]}')
+    suite.check('counting a trajectory that exists raises instead of saying 0',
+                result.returncode == 0 and 'REFUSED:' in result.stdout,
+                f'-> {output[-90:]}')
+    suite.check('the message names the trajectory it was asked about',
+                'has-frames.dcd' in result.stdout, f'-> {output[-120:]}')
 
 
 def main():
@@ -165,7 +182,7 @@ def main():
     check_state_xml_step_count(suite, work)
     check_harvest_entry_points(suite)
     check_config_from_signature(suite)
-    check_frame_counting_backend(suite)
+    check_frame_counting_backend(suite, work)
     return suite.report()
 
 

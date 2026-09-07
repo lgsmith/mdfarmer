@@ -79,12 +79,6 @@ except ImportError:
     loos = None
     pyloos = None
 
-if _mdtraj is None and loos is None:
-    # With no way to count frames every generation measures as empty, which the
-    # orchestrator reads as one that never ran and deletes.
-    raise ImportError('mdfarmer needs mdtraj or LOOS to count frames, and '
-                      'neither is importable.')
-
 
 def _traj_len_mdtraj(traj_fn):
     with _mdtraj.open(str(traj_fn)) as fh:
@@ -112,10 +106,20 @@ def get_traj_len(traj_fn, top_fn, dry_topology_name=DRY_TOPOLOGY_NAME):
     harvest the trajectory name is a symlink to a stripped copy, and LOOS built
     from the wet top_fn would hit an atom-count mismatch, be swallowed by the
     broad except below, and report 0 frames, which reads as "never ran".
+
+    With neither backend installed a trajectory that exists cannot be measured,
+    so this raises rather than answering 0. Refusing here rather than at import
+    keeps a scheduler-only install, which never counts a frame, working.
     """
     traj_p = Path(traj_fn)
     if not traj_p.is_file() or traj_p.stat().st_size == 0:
         return 0
+    if _mdtraj is None and loos is None:
+        # 0 for a trajectory that exists reads as a generation that never ran,
+        # and the orchestrator deletes it.
+        raise ImportError(
+            f'Counting the frames in {traj_fn} needs mdtraj or LOOS, and '
+            'neither is importable.')
     if _mdtraj is not None:
         try:
             return _traj_len_mdtraj(traj_p)
