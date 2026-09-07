@@ -83,21 +83,20 @@ def check_state_xml_step_count(suite, work):
 def check_harvest_entry_points(suite):
     """The old shims must not pin LOOS: it keeps only the diagonal of a
     triclinic cell, and only the auto choice looks at the box at all."""
-    suite.section('the harvest entry points scripts on disk still call')
+    suite.section('the harvest entry point scripts on disk still call')
     calls = []
     real = harvester.harvest_generation
     harvester.harvest_generation = lambda *args, **kws: calls.append(kws)
     try:
         util.strip_and_downsample('config.json', 'hconfig.json')
-        util.strip_ds_mdtraj('config.json', 'hconfig.json')
     finally:
         harvester.harvest_generation = real
     suite.check('strip_and_downsample lets the box pick the backend',
                 calls[0].get('backend', harvester.BACKEND_AUTO)
                 == harvester.BACKEND_AUTO, f'-> {calls[0]}')
-    suite.check('strip_ds_mdtraj still pins mdtraj, right for either box',
-                calls[1].get('backend') == harvester.BACKEND_MDTRAJ,
-                f'-> {calls[1]}')
+    suite.check('it is the only old name left, so no pinned twin to pick wrong',
+                not hasattr(util, 'strip_ds_mdtraj'),
+                f'-> {[n for n in dir(util) if n.startswith("strip")]}')
     suite.check('only the auto choice consults the box at all',
                 harvester.select_backend('traj.dcd',
                                          backend=harvester.BACKEND_LOOS)
@@ -133,10 +132,51 @@ def check_config_from_signature(suite):
                 f'-> {type(exc).__name__}: {exc}')
 
 
-def check_frame_counting_backend(suite):
-    """With neither mdtraj nor LOOS, every trajectory measures as empty and the
-    orchestrator deletes it, so importing at all has to fail."""
+def check_whole_frames(suite):
+    """One implementation of "steps has to land on a write_interval", so the
+    Farmer's template check and an engine's per-generation check cannot drift.
+    """
+    suite.section('a step count off the write_interval grid')
+    suite.check('a whole number of intervals passes through unchanged',
+                util.check_whole_frames(10000, 500) == 10000)
+    suite.check('one interval exactly is still whole',
+                util.check_whole_frames(500, 500) == 500)
+
+    exc = raises(util.check_whole_frames, 10001, 500)
+    suite.check('a remainder is a ValueError, which the Farmer cascades on',
+                isinstance(exc, ValueError), f'-> {type(exc).__name__}')
+    suite.check('the message names both numbers and the leftover',
+                exc is not None and all(s in str(exc)
+                                        for s in ('10001', '500', '1')),
+                f'-> {exc}')
+    suite.check('fewer steps than one interval is a remainder too',
+                isinstance(raises(util.check_whole_frames, 250, 500),
+                           ValueError))
+
+    exc = raises(util.check_whole_frames, 10001, 500, source='gen-03 config')
+    suite.check('the caller names where the numbers came from',
+                exc is not None and 'gen-03 config' in str(exc), f'-> {exc}')
+
+    # Neither engine's config template is required to carry both keys.
+    suite.check('a missing steps is nothing to check',
+                util.check_whole_frames(None, 500) is None)
+    suite.check('a missing write_interval is nothing to check',
+                util.check_whole_frames(10001, None) == 10001)
+    suite.check('a zero write_interval does not raise ZeroDivisionError',
+                util.check_whole_frames(10001, 0) == 10001)
+
+
+def check_frame_counting_backend(suite, work):
+    """With neither mdtraj nor LOOS every trajectory would measure as empty and
+    the orchestrator would delete it, so get_traj_len refuses to answer.
+
+    The refusal is at count time rather than import time: a scheduler-only
+    install never counts a frame, and failing its `import mdfarmer` would cost
+    it the whole package for a backend it does not use.
+    """
     suite.section('an install with no way to count frames')
+    traj_p = work / 'has-frames.dcd'
+    traj_p.write_bytes(b'not a real dcd, but it is a file with bytes in it')
     script = '\n'.join((
         'import importlib.util, sys',
         # None in sys.modules is what makes an import raise ImportError.
@@ -144,8 +184,11 @@ def check_frame_counting_backend(suite):
         "sys.modules['loos'] = None",
         f"spec = importlib.util.spec_from_file_location('u', {UTILITIES!r})",
         'module = importlib.util.module_from_spec(spec)',
+        'spec.loader.exec_module(module)',
+        "print('IMPORTED')",
+        f"print('MISSING:', module.get_traj_len({str(work / 'gone.dcd')!r}, None))",
         'try:',
-        '    spec.loader.exec_module(module)',
+        f'    module.get_traj_len({str(traj_p)!r}, None)',
         'except ImportError as exc:',
         "    print('REFUSED:', exc)",
         '    sys.exit(0)',
@@ -153,9 +196,16 @@ def check_frame_counting_backend(suite):
     ))
     result = sp.run([sys.executable, '-c', script], capture_output=True,
                     text=True)
-    suite.check('importing utilities fails rather than warning',
-                result.returncode == 0,
-                f'-> {(result.stdout + result.stderr).strip()[-90:]}')
+    output = (result.stdout + result.stderr).strip()
+    suite.check('importing utilities still works, so the scheduler side runs',
+                'IMPORTED' in result.stdout, f'-> {output[-90:]}')
+    suite.check('a trajectory that is not there is still 0, not an error',
+                'MISSING: 0' in result.stdout, f'-> {output[-90:]}')
+    suite.check('counting a trajectory that exists raises instead of saying 0',
+                result.returncode == 0 and 'REFUSED:' in result.stdout,
+                f'-> {output[-90:]}')
+    suite.check('the message names the trajectory it was asked about',
+                'has-frames.dcd' in result.stdout, f'-> {output[-120:]}')
 
 
 def main():
@@ -165,7 +215,8 @@ def main():
     check_state_xml_step_count(suite, work)
     check_harvest_entry_points(suite)
     check_config_from_signature(suite)
-    check_frame_counting_backend(suite)
+    check_whole_frames(suite)
+    check_frame_counting_backend(suite, work)
     return suite.report()
 
 

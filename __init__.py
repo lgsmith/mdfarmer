@@ -35,7 +35,7 @@ __all__ = ['fdir', 'dir_seeds_clones', 'dir_seeds_clones_gens', 'omm_generation'
            'check_commensurability', 'unharvested_gen_dirs',
            'verify_dry_chain', 'select_backend', 'resolve_subset',
            'frame_plan', 'expected_counts',
-           'strip_and_downsample', 'strip_ds_mdtraj',
+           'strip_and_downsample',
            'default_straight_sampling_config_template',
            'default_straight_sampling_init_config',
            'merge_args_defaults_dict', 'calx_remaining_steps', 'get_traj_len',

@@ -79,12 +79,6 @@ except ImportError:
     loos = None
     pyloos = None
 
-if _mdtraj is None and loos is None:
-    # With no way to count frames every generation measures as empty, which the
-    # orchestrator reads as one that never ran and deletes.
-    raise ImportError('mdfarmer needs mdtraj or LOOS to count frames, and '
-                      'neither is importable.')
-
 
 def _traj_len_mdtraj(traj_fn):
     with _mdtraj.open(str(traj_fn)) as fh:
@@ -112,10 +106,20 @@ def get_traj_len(traj_fn, top_fn, dry_topology_name=DRY_TOPOLOGY_NAME):
     harvest the trajectory name is a symlink to a stripped copy, and LOOS built
     from the wet top_fn would hit an atom-count mismatch, be swallowed by the
     broad except below, and report 0 frames, which reads as "never ran".
+
+    With neither backend installed a trajectory that exists cannot be measured,
+    so this raises rather than answering 0. Refusing here rather than at import
+    keeps a scheduler-only install, which never counts a frame, working.
     """
     traj_p = Path(traj_fn)
     if not traj_p.is_file() or traj_p.stat().st_size == 0:
         return 0
+    if _mdtraj is None and loos is None:
+        # 0 for a trajectory that exists reads as a generation that never ran,
+        # and the orchestrator deletes it.
+        raise ImportError(
+            f'Counting the frames in {traj_fn} needs mdtraj or LOOS, and '
+            'neither is importable.')
     if _mdtraj is not None:
         try:
             return _traj_len_mdtraj(traj_p)
@@ -179,38 +183,22 @@ def frame_timing(traj_fn, n_frames=None):
     return step0, steps_per_frame, time0, time_per_frame
 
 
-"""
-The harvest itself lives in harvester.harvest_generation; these two names are
-what existing submit scripts call, and each hands off to it.
-
-hconfig keys:
- - harvester_subset: which atoms the solute trajectory keeps, in LOOS syntax
-   unless harvester_subset_syntax says 'mdtraj'.
- - downsample_frq: keep every Nth frame in the solvated stream.
- - harvester_structure: structure file to build the model from. REQUIRED for
-   GROMACS runs, whose top_fn is a force-field topology that neither LOOS nor
-   mdtraj can build a model from. Defaults to config['top_fn'].
-"""
-
-
 def strip_and_downsample(config_fn, harvester_config_fn):
-    """Old entry point, kept for the harvest.sh scripts already on disk.
+    """The one old entry point, kept for the harvest.sh scripts already on disk.
 
-    The backend is chosen by box shape rather than pinned: LOOS keeps only the
-    diagonal of a triclinic cell, so pinning it here would harvest an old
-    triclinic campaign with a silently wrong box. Which atoms are kept does not
-    depend on the backend, so nothing else about the harvest changes.
+    New scripts call harvester.harvest_generation, which this hands off to with
+    no backend pinned, so the box shape picks one.
+
+    hconfig keys:
+     - harvester_subset: which atoms the solute trajectory keeps, in LOOS syntax
+       unless harvester_subset_syntax says 'mdtraj'.
+     - downsample_frq: keep every Nth frame in the solvated stream.
+     - harvester_structure: structure file to build the model from. REQUIRED for
+       GROMACS runs, whose top_fn is a force-field topology that neither LOOS nor
+       mdtraj can build a model from. Defaults to config['top_fn'].
     """
     from . import harvester
     return harvester.harvest_generation(config_fn, harvester_config_fn)
-
-
-def strip_ds_mdtraj(config_fn, harvester_config_fn):
-    """Old entry point pinning the mdtraj backend, which is right for a box of
-    either shape."""
-    from . import harvester
-    return harvester.harvest_generation(
-        config_fn, harvester_config_fn, backend=harvester.BACKEND_MDTRAJ)
 
 
 # Ready-made job scripts, keyed by scheduler. The module docstring says what a
@@ -646,6 +634,29 @@ class BadNodeRegistry:
         return node
 
 
+# Indent for the JSON files a runner and the orchestrator share.
+JSON_INDENT = 2
+
+
+def write_json_atomic(path, obj, indent=JSON_INDENT):
+    """Write obj to path as JSON under a temp name, and return path.
+
+    The rename is atomic and the temp name sits in the target's own directory,
+    so a reader racing the write sees either the whole old file or the whole new
+    one. Every file a running job and the orchestrator share is written this
+    way: a generation's config and status, a pack manifest, the seed map.
+
+    indent is a parameter rather than fixed because config.json has always been
+    written at 4 and the rest at 2, and reshaping files already on disk would
+    make a stored config differ from itself on the next boot.
+    """
+    path = Path(path)
+    tmp_p = path.with_name(path.name + '.tmp')
+    tmp_p.write_text(json.dumps(obj, indent=indent))
+    tmp_p.replace(path)
+    return path
+
+
 # Where a campaign records what each seed index means.
 SEED_MAP_NAME = 'seed_map.json'
 
@@ -663,12 +674,9 @@ def write_seed_map(seed_map_p: Path, seed_map: dict):
     """Write {seed index: label}, under a temp name so no boot reads a torn file."""
     seed_map_p = Path(seed_map_p)
     seed_map_p.parent.mkdir(parents=True, exist_ok=True)
-    tmp_p = seed_map_p.with_name(seed_map_p.name + '.tmp')
-    tmp_p.write_text(json.dumps(
-        {str(index): label for index, label in sorted(seed_map.items())},
-        indent=2))
-    tmp_p.replace(seed_map_p)
-    return seed_map_p
+    return write_json_atomic(
+        seed_map_p,
+        {str(index): label for index, label in sorted(seed_map.items())})
 
 
 def changed_seed_labels(recorded: dict, seed_labels):
@@ -854,6 +862,27 @@ def truncate_dcd_to_nframes(p: Path, target_nframes: int) -> int:
         f.write(struct.pack('<i', achievable))
     os.truncate(str(p), header_size + achievable * frame_size)
     return achievable
+
+
+def check_whole_frames(total_steps, write_interval, source='config_template'):
+    """Refuse a step count that is not a whole number of write_intervals.
+
+    The leftover steps write no frame and no checkpoint, so the run passes its
+    last report and never registers as finished: calx_remaining_steps keeps
+    asking for the remainder and every relaunch spends it again.
+
+    source names where the numbers came from, since the Farmer checks a config
+    template and a Clone checks the generation it is about to launch. Either
+    value being absent or zero means there is nothing to check. Returns
+    total_steps, so a caller can validate in place.
+    """
+    if not total_steps or not write_interval or total_steps % write_interval == 0:
+        return total_steps
+    raise ValueError(
+        f'{source} steps={total_steps} is not a whole number of '
+        f'write_interval={write_interval} steps. The remaining '
+        f'{total_steps % write_interval} would write no frame and no '
+        'checkpoint, so the generation would never finish.')
 
 
 def calx_remaining_steps(traj_fn, top_fn, total_steps, write_interval):
