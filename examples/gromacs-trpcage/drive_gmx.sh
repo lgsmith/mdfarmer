@@ -38,9 +38,9 @@ RUN_PY=(python -u)               # what activate_env leaves on PATH
 # ones for every job it submits.
 GMX_MODULES='modules/2.4-20250724 openmpi/cuda-4.1.8 gromacs/mpi-2024.4'
 GMX_BIN='gmx_mpi'
-# Whether farmer.py puts a launcher in front of that binary. Kept in step with
-# its GMX_LAUNCHER by hand; the check below is what catches them disagreeing.
-GMX_LAUNCHED=1
+# Whether farmer.py runs that binary with a scrubbed environment. Kept in step
+# with its GMX_SCRUB by hand; the check below is what catches them disagreeing.
+GMX_SCRUBBED=1
 
 GAP="${GAP:-60}"                     # seconds before re-entering a failed tender
 MIN_RUN_S=60                         # a shorter run is a broken setup, not a hiccup
@@ -134,15 +134,15 @@ preflight() {
         exit 1
     fi
     if gmx_survives_scheduler_env; then
-        if [ "$GMX_LAUNCHED" = 1 ]; then
+        if [ "$GMX_SCRUBBED" = 1 ]; then
             echo "note: $GMX_BIN runs fine under a scheduler environment, so the" >&2
-            echo "  launcher in farmer.py's GMX_LAUNCHER may no longer be needed." >&2
+            echo "  scrub in farmer.py's GMX_SCRUB may no longer be needed." >&2
         fi
-    elif [ "$GMX_LAUNCHED" != 1 ]; then
+    elif [ "$GMX_SCRUBBED" != 1 ]; then
         echo "$GMX_BIN aborts when a scheduler's environment is present, and" >&2
-        echo "farmer.py runs it with no launcher: every generation would die at" >&2
-        echo "grompp before any MD. Set GMX_LAUNCHER in farmer.py (mpirun -n 1" >&2
-        echo "for an OpenMPI build), or use a thread-MPI gmx." >&2
+        echo "farmer.py runs it with that environment intact: every generation" >&2
+        echo "would die at grompp before any MD. Set GMX_SCRUB in farmer.py to" >&2
+        echo "drop SLURM_STEP_ID, or use a thread-MPI gmx." >&2
         exit 1
     fi
     activate_env
