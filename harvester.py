@@ -9,6 +9,15 @@ same file at once.
 
 Both backends stream, since a generation can be tens of GB. LOOS is used when
 the box is rectangular and mdtraj when it is not.
+
+A generation that finished while the tender was down is never reaped, and
+recovery advances the clone past it, so nothing comes back for it. Those are
+found by unharvested_gen_dirs and sorted by classify_gen_dir, which reads only:
+a generation is called safe to harvest late when the engine's own record says
+it reached its step target, that record's target is the one the chain implies,
+and the trajectory holds exactly the frames the configs predict. Everything
+else is reported for a human, because an unharvested generation is evidence
+something went wrong and the harvest deletes the only copy of the original.
 """
 
 import json
@@ -17,6 +26,7 @@ from pathlib import Path
 
 from . import utilities as util
 from . import reimage
+from . import gmx_simulate
 
 
 # Written last, after both outputs are verified and the original is gone. Its
@@ -33,6 +43,12 @@ DRY_TOPOLOGY_NAME = 'dry-top.pdb'
 
 # What every generation directory calls its run record.
 CONFIG_NAME = util.CONFIG_NAME
+
+# What Harvester.reap writes into a generation directory at submission time.
+HARVESTER_CONFIG_NAME = 'hconfig.json'
+
+# The GROMACS runner's own progress record, read as a completion witness.
+GEN_STATUS_NAME = gmx_simulate.GEN_STATUS_NAME
 
 # Backend selectors for harvest_generation.
 BACKEND_AUTO = 'auto'
@@ -54,6 +70,26 @@ SEAM_KEEP = 'keep'
 SYNTAX_LOOS = 'loos'
 SYNTAX_MDTRAJ = 'mdtraj'
 
+# What classify_gen_dir can conclude about one generation directory.
+CATEGORY_HARVESTED = 'harvested'
+CATEGORY_COMPLETE = 'complete'
+CATEGORY_REPAIRABLE = 'repairable'
+CATEGORY_PARTLY_HARVESTED = 'partly-harvested'
+CATEGORY_UNFINISHED = 'unfinished'
+CATEGORY_INCONSISTENT = 'inconsistent'
+CATEGORY_UNPROVEN = 'unproven'
+CATEGORY_UNREADABLE = 'unreadable'
+
+# The only two a harvest may act on: one is provably finished, the other has
+# already lost its original and needs nothing but its sentinel.
+SAFE_CATEGORIES = (CATEGORY_COMPLETE, CATEGORY_REPAIRABLE)
+
+# Loudest first, so a report ends on what a human may safely act on.
+CATEGORY_ORDER = (CATEGORY_UNREADABLE, CATEGORY_INCONSISTENT,
+                  CATEGORY_PARTLY_HARVESTED, CATEGORY_UNPROVEN,
+                  CATEGORY_UNFINISHED, CATEGORY_REPAIRABLE,
+                  CATEGORY_COMPLETE, CATEGORY_HARVESTED)
+
 
 class HarvestError(RuntimeError):
     """Raised before the original is removed, so a failed harvest loses nothing."""
@@ -65,7 +101,7 @@ class Harvester:
 
     def __init__(self,  harvester_template: str,
                  scheduler: str, run_config=None, scriptname='harvest.sh',
-                 run_config_name='hconfig.json'):
+                 run_config_name=HARVESTER_CONFIG_NAME):
         # Expects a dict to be fed to harvester_template.format(**run_config)
         self.run_config = run_config
         self.run_config_name = run_config_name
@@ -828,3 +864,310 @@ def verify_dry_chain(gen_dirs, sentinel_name=SENTINEL_NAME,
         uniform_spacing=bool(np.allclose(spacing, spacing[0])) if len(spacing)
         else True,
         first_time=float(time[0]), last_time=float(time[-1]))
+
+
+def _read_json(path):
+    """The JSON object at path, or None if it is missing or will not parse."""
+    p = Path(path)
+    if not p.is_file():
+        return None
+    try:
+        return json.loads(p.read_text())
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        print(f'[harvest] {p} will not parse as JSON; ignoring.', flush=True)
+        return None
+
+
+def _verdict(row, category, reason):
+    """Stamp a category and the evidence for it onto a classification row."""
+    row['category'] = category
+    row['reason'] = reason
+    return row
+
+
+def _resolve_hconfig(gen_p, hconfig, harvester_config_name):
+    """(harvester config, where it came from) for one generation.
+
+    A generation the tender never reaped has no harvester config of its own,
+    since Harvester.reap writes that at submission time. A dict or path given
+    by the caller wins; otherwise the nearest sibling generation's is borrowed,
+    and _steps_per_gen refuses it if it belongs to a different generation
+    length.
+    """
+    if isinstance(hconfig, dict):
+        return hconfig, 'caller'
+    if hconfig is not None:
+        return _read_json(hconfig), str(hconfig)
+    own = _read_json(gen_p / harvester_config_name)
+    if own is not None:
+        return own, harvester_config_name
+    return _sibling_hconfig(gen_p, harvester_config_name)
+
+
+def _sibling_hconfig(gen_p, harvester_config_name):
+    """The harvester config of the nearest other generation in this clone."""
+    here = _gen_sort_key(gen_p)[1]
+    candidates = sorted(
+        (p for p in gen_p.parent.glob(f'*/{harvester_config_name}')
+         if p.parent != gen_p),
+        key=lambda p: abs(_gen_sort_key(p.parent)[1] - here))
+    for candidate in candidates:
+        found = _read_json(candidate)
+        if found is not None:
+            return found, str(candidate)
+    return None, None
+
+
+def _gromacs_witness(gen_p, restart_p, target_step, gen_status_name):
+    """gen_status.json, plus the checkpoint the next generation is seeded from."""
+    status = gmx_simulate.read_gen_status(gen_p,
+                                          gen_status_name=gen_status_name)
+    if status is None:
+        return gen_status_name, None, f'{gen_status_name} will not parse'
+    reached, recorded = status.get('reached_step'), status.get('target_step')
+    if not status.get('complete'):
+        return gen_status_name, False, (
+            f'{gen_status_name} says complete=false, at step {reached} of '
+            f'{recorded}')
+    if recorded is not None and recorded != target_step:
+        return gen_status_name, None, (
+            f'{gen_status_name} targets step {recorded}, but the generations '
+            f'before this one plus its own length end at {target_step}')
+    if reached is not None and reached < target_step:
+        return gen_status_name, None, (
+            f'{gen_status_name} says complete but reached only {reached} of '
+            f'{target_step}')
+    if not gmx_simulate.is_checkpoint(restart_p):
+        return gen_status_name, None, (
+            f'{gen_status_name} says complete but {restart_p.name} is not a '
+            'GROMACS checkpoint, so nothing was seeded from this generation')
+    return gen_status_name, True, (
+        f'{gen_status_name}: complete at step {reached} of {target_step}')
+
+
+def _openmm_witness(restart_p, target_step):
+    """state.xml's stepCount, which accumulates across generations."""
+    if not util.is_state_xml_usable(restart_p):
+        return restart_p.name, None, f'{restart_p.name} will not deserialize'
+    try:
+        state_step = util.state_xml_step_count(restart_p)
+    except ValueError as exc:
+        return restart_p.name, None, str(exc)
+    detail = f'{restart_p.name}: stepCount {state_step} of {target_step}'
+    if state_step == target_step:
+        return restart_p.name, True, detail
+    if state_step < target_step:
+        return restart_p.name, False, detail
+    return restart_p.name, None, detail + ', past the end of this generation'
+
+
+def completion_witness(gen_dir, config, target_step,
+                       gen_status_name=GEN_STATUS_NAME):
+    """(witness, finished, detail): does the engine's own record say it ended?
+
+    witness names the record that was read and is None when the generation left
+    none, which is not the same as saying it did not finish. finished is None
+    when the record contradicts itself or the rest of the chain.
+
+    Both engines are asked the same question in the terms each records it:
+    GROMACS writes gen_status.json only after its last mdrun, and OpenMM leaves
+    a state.xml whose stepCount is absolute across generations.
+    """
+    gen_p = Path(gen_dir)
+    restart_p = gen_p / config['restart_name']
+    if (gen_p / gen_status_name).is_file():
+        return _gromacs_witness(gen_p, restart_p, target_step, gen_status_name)
+    if gmx_simulate.is_checkpoint(restart_p):
+        return None, False, (
+            f'a GROMACS checkpoint but no {gen_status_name}, so nothing '
+            'records whether the run reached its target')
+    if restart_p.is_file():
+        return _openmm_witness(restart_p, target_step)
+    return None, False, f'no {gen_status_name} and no {restart_p.name}'
+
+
+def classify_gen_dir(gen_dir, hconfig=None, seam=SEAM_AUTO,
+                     sentinel_name=SENTINEL_NAME, config_name=CONFIG_NAME,
+                     harvester_config_name=HARVESTER_CONFIG_NAME,
+                     gen_status_name=GEN_STATUS_NAME,
+                     dry_prefix=DRY_PREFIX,
+                     downsample_prefix=DOWNSAMPLE_PREFIX,
+                     dry_topology_name=DRY_TOPOLOGY_NAME):
+    """Sort one generation directory into a category, with its evidence.
+
+    Reads; writes nothing. The row carries gen_dir, gen_index, category and
+    reason, plus whichever of steps_per_gen, frames_per_gen, target_step,
+    first_global_index, n_orig, skip_first, n_dry, n_down and witness were
+    established before the verdict.
+
+    Only CATEGORY_COMPLETE says a late harvest is safe, and it needs all of:
+    both configs parse; the generation length is recorded rather than guessed;
+    every earlier generation's config is present, so the chain places this one;
+    the engine's own record says it reached the step the chain implies; the
+    checkpoint that record depends on is readable; and the trajectory holds
+    exactly the frames that length predicts, seam resolved. Anything short of
+    that is a human's decision, not this function's.
+    """
+    gen_p = Path(gen_dir)
+    row = dict(gen_dir=str(gen_p), gen_index=None, category=None, reason='')
+    if (gen_p / sentinel_name).is_file():
+        return _verdict(row, CATEGORY_HARVESTED, f'{sentinel_name} is present')
+    config = _read_json(gen_p / config_name)
+    if config is None:
+        return _verdict(row, CATEGORY_UNREADABLE, f'no readable {config_name}')
+    row['gen_index'] = config.get('gen_index')
+    hconfig, row['hconfig_source'] = _resolve_hconfig(
+        gen_p, hconfig, harvester_config_name)
+    if hconfig is None:
+        return _verdict(row, CATEGORY_UNREADABLE,
+                        f'no {harvester_config_name} here or in a sibling '
+                        'generation, so the harvest plan is unknown')
+    try:
+        return _classify_against_plan(
+            gen_p, config, hconfig, row, seam=seam,
+            sentinel_name=sentinel_name, gen_status_name=gen_status_name,
+            dry_prefix=dry_prefix, downsample_prefix=downsample_prefix,
+            dry_topology_name=dry_topology_name)
+    except KeyError as exc:
+        return _verdict(row, CATEGORY_UNREADABLE,
+                        f'a config in this chain has no {exc} entry')
+    except FileNotFoundError as exc:
+        return _verdict(row, CATEGORY_UNREADABLE, str(exc))
+    except (HarvestError, ValueError) as exc:
+        return _verdict(row, CATEGORY_INCONSISTENT, str(exc))
+
+
+def _classify_against_plan(gen_p, config, hconfig, row, seam, sentinel_name,
+                           gen_status_name, dry_prefix, downsample_prefix,
+                           dry_topology_name):
+    """The part of classify_gen_dir that needs both configs to have parsed."""
+    traj_p, dry_p, down_p, dry_top_p, _ = harvest_paths(
+        gen_p, config, dry_prefix=dry_prefix,
+        downsample_prefix=downsample_prefix,
+        dry_topology_name=dry_topology_name, sentinel_name=sentinel_name)
+    structure_fn = hconfig.get('harvester_structure') or config['top_fn']
+    downsample_frq = hconfig['downsample_frq']
+    if downsample_frq < 1:
+        raise HarvestError(
+            f'downsample_frq is {downsample_frq}; keeping every Nth frame '
+            'needs N of at least 1.')
+    if (config.get('steps_per_gen') is None
+            and hconfig.get('steps_per_gen') is None):
+        return _verdict(row, CATEGORY_UNPROVEN,
+                        'neither config records steps_per_gen, so this '
+                        "generation's length would have to be guessed")
+    steps_per_gen = _steps_per_gen(config, hconfig)
+    frames_per_gen = check_commensurability(
+        steps_per_gen, config['write_interval'], downsample_frq)
+    first_global_index, chain_steps = chain_offsets(config, downsample_frq)
+    row.update(steps_per_gen=steps_per_gen, frames_per_gen=frames_per_gen,
+               first_global_index=first_global_index,
+               target_step=chain_steps + steps_per_gen)
+
+    if traj_p.is_symlink():
+        return _classify_symlinked(
+            row, traj_p, dry_p, down_p, dry_top_p, structure_fn,
+            frames_per_gen=frames_per_gen, gen_index=config['gen_index'],
+            first_global_index=first_global_index,
+            downsample_frq=downsample_frq, seam=seam,
+            sentinel_name=sentinel_name)
+    leftovers = [p.name for p in (dry_p, down_p, dry_top_p) if p.exists()]
+    if leftovers:
+        return _verdict(row, CATEGORY_PARTLY_HARVESTED,
+                        f'{", ".join(leftovers)} present with no '
+                        f'{sentinel_name}, but {traj_p.name} is still the '
+                        'original: a harvest died before it swapped them')
+    if not traj_p.is_file():
+        return _verdict(row, CATEGORY_UNFINISHED, f'no {traj_p.name}')
+    row['n_orig'] = util.get_traj_len(traj_p, structure_fn)
+    if not row['n_orig']:
+        return _verdict(row, CATEGORY_UNREADABLE,
+                        f'{traj_p.name} holds no readable frames')
+    # Raises unless the count is one of the two a generation of this length can
+    # hold, which is what proves the trajectory against the config.
+    row['skip_first'] = resolve_seam(row['n_orig'], frames_per_gen,
+                                     config['gen_index'], seam=seam)
+
+    witness, finished, detail = completion_witness(
+        gen_p, config, row['target_step'], gen_status_name=gen_status_name)
+    row['witness'] = witness
+    if witness is None:
+        return _verdict(row, CATEGORY_UNPROVEN, detail)
+    if finished is None:
+        return _verdict(row, CATEGORY_INCONSISTENT, detail)
+    if not finished:
+        return _verdict(row, CATEGORY_UNFINISHED, detail)
+    return _verdict(row, CATEGORY_COMPLETE,
+                    f'{detail}; {traj_p.name} holds {row["n_orig"]} frames for '
+                    f'a {frames_per_gen}-frame generation')
+
+
+def _classify_symlinked(row, traj_p, dry_p, down_p, dry_top_p, structure_fn,
+                        frames_per_gen, gen_index, first_global_index,
+                        downsample_frq, seam, sentinel_name):
+    """A generation whose original is already a symlink: a harvest died late."""
+    if not (dry_p.is_file() and down_p.is_file()):
+        return _verdict(row, CATEGORY_PARTLY_HARVESTED,
+                        f'{traj_p.name} is a symlink, so the original is gone, '
+                        f'but {dry_p.name} and {down_p.name} are not both here')
+    row['n_dry'] = util.get_traj_len(
+        dry_p, dry_top_p if dry_top_p.is_file() else None)
+    row['n_down'] = util.get_traj_len(down_p, structure_fn)
+    counts = (f'{dry_p.name} holds {row["n_dry"]} frames and {down_p.name} '
+              f'{row["n_down"]}')
+    if repair_candidates(row['n_dry'], row['n_down'], frames_per_gen, gen_index,
+                         first_global_index, downsample_frq, seam=seam):
+        return _verdict(row, CATEGORY_REPAIRABLE,
+                        f'the original is already gone and {counts}, which '
+                        f'matches the plan; only {sentinel_name} is missing')
+    return _verdict(row, CATEGORY_PARTLY_HARVESTED,
+                    f'{traj_p.name} is a symlink, so the original is gone, but '
+                    f'{counts}, which matches no plan for a '
+                    f'{frames_per_gen}-frame generation')
+
+
+def classify_campaign(top_level, hconfig=None, seam=SEAM_AUTO,
+                      skip_newest=False, sentinel_name=SENTINEL_NAME,
+                      config_name=CONFIG_NAME,
+                      harvester_config_name=HARVESTER_CONFIG_NAME,
+                      gen_status_name=GEN_STATUS_NAME):
+    """Classify every unharvested generation in a campaign. Reads only.
+
+    skip_newest leaves out each clone's newest generation, which on a running
+    campaign is the one in flight rather than one whose harvest was lost.
+    """
+    return [classify_gen_dir(gen_dir, hconfig=hconfig, seam=seam,
+                             sentinel_name=sentinel_name,
+                             config_name=config_name,
+                             harvester_config_name=harvester_config_name,
+                             gen_status_name=gen_status_name)
+            for gen_dir in unharvested_gen_dirs(
+                top_level, sentinel_name=sentinel_name,
+                config_name=config_name, skip_newest=skip_newest)]
+
+
+def format_report(rows, category_order=CATEGORY_ORDER,
+                  safe_categories=SAFE_CATEGORIES,
+                  harvester_config_name=HARVESTER_CONFIG_NAME):
+    """The per-generation table a human reads before deciding anything."""
+    counts = ', '.join(f'{c} {sum(r["category"] == c for r in rows)}'
+                       for c in category_order
+                       if any(r['category'] == c for r in rows))
+    lines = [f'unharvested generations: {counts or "none"}']
+    for category in category_order:
+        in_category = [r for r in rows if r['category'] == category]
+        if not in_category:
+            continue
+        lines.append(f'\n{category} ({len(in_category)})')
+        for row in in_category:
+            lines.append(f'  {row["gen_dir"]}')
+            lines.append(f'      {row["reason"]}')
+            borrowed = row.get('hconfig_source')
+            if borrowed not in (None, harvester_config_name):
+                lines.append(f'      judged against the harvester config at '
+                             f'{borrowed}')
+    n_safe = sum(r['category'] in safe_categories for r in rows)
+    lines.append(f'\n{n_safe} of {len(rows)} are safe to harvest without a '
+                 f'human looking first ({", ".join(safe_categories)}); the '
+                 'rest are left alone.')
+    return '\n'.join(lines)
