@@ -7,11 +7,13 @@ generations are deliberately far too short for that. What it proves is that
 the tender, the scheduler scripts, the interpreter on the compute node and the
 harvest all work before a real campaign is committed to them.
 
-    PY=/mnt/home/lsmith/miniforge3/envs/omm/bin/python
-    $PY farmer.py --check                   # readiness table, no writes
-    $PY farmer.py --dry-run                 # dirs, configs, scripts; submit nothing
-    nohup $PY -u farmer.py > shakedown-omm.tend.out 2>&1 &   # for real
-    touch stop                              # graceful stop, at the next tick
+drive_omm.sh is how it is launched: it holds the campaign's tender lock, logs
+somewhere findable, and detaches. The driver runs on its own just as well.
+
+    ./drive_omm.sh --check      # readiness table, no writes
+    ./drive_omm.sh --dry-run    # dirs, configs, scripts; submit nothing
+    ./drive_omm.sh              # start the tender, detached
+    ./drive_omm.sh --stop       # graceful stop, at the next tick
 """
 import argparse
 import gzip
@@ -134,20 +136,31 @@ STATE_COUNTER_RE = re.compile(r'stepCount="\d+" time="[^"]*"')
 STATE_COUNTER_ZERO = 'stepCount="0" time="0.0"'
 
 
-def inflate(src_gz, dest):
-    """Decompress one committed .gz input to `dest`, and return `dest`.
+def inflate(src_gz, dest, finish=None):
+    """Decompress one committed .gz input to `dest` once, and return `dest`.
 
     The inputs are committed gzipped so the example is self-contained without
     carrying 7 MB of XML, but omm_generation reads system_fn with
     `Path(system_fn).read_text()` and hands seed_fn to `Simulation.loadState`,
     neither of which inflates. So they are inflated once, here, rather than in
     the runner.
+
+    A `dest` already on disk is left alone: every tender boot calls this, and
+    re-inflating 7 MB each time would be waste, not safety. The inflated file
+    only appears under its real name once it is whole, so a boot killed
+    mid-inflate leaves nothing a later boot can mistake for done. `finish` is
+    called on the staged file first, for edits that must happen exactly once.
     """
     dest = Path(dest)
+    if dest.is_file():
+        return dest
     dest.parent.mkdir(parents=True, exist_ok=True)
-    with gzip.open(src_gz, 'rb') as fin, dest.open('wb') as fout:
+    staged = dest.with_name(dest.name + '.partial')
+    with gzip.open(src_gz, 'rb') as fin, staged.open('wb') as fout:
         shutil.copyfileobj(fin, fout)
-    return dest
+    if finish is not None:
+        finish(staged)
+    return staged.replace(dest)
 
 
 def zero_state_counters(state_p, pattern=STATE_COUNTER_RE,
@@ -183,14 +196,20 @@ def write_integrator(dest, temperature=TEMPERATURE, dt_ps=DT_PS,
 
 
 def prepare_inputs(inputs=INPUTS, prepared=PREPARED):
-    """Inflate the committed inputs and write the integrator beside them."""
+    """Inflate the committed inputs and write the integrator beside them.
+
+    Cheap enough to call on every tender boot: the inflation is skipped once
+    the inflated file is there, and the integrator is three numbers.
+    """
     prepared = Path(prepared)
     paths = dict(
         system_fn=inflate(inputs / 'system.xml.gz', prepared / 'system.xml'),
         top_fn=inflate(inputs / 'topology.pdb.gz', prepared / 'topology.pdb'),
-        seed_fn=inflate(inputs / 'state.xml.gz', prepared / 'state.xml'),
+        # Rewound while staged, so the seed is never on disk under its real
+        # name still carrying its equilibration's step count.
+        seed_fn=inflate(inputs / 'state.xml.gz', prepared / 'state.xml',
+                        finish=zero_state_counters),
     )
-    zero_state_counters(paths['seed_fn'])
     paths['integrator_xml'] = write_integrator(prepared / 'integrator.xml')
     return {key: str(p.resolve()) for key, p in paths.items()}
 
@@ -349,7 +368,10 @@ def main():
                           steps_per_gen=args.steps,
                           write_interval=args.write_interval,
                           harvest=not args.no_harvest, dry_run=args.dry_run)
-    farmer.start_tending_fields(update_interval=args.update_interval)
+    finished = farmer.start_tending_fields(update_interval=args.update_interval)
+    # The exit status a re-entering tender loop reads: 0 only when every clone
+    # finished, so a braked or failed run is re-entered rather than called done.
+    raise SystemExit(0 if finished else 1)
 
 
 if __name__ == '__main__':

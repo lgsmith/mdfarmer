@@ -14,7 +14,9 @@ slot and refill it, the way the OpenMM arm's 5-of-10 does.
 ## The system
 
 Trp-cage (20 residues, 304 atoms) in 3287 four-site waters with 6 K⁺ and 7 Cl⁻,
-13465 atoms, at 277 K under a C-rescale barostat.
+13465 atoms, at 277 K under a C-rescale barostat, in **amber03 + TIP4P-ice**
+(`sampling-trpcage/systems/fresh-omm/native-277`, whose `meta.json` marks the
+amber03 as benchmark-only).
 
 `inputs/` holds it gzipped — `gmx.gro.gz` and `gmx.top.gz`, 218 KB for 1.0 MB —
 plus `prod-277.mdp` committed plain, because it is 2 KB and it is the file you
@@ -22,13 +24,21 @@ will actually want to read. `prepare_inputs()` inflates the two before the
 Farmer is built. Unlike OpenMM, GROMACS has no choice about this: `grompp` takes
 file names, not streams.
 
+Inflation is a one-off, not a per-boot cost: `inflate()` returns immediately if
+the inflated file is already in `prepared/`, and writes through a `.partial`
+name so a boot killed halfway leaves nothing that a later boot could mistake for
+a finished file. Delete `prepared/` to force it again. Nothing here compresses
+trajectories or restarts *during* a run: `state.cpt` is GROMACS' own binary
+checkpoint written plain, and the only compression in the stream is the one
+built into the XTC format.
+
 `prod-277.mdp` is `sampling-trpcage/mdp/prod-277-a19opc3.mdp` with only the
 output strides and the step count shortened — `nstlog`, `nstenergy` and
 `nstxout-compressed` from 50000 to 2000, `nsteps` from 5e8 to 10000. The physics
 is untouched, so the shakedown runs the same integrator, coupling and
 constraints a real campaign would.
 
-### `-update cpu`, not `-update gpu`
+### Which arm this is: `-update cpu`, not `-update gpu`
 
 The water here is four-site (TIP4P-ice: one virtual site per molecule), and
 GROMACS refuses GPU update outright with virtual sites:
@@ -45,32 +55,72 @@ per-replica knee is 12 cores, not the 4 that suffices when the whole step is on
 the card. Measured here, solo on an RTX A6000: **574 ns/day at 4 cores, 785 at
 12.** Hence `CORES_PER_REPLICA = 12` and `PACK_CPUS = 24`.
 
-Swap in a three-site system (a19/OPC3) and `UPDATE_MODE = 'gpu'` with
+Swap in a three-site system (amber19/OPC3) and `UPDATE_MODE = 'gpu'` with
 `CORES_PER_REPLICA = 4` becomes the right setting; the mdp keeps v-rescale and
 C-rescale precisely so that switch needs no mdp edit.
+
+Those are the two arms, and they have to stay separate rather than be averaged
+into one campaign: 12 cores per replica against 4 is a different allocation
+shape and a slower replica, and because packing's speed loss is measured against
+that baseline, it also changes how favourable packing looks. All of this was
+settled in `sampling-trpcage`; here the system is only a framework for testing
+the code, and no performance work belongs in this example.
 
 ## Run it
 
 ```bash
-PY=/mnt/home/lsmith/miniforge3/envs/omm/bin/python
 cd examples/gromacs-trpcage
 
-$PY farmer.py --check      # run shape and input readiness; writes nothing
-$PY farmer.py --dry-run    # every directory, config, pack.json and sbatch.sh; submits nothing
-
-# for real:
-nohup $PY -u farmer.py > shakedown-gmx.tend.out 2>&1 &
-tail -f shakedown-gmx.tend.out
+./drive_gmx.sh --check      # run shape and input readiness; writes nothing
+./drive_gmx.sh --dry-run    # every directory, config, pack.json and sbatch.sh; submits nothing
+./drive_gmx.sh              # start the tender, detached, and return
+./drive_gmx.sh --status     # up or down, its pid, the tail of its log
+./drive_gmx.sh --stop       # brake it at its next tick
 ```
 
-The job script loads GROMACS itself (`ENV_SETUP` at the top of `farmer.py`;
-`modules/2.4-20250724 openmpi/cuda-4.1.8 gromacs/mpi-2024.4`, giving `gmx_mpi`)
-and refuses to run if the binary or `mdfarmer` is missing, rather than failing
-halfway through a generation. The tender itself needs `mdfarmer` importable by
-`$PY`; Slurm carries that environment to the node.
+`drive_gmx.sh` runs the driver under `mamba run -n omm python -u`
+(`--no-capture-output` is broken here, so `-u` is what keeps the log live) and
+appends to `shakedown-gmx.tend.out`, whose path it prints on the way out. Set
+`CONDA_ENV` to use a different environment. `farmer.py` still runs perfectly
+well by hand; the script is what makes it survivable.
 
-`touch stop` in the launch directory to stop the tender at the next tick.
-Everything it writes lands in `data/` and `prepared/`, both gitignored.
+**The tender is not a Slurm job.** It runs detached — `setsid nohup` — on the
+login node or workstation you launch it from, and outlives the shell that
+started it. It sleeps between ticks and needs nothing from the cluster but
+`sbatch`, so an allocation of its own would idle for hours; worse, that
+allocation's walltime or its preemption would end the campaign with it. Launch
+it anywhere `sbatch` and the `omm` environment both work.
+
+**One tender per campaign.** The loop holds `flock` on
+`data/shakedown-gmx/tender.lock` for as long as it lives, and a second
+`./drive_gmx.sh` refuses with the running one's pid rather than starting a rival
+that would submit every pack a second time. (`pack.lock` inside the job is the
+same idea one level down: it is what stops two mdruns entering one pack
+directory. Neither substitutes for the other.) The kernel drops the lock when the
+process dies, however it dies, so there is no stale pid file to reason about.
+
+**It re-enters.** `Farmer.launch` drops a pack for good on a single transient
+`sbatch` failure, and a fresh tender rebuilds every pack from disk and re-adopts
+the job ids still running, so re-entering is the recovery. The loop does that
+every 60 s (`GAP`) until the driver exits 0, which happens only when every clone
+has finished. Three exits inside a minute in a row is a broken setup rather than
+a scheduler hiccup, and the loop says so and gives up.
+
+Before it detaches, the script checks that `mamba`, `sbatch` and an importable
+`mdfarmer` are all there, prints which `mdfarmer` (in a git worktree that is not
+necessarily the tree you are reading), and confirms in a **subshell** that
+`module load modules/2.4-20250724 openmpi/cuda-4.1.8 gromacs/mpi-2024.4` really
+yields a `gmx_mpi`: a campaign whose every generation would die at `mdrun` should
+fail on the login node in one second, not across 25 pack jobs. The subshell is
+deliberate — the tender never calls `gmx` itself, and leaving the module tree in
+its environment would put module libraries ahead of the conda ones in every job
+it submits. On the node it is `ENV_SETUP` at the top of `farmer.py` that loads
+them, and the job script refuses to run if `gmx_mpi` or `mdfarmer` is missing.
+
+`./drive_gmx.sh --stop` writes the `stop` brake file the driver watches for; the
+tender exits at its next tick (20 s), the loop then exits too, and pack jobs
+already submitted keep running. Everything a run writes lands in `data/` and
+`prepared/`, both gitignored.
 
 ## What to expect
 

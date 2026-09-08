@@ -13,9 +13,11 @@ per clone, no packing — the GROMACS example next door is the packed arm.
 ## The system
 
 Trp-cage (20 residues, 304 atoms) in 3287 four-site waters with 6 K⁺ and 7 Cl⁻,
-13465 atoms in a 4.68 nm cube, at 277 K under a Monte Carlo barostat. It is the
-same system `examples/gromacs-trpcage` runs, so the two datasets are comparable
-frame for frame.
+13465 atoms in a 4.68 nm cube, at 277 K under a Monte Carlo barostat, in
+**amber03 + TIP4P-ice** (`sampling-trpcage/systems/fresh-omm/native-277`, whose
+`meta.json` marks the amber03 as benchmark-only). It is the same system
+`examples/gromacs-trpcage` runs, so the two datasets are comparable frame for
+frame.
 
 `inputs/` holds it gzipped — `system.xml.gz`, `state.xml.gz`,
 `topology.pdb.gz`, 1.07 MB for 6.6 MB of XML. `prepare_inputs()` inflates them
@@ -25,33 +27,88 @@ the system with `Path(system_fn).read_text()` and hands the seed to
 happily take `gzip.open(p, 'rt').read()` — `tests/test_example_inputs.py`
 checks that it round-trips — but nothing in the runner does that today.)
 
+Inflation is a one-off, not a per-boot cost: `inflate()` returns immediately if
+the inflated file is already in `prepared/`, and writes through a `.partial`
+name so a boot killed halfway leaves nothing that a later boot could mistake for
+a finished file. Delete `prepared/` to force it again. Nothing in either example
+compresses trajectories or restarts *during* a run — the DCD and the `state.xml`
+restarts are written plain, and the only lossy compression anywhere is the XTC
+format the GROMACS arm writes natively.
+
 `prepare_inputs()` also rewinds the seed state's `stepCount` from 150000 to 0.
 That number is left over from the equilibration this system came from, and
 `seeder._try_recover_gen` reads `state.xml`'s `stepCount` as a step counted from
 the start of the campaign — so a seed carrying it would make every *resumed*
 generation look finished before it started. A clean first run would not notice.
 
+### Which arm this is
+
+This is the **TIP4P-ice (4-site) arm**, the same one `examples/gromacs-trpcage`
+runs, and the two physics arms have to stay separate because of what the water
+does to the GROMACS side: one virtual site per water means GROMACS refuses
+`mdrun -update gpu`, the update runs on the CPU, and the per-replica knee moves
+from ~4 cores to 12. An **amber19 + OPC3** (3-site) build is the other arm:
+`-update gpu`, ~4 cores per replica, faster per card — and because packing's
+speed loss is measured against that faster baseline, it also changes how
+favourable packing looks. Mixed into one campaign the two would need different
+core budgets per replica and could not be compared.
+
+OpenMM has no `-update gpu` switch to lose — the CUDA platform integrates and
+places virtual sites on the card either way — so the four-site water costs this
+arm nothing: `CPUS = 2`, one busy core and a spare, whichever water it is. That
+asymmetry is why the GROMACS arm asks for 24 cores a pack and this one asks for
+2 a clone. All of it was settled in `sampling-trpcage`; here the system is only
+a framework for testing the code, and no performance work belongs in either
+example.
+
 ## Run it
 
 ```bash
-PY=/mnt/home/lsmith/miniforge3/envs/omm/bin/python
 cd examples/openmm-trpcage
 
-$PY farmer.py --check      # run shape and input readiness; writes nothing
-$PY farmer.py --dry-run    # every directory, config and sbatch.sh; submits nothing
-
-# for real:
-nohup $PY -u farmer.py > shakedown-omm.tend.out 2>&1 &
-tail -f shakedown-omm.tend.out
+./drive_omm.sh --check      # run shape and input readiness; writes nothing
+./drive_omm.sh --dry-run    # every directory, config and sbatch.sh; submits nothing
+./drive_omm.sh              # start the tender, detached, and return
+./drive_omm.sh --status     # up or down, its pid, the tail of its log
+./drive_omm.sh --stop       # brake it at its next tick
 ```
 
-`mdfarmer` must be importable by `$PY` — the submit script checks and refuses
-rather than failing on the node. Slurm exports the tender's environment, so
-launching from a shell where `python -c 'import mdfarmer'` works is enough.
+`drive_omm.sh` runs the driver under `mamba run -n omm python -u`
+(`--no-capture-output` is broken here, so `-u` is what keeps the log live) and
+appends to `shakedown-omm.tend.out`, whose path it prints on the way out. Set
+`CONDA_ENV` to use a different environment. `farmer.py` still runs perfectly
+well by hand; the script is what makes it survivable.
 
-To stop the tender gracefully, `touch stop` in the directory you launched it
-from; it exits at the next tick. Everything it writes lands in `data/` and
-`prepared/`, both gitignored.
+**The tender is not a Slurm job.** It runs detached — `setsid nohup` — on the
+login node or workstation you launch it from, and outlives the shell that
+started it. It sleeps between ticks and needs nothing from the cluster but
+`sbatch`, so an allocation of its own would idle for hours; worse, that
+allocation's walltime or its preemption would end the campaign with it. Launch
+it anywhere `sbatch` and the `omm` environment both work.
+
+**One tender per campaign.** The loop holds `flock` on
+`data/shakedown-omm/tender.lock` for as long as it lives, and a second
+`./drive_omm.sh` refuses with the running one's pid rather than starting a rival
+that would submit every clone a second time. The kernel drops the lock when the
+process dies, however it dies, so there is no stale pid file to reason about.
+
+**It re-enters.** `Farmer.launch` drops a clone for good on a single transient
+`sbatch` failure, and a fresh tender rebuilds every clone from disk and re-adopts
+the job ids still running, so re-entering is the recovery. The loop does that
+every 60 s (`GAP`) until the driver exits 0, which happens only when every clone
+has finished. Three exits inside a minute in a row is a broken setup rather than
+a scheduler hiccup, and the loop says so and gives up.
+
+Before it detaches, the script checks that `mamba`, `sbatch` and an importable
+`mdfarmer` are all there, and prints which `mdfarmer` — `import mdfarmer`
+resolves to whatever the environment installed, which in a git worktree is not
+necessarily the tree you are reading. On the node, the submit script makes the
+same check and refuses rather than failing mid-generation.
+
+`./drive_omm.sh --stop` writes the `stop` brake file the driver watches for; the
+tender exits at its next tick (20 s), the loop then exits too, and jobs already
+submitted keep running. Everything a run writes lands in `data/` and `prepared/`,
+both gitignored.
 
 ## What to expect
 

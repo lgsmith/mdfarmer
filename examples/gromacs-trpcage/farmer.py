@@ -7,11 +7,13 @@ It proves the packed path end to end -- one sbatch, one MPS daemon, one pack
 lock, two pinned mdruns, per-member failure and recovery, and a harvest per
 generation -- before a real campaign is committed to it.
 
-    PY=/mnt/home/lsmith/miniforge3/envs/omm/bin/python
-    $PY farmer.py --check                   # readiness table, no writes
-    $PY farmer.py --dry-run                 # dirs, configs, scripts; submit nothing
-    nohup $PY -u farmer.py > shakedown-gmx.tend.out 2>&1 &   # for real
-    touch stop                              # graceful stop, at the next tick
+drive_gmx.sh is how it is launched: it holds the campaign's tender lock, logs
+somewhere findable, and detaches. The driver runs on its own just as well.
+
+    ./drive_gmx.sh --check      # readiness table, no writes
+    ./drive_gmx.sh --dry-run    # dirs, configs, scripts; submit nothing
+    ./drive_gmx.sh              # start the tender, detached
+    ./drive_gmx.sh --stop       # graceful stop, at the next tick
 """
 import argparse
 import gzip
@@ -171,22 +173,34 @@ HARVEST_FSTRING = """#!/bin/bash
 
 
 def inflate(src_gz, dest):
-    """Decompress one committed .gz input to `dest`, and return `dest`.
+    """Decompress one committed .gz input to `dest` once, and return `dest`.
 
     The inputs are committed gzipped so the example is self-contained without
     carrying a megabyte of .gro and .top. GROMACS cannot read them that way --
     grompp takes file names, not streams -- so they are inflated once, here,
     before the Farmer is built.
+
+    A `dest` already on disk is left alone: every tender boot calls this, and
+    re-inflating each time would be waste, not safety. The inflated file only
+    appears under its real name once it is whole, so a boot killed mid-inflate
+    leaves nothing a later boot can mistake for done.
     """
     dest = Path(dest)
+    if dest.is_file():
+        return dest
     dest.parent.mkdir(parents=True, exist_ok=True)
-    with gzip.open(src_gz, 'rb') as fin, dest.open('wb') as fout:
+    staged = dest.with_name(dest.name + '.partial')
+    with gzip.open(src_gz, 'rb') as fin, staged.open('wb') as fout:
         shutil.copyfileobj(fin, fout)
-    return dest
+    return staged.replace(dest)
 
 
 def prepare_inputs(inputs=INPUTS, prepared=PREPARED):
-    """Inflate the committed inputs; the .mdp is small enough to commit plain."""
+    """Inflate the committed inputs; the .mdp is small enough to commit plain.
+
+    Cheap enough to call on every tender boot: the inflation is skipped once
+    the inflated file is there.
+    """
     paths = dict(
         structure_fn=inflate(inputs / 'gmx.gro.gz', Path(prepared) / 'gmx.gro'),
         top_fn=inflate(inputs / 'gmx.top.gz', Path(prepared) / 'gmx.top'),
@@ -366,7 +380,10 @@ def main():
                           steps_per_gen=args.steps,
                           write_interval=args.write_interval,
                           harvest=not args.no_harvest, dry_run=args.dry_run)
-    farmer.start_tending_fields(update_interval=args.update_interval)
+    finished = farmer.start_tending_fields(update_interval=args.update_interval)
+    # The exit status a re-entering tender loop reads: 0 only when every clone
+    # finished, so a braked or failed run is re-entered rather than called done.
+    raise SystemExit(0 if finished else 1)
 
 
 if __name__ == '__main__':
