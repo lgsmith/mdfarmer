@@ -465,13 +465,10 @@ def harvest_generation(config_fn, harvester_config_fn,
     hconfig = json.loads(Path(harvester_config_fn).read_text())
     gen_dir = Path(config_fn).resolve().parent
 
-    sep = config['sep']
-    traj_fn = f"{config['traj_name']}{config['traj_suffix']}"
-    traj_p = gen_dir / traj_fn
-    dry_p = gen_dir / f'{dry_prefix}{sep}{traj_fn}'
-    down_p = gen_dir / f'{downsample_prefix}{sep}{traj_fn}'
-    sentinel_p = gen_dir / sentinel_name
-    dry_top_p = gen_dir / dry_topology_name
+    traj_p, dry_p, down_p, dry_top_p, sentinel_p = harvest_paths(
+        gen_dir, config, dry_prefix=dry_prefix,
+        downsample_prefix=downsample_prefix,
+        dry_topology_name=dry_topology_name, sentinel_name=sentinel_name)
 
     if sentinel_p.is_file():
         record = json.loads(sentinel_p.read_text())
@@ -561,6 +558,24 @@ def harvest_generation(config_fn, harvester_config_fn,
     # read of this one would say the generation still needs harvesting.
     util.write_json_atomic(sentinel_p, record)
     return record
+
+
+def harvest_paths(gen_dir, config, dry_prefix=DRY_PREFIX,
+                  downsample_prefix=DOWNSAMPLE_PREFIX,
+                  dry_topology_name=DRY_TOPOLOGY_NAME,
+                  sentinel_name=SENTINEL_NAME):
+    """(original, dry, downsampled, dry topology, sentinel) for a generation.
+
+    Named in one place so the classifier looks for exactly the files
+    harvest_generation would write.
+    """
+    gen_p = Path(gen_dir)
+    traj_fn = f"{config['traj_name']}{config['traj_suffix']}"
+    return (gen_p / traj_fn,
+            gen_p / f"{dry_prefix}{config['sep']}{traj_fn}",
+            gen_p / f"{downsample_prefix}{config['sep']}{traj_fn}",
+            gen_p / dry_topology_name,
+            gen_p / sentinel_name)
 
 
 def _steps_per_gen(config, hconfig):
