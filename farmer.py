@@ -438,14 +438,9 @@ class Farmer:
             )
 
         # Both keys are optional; not every engine's template carries them.
-        steps = self.config_template.get('steps')
-        write_interval = self.config_template.get('write_interval')
-        if steps and write_interval and steps % write_interval:
-            raise ValueError(
-                f'config_template steps={steps} is not a whole number of '
-                f'write_interval={write_interval} steps. The remaining '
-                f'{steps % write_interval} would write no frame and no '
-                'checkpoint, so the generation would never finish.')
+        util.check_whole_frames(self.config_template.get('steps'),
+                                self.config_template.get('write_interval'),
+                                source='config_template')
 
         # Whoever set this meant "flush per frame", already the default.
         if self.config_template.get('buffering') == 0:
