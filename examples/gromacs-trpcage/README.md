@@ -66,22 +66,78 @@ that baseline, it also changes how favourable packing looks. All of this was
 settled in `sampling-trpcage`; here the system is only a framework for testing
 the code, and no performance work belongs in this example.
 
+## Setting it up
+
+One conda environment for mdfarmer, and GROMACS from somewhere else entirely:
+
+```bash
+mamba create -n mdfarmer -c conda-forge python=3.12 loos mdtraj
+mamba activate mdfarmer
+pip install -e /path/to/mdfarmer      # editable: this checkout is what runs
+```
+
+No `openmm` and no `gromacs` in that list. The tender never runs MD — it writes
+job scripts and reads what came back — and `gmx` reaches the compute node
+through `ENV_SETUP`, which the job script sources there. `loos` and `mdtraj` are
+both needed, because the harvest picks between them per trajectory: LOOS for a
+rectangular box, mdtraj for a triclinic one it cannot represent.
+
+Install **editable**. It puts a pointer to your checkout in the environment
+rather than a copy, so the code you edit is the code the compute node runs. A
+regular install or a `PYTHONPATH` entry work too, but then `import mdfarmer` can
+quietly resolve to a different tree than the one you are reading — which is why
+`--check` prints the file it landed on. Read that line.
+
+Then name the environment when you launch:
+
+```bash
+./drive_gmx.sh --env mdfarmer --check
+```
+
+Nothing has to be installed on the compute node. `sbatch` exports the tender's
+environment by default, and independently of that the job script pins the
+absolute interpreter — `sys.executable` as the tender saw it — and refuses with
+`MISSING INTERPRETER` rather than running the wrong python.
+
+### What is site-specific
+
+Set for Flatiron's `rusty`. These are the first things to change elsewhere, all
+constants at the top of `farmer.py`:
+
+| constant | here | what to check |
+|---|---|---|
+| `ENV_SETUP` | `module load modules/2.4-20250724 openmpi/cuda-4.1.8 gromacs/mpi-2024.4` | whatever puts a CUDA GROMACS on `PATH` for you; `--check` proves it in a subshell before submitting anything |
+| `GMX_BIN` | `gmx_mpi` | `gmx` on a thread-MPI build. `gmx_pack` probes for `-ntmpi` rather than assuming, so either is fine |
+| `PARTITION` | `gpu` | a partition your account can submit to |
+| `GRES` | `gpu:rtx_pro_6000_blackwell:1` | `sinfo -o '%P %G'` for the names your cluster uses |
+| `QOS` | unset | some sites require one |
+| `EXTRA_SBATCH` | empty | account/reservation lines, if your site wants them |
+| `PACK_CPUS` | 24 | cores per pack, split across its replicas |
+| `HARVEST_PARTITION` | `ccb` | any CPU-only partition |
+| `WALLTIME` | `00:20:00` | fine for seconds of MD; raise for a real campaign |
+
+Packing two replicas onto one card only pays with an MPS daemon, which the job
+script starts per job. Whether it pays *at all* is system-specific — see
+`plans/NOTE-gpu-packing-scaling.md` and `tests/test_pack_scaling.py`.
+
 ## Run it
 
 ```bash
 cd examples/gromacs-trpcage
 
-./drive_gmx.sh --check      # run shape and input readiness; writes nothing
-./drive_gmx.sh --dry-run    # every directory, config, pack.json and sbatch.sh; submits nothing
-./drive_gmx.sh              # start the tender, detached, and return
-./drive_gmx.sh --status     # up or down, its pid, the tail of its log
-./drive_gmx.sh --stop       # brake it at its next tick
+./drive_gmx.sh --env mdfarmer --check      # run shape and input readiness; writes nothing
+./drive_gmx.sh --env mdfarmer --dry-run    # every directory, config, pack.json and sbatch.sh; submits nothing
+./drive_gmx.sh --env mdfarmer              # start the tender, detached, and return
+./drive_gmx.sh --env mdfarmer --status     # up or down, its pid, the tail of its log
+./drive_gmx.sh --env mdfarmer --stop       # brake it at its next tick
 ```
 
-`drive_gmx.sh` runs the driver under `mamba run -n omm python -u`
-(`--no-capture-output` is broken here, so `-u` is what keeps the log live) and
-appends to `shakedown-gmx.tend.out`, whose path it prints on the way out. Set
-`CONDA_ENV` to use a different environment. `farmer.py` still runs perfectly
+`drive_gmx.sh` activates the environment you name and runs the driver as a
+direct child, appending to `shakedown-gmx.tend.out`, whose path it prints on the
+way out. Direct rather than under `mamba run` on purpose: the loop reads the
+driver's exit status to decide whether to re-enter, and you read its log live,
+and a wrapper process sits in the way of both. `--env` names the environment;
+`CONDA_ENV` in the environment does the same. `farmer.py` still runs perfectly
 well by hand; the script is what makes it survivable.
 
 **The tender is not a Slurm job.** It runs detached — `setsid nohup` — on the
@@ -89,7 +145,7 @@ login node or workstation you launch it from, and outlives the shell that
 started it. It sleeps between ticks and needs nothing from the cluster but
 `sbatch`, so an allocation of its own would idle for hours; worse, that
 allocation's walltime or its preemption would end the campaign with it. Launch
-it anywhere `sbatch` and the `omm` environment both work.
+it anywhere `sbatch` and your environment both work.
 
 **One tender per campaign.** The loop holds `flock` on
 `data/shakedown-gmx/tender.lock` for as long as it lives, and a second
@@ -106,8 +162,8 @@ every 60 s (`GAP`) until the driver exits 0, which happens only when every clone
 has finished. Three exits inside a minute in a row is a broken setup rather than
 a scheduler hiccup, and the loop says so and gives up.
 
-Before it detaches, the script checks that `mamba`, `sbatch` and an importable
-`mdfarmer` are all there, prints which `mdfarmer` (in a git worktree that is not
+Before it detaches, the script checks that `sbatch` and an importable
+`mdfarmer` are both there, prints which `mdfarmer` (in a git worktree that is not
 necessarily the tree you are reading), and confirms in a **subshell** that
 `module load modules/2.4-20250724 openmpi/cuda-4.1.8 gromacs/mpi-2024.4` really
 yields a `gmx_mpi`: a campaign whose every generation would die at `mdrun` should
