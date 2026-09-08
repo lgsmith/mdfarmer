@@ -90,6 +90,9 @@ CATEGORY_ORDER = (CATEGORY_UNREADABLE, CATEGORY_INCONSISTENT,
                   CATEGORY_UNFINISHED, CATEGORY_REPAIRABLE,
                   CATEGORY_COMPLETE, CATEGORY_HARVESTED)
 
+# A recovery harvest keeps the original by default; see harvest_recovered.
+RECOVERY_UNLINK = False
+
 
 class HarvestError(RuntimeError):
     """Raised before the original is removed, so a failed harvest loses nothing."""
@@ -1171,3 +1174,70 @@ def format_report(rows, category_order=CATEGORY_ORDER,
                  f'human looking first ({", ".join(safe_categories)}); the '
                  'rest are left alone.')
     return '\n'.join(lines)
+
+
+def harvest_recovered(rows, hconfig=None, unlink=RECOVERY_UNLINK,
+                      seam=SEAM_AUTO, safe_categories=SAFE_CATEGORIES,
+                      config_name=CONFIG_NAME,
+                      harvester_config_name=HARVESTER_CONFIG_NAME):
+    """Harvest the classified generations that were proved safe, and no others.
+
+    unlink defaults to False here, unlike a harvest the tender submits: these
+    generations went unwitnessed, so the original is kept and the disk is
+    reclaimed by hand once the dry copies have been looked at. Pass unlink=True
+    to accept _verify_counts alone, as the tender's own harvest does.
+
+    The harvest runs in this process, on the same code path the harvest job
+    runs; a campaign with many generations to recover is better handed to the
+    scheduler one directory at a time.
+    """
+    results = []
+    for row in rows:
+        if row['category'] not in safe_categories:
+            continue
+        gen_p = Path(row['gen_dir'])
+        hconfig_p = gen_p / harvester_config_name
+        if not hconfig_p.is_file():
+            # harvest_generation reads the plan from this directory, and a
+            # generation the tender never reaped has none of its own.
+            borrowed, source = _resolve_hconfig(gen_p, hconfig,
+                                                harvester_config_name)
+            print(f'[harvest] {gen_p}: no {harvester_config_name} of its own; '
+                  f'writing the one from {source}.', flush=True)
+            util.write_json_atomic(hconfig_p, borrowed)
+        results.append(harvest_generation(gen_p / config_name, hconfig_p,
+                                          seam=seam, unlink=unlink))
+    return results
+
+
+def _main(argv=None):
+    """`python -m mdfarmer.harvester <campaign>`: report, and only then act."""
+    import argparse
+    ap = argparse.ArgumentParser(
+        description='Report the generations a campaign never harvested, and '
+                    'optionally harvest the ones that are provably safe.')
+    ap.add_argument('top_level', help="the campaign's traj_dir_top_level")
+    ap.add_argument('--skip-newest', action='store_true',
+                    help="leave out each clone's newest generation, which on a "
+                         'running campaign is the one in flight')
+    ap.add_argument('--hconfig', default=None,
+                    help='harvester config to judge every generation against; '
+                         "by default each borrows a sibling's")
+    ap.add_argument('--harvest', action='store_true',
+                    help=f'harvest the {"/".join(SAFE_CATEGORIES)} generations. '
+                         'Without this nothing is modified.')
+    ap.add_argument('--unlink', action='store_true', default=RECOVERY_UNLINK,
+                    help='let the harvest replace each original with a symlink '
+                         'to its dry copy; off on this path')
+    args = ap.parse_args(argv)
+    rows = classify_campaign(args.top_level, hconfig=args.hconfig,
+                             skip_newest=args.skip_newest)
+    print(format_report(rows), flush=True)
+    if args.harvest:
+        harvest_recovered(rows, hconfig=args.hconfig, unlink=args.unlink)
+    return 0
+
+
+if __name__ == '__main__':
+    import sys
+    sys.exit(_main())
