@@ -173,7 +173,9 @@ def _try_recover_gen(gen_path: Path, *,
     if nset == 0:
         return gen_index, seed_fn, total_steps, False
 
-    gen_start_step = util.steps_before(
+    # Counted from the campaign's own zero: the seed may have arrived already
+    # carrying the step count of whatever equilibrated it.
+    gen_start_step = prev_config.get('step_origin', 0) + util.steps_before(
         prev_config['traj_dir_top_level'], prev_config['seed_index'],
         prev_config['clone_index'], gen_index, prev_config['dirname_pad'],
         sep=prev_config['sep'])
@@ -303,6 +305,10 @@ class Clone:
             self.total_steps = steps_per_gen
         self.remaining_steps = config['steps']
         seed_p = Path(seed_fn)
+        # An equilibrated seed's state.xml already carries a step count, and
+        # every later one counts on from it. Recorded once so recovery can tell
+        # this campaign's own steps from the seed's history.
+        config.setdefault('step_origin', util.state_xml_origin(seed_p))
         self.set_seed(seed_p)
         self.scheduler = scheduler
         if cleandoc_sched_fstring:

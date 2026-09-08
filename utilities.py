@@ -834,6 +834,22 @@ def is_state_xml_usable(p: Path) -> bool:
     return True
 
 
+def state_xml_origin(seed_fn):
+    """The step an initial seed already carries, or 0 if it carries none.
+
+    An equilibrated seed's state.xml records the step its equilibration reached,
+    and every later stepCount counts on from there. A campaign's own step zero
+    is therefore this offset, not zero, and recovery has to subtract it.
+    """
+    seed_p = Path(seed_fn)
+    if seed_p.suffix.lower() != '.xml' or not seed_p.is_file():
+        return 0
+    try:
+        return state_xml_step_count(seed_p)
+    except (ValueError, OSError):
+        return 0
+
+
 def state_xml_step_count(p: Path) -> int:
     """The step a state.xml stopped at. ValueError if it cannot be read."""
     import xml.etree.ElementTree as ET
