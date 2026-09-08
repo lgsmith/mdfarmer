@@ -14,7 +14,9 @@ slot and refill it, the way the OpenMM arm's 5-of-10 does.
 ## The system
 
 Trp-cage (20 residues, 304 atoms) in 3287 four-site waters with 6 K⁺ and 7 Cl⁻,
-13465 atoms, at 277 K under a C-rescale barostat.
+13465 atoms, at 277 K under a C-rescale barostat, in **amber03 + TIP4P-ice**
+(`sampling-trpcage/systems/fresh-omm/native-277`, whose `meta.json` marks the
+amber03 as benchmark-only).
 
 `inputs/` holds it gzipped — `gmx.gro.gz` and `gmx.top.gz`, 218 KB for 1.0 MB —
 plus `prod-277.mdp` committed plain, because it is 2 KB and it is the file you
@@ -36,7 +38,7 @@ output strides and the step count shortened — `nstlog`, `nstenergy` and
 is untouched, so the shakedown runs the same integrator, coupling and
 constraints a real campaign would.
 
-### `-update cpu`, not `-update gpu`
+### Which arm this is: `-update cpu`, not `-update gpu`
 
 The water here is four-site (TIP4P-ice: one virtual site per molecule), and
 GROMACS refuses GPU update outright with virtual sites:
@@ -53,9 +55,16 @@ per-replica knee is 12 cores, not the 4 that suffices when the whole step is on
 the card. Measured here, solo on an RTX A6000: **574 ns/day at 4 cores, 785 at
 12.** Hence `CORES_PER_REPLICA = 12` and `PACK_CPUS = 24`.
 
-Swap in a three-site system (a19/OPC3) and `UPDATE_MODE = 'gpu'` with
+Swap in a three-site system (amber19/OPC3) and `UPDATE_MODE = 'gpu'` with
 `CORES_PER_REPLICA = 4` becomes the right setting; the mdp keeps v-rescale and
 C-rescale precisely so that switch needs no mdp edit.
+
+Those are the two arms, and they have to stay separate rather than be averaged
+into one campaign: 12 cores per replica against 4 is a different allocation
+shape and a slower replica, and because packing's speed loss is measured against
+that baseline, it also changes how favourable packing looks. All of this was
+settled in `sampling-trpcage`; here the system is only a framework for testing
+the code, and no performance work belongs in this example.
 
 ## Run it
 

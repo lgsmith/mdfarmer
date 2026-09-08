@@ -13,9 +13,11 @@ per clone, no packing — the GROMACS example next door is the packed arm.
 ## The system
 
 Trp-cage (20 residues, 304 atoms) in 3287 four-site waters with 6 K⁺ and 7 Cl⁻,
-13465 atoms in a 4.68 nm cube, at 277 K under a Monte Carlo barostat. It is the
-same system `examples/gromacs-trpcage` runs, so the two datasets are comparable
-frame for frame.
+13465 atoms in a 4.68 nm cube, at 277 K under a Monte Carlo barostat, in
+**amber03 + TIP4P-ice** (`sampling-trpcage/systems/fresh-omm/native-277`, whose
+`meta.json` marks the amber03 as benchmark-only). It is the same system
+`examples/gromacs-trpcage` runs, so the two datasets are comparable frame for
+frame.
 
 `inputs/` holds it gzipped — `system.xml.gz`, `state.xml.gz`,
 `topology.pdb.gz`, 1.07 MB for 6.6 MB of XML. `prepare_inputs()` inflates them
@@ -38,6 +40,26 @@ That number is left over from the equilibration this system came from, and
 `seeder._try_recover_gen` reads `state.xml`'s `stepCount` as a step counted from
 the start of the campaign — so a seed carrying it would make every *resumed*
 generation look finished before it started. A clean first run would not notice.
+
+### Which arm this is
+
+This is the **TIP4P-ice (4-site) arm**, the same one `examples/gromacs-trpcage`
+runs, and the two physics arms have to stay separate because of what the water
+does to the GROMACS side: one virtual site per water means GROMACS refuses
+`mdrun -update gpu`, the update runs on the CPU, and the per-replica knee moves
+from ~4 cores to 12. An **amber19 + OPC3** (3-site) build is the other arm:
+`-update gpu`, ~4 cores per replica, faster per card — and because packing's
+speed loss is measured against that faster baseline, it also changes how
+favourable packing looks. Mixed into one campaign the two would need different
+core budgets per replica and could not be compared.
+
+OpenMM has no `-update gpu` switch to lose — the CUDA platform integrates and
+places virtual sites on the card either way — so the four-site water costs this
+arm nothing: `CPUS = 2`, one busy core and a spare, whichever water it is. That
+asymmetry is why the GROMACS arm asks for 24 cores a pack and this one asks for
+2 a clone. All of it was settled in `sampling-trpcage`; here the system is only
+a framework for testing the code, and no performance work belongs in either
+example.
 
 ## Run it
 
