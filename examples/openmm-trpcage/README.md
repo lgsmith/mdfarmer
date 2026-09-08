@@ -25,6 +25,14 @@ the system with `Path(system_fn).read_text()` and hands the seed to
 happily take `gzip.open(p, 'rt').read()` — `tests/test_example_inputs.py`
 checks that it round-trips — but nothing in the runner does that today.)
 
+Inflation is a one-off, not a per-boot cost: `inflate()` returns immediately if
+the inflated file is already in `prepared/`, and writes through a `.partial`
+name so a boot killed halfway leaves nothing that a later boot could mistake for
+a finished file. Delete `prepared/` to force it again. Nothing in either example
+compresses trajectories or restarts *during* a run — the DCD and the `state.xml`
+restarts are written plain, and the only lossy compression anywhere is the XTC
+format the GROMACS arm writes natively.
+
 `prepare_inputs()` also rewinds the seed state's `stepCount` from 150000 to 0.
 That number is left over from the equilibration this system came from, and
 `seeder._try_recover_gen` reads `state.xml`'s `stepCount` as a step counted from

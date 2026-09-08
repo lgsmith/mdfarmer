@@ -22,6 +22,14 @@ will actually want to read. `prepare_inputs()` inflates the two before the
 Farmer is built. Unlike OpenMM, GROMACS has no choice about this: `grompp` takes
 file names, not streams.
 
+Inflation is a one-off, not a per-boot cost: `inflate()` returns immediately if
+the inflated file is already in `prepared/`, and writes through a `.partial`
+name so a boot killed halfway leaves nothing that a later boot could mistake for
+a finished file. Delete `prepared/` to force it again. Nothing here compresses
+trajectories or restarts *during* a run: `state.cpt` is GROMACS' own binary
+checkpoint written plain, and the only compression in the stream is the one
+built into the XTC format.
+
 `prod-277.mdp` is `sampling-trpcage/mdp/prod-277-a19opc3.mdp` with only the
 output strides and the step count shortened — `nstlog`, `nstenergy` and
 `nstxout-compressed` from 50000 to 2000, `nsteps` from 5e8 to 10000. The physics
