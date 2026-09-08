@@ -22,12 +22,14 @@ node, and the farmer spends each clone's restart budget doing it.
 BadNodeRegistry recognises those failures, remembers the host in a file that
 survives a restart, and excludes it from later submissions.
 
-Resuming. The last frame of a generation's DCD has to sit at exactly the step
-its state.xml stopped at, or the next append lands at the wrong point in time
-and gen-to-gen concatenation drifts. A run killed between the trajectory report
-and the checkpoint report has one frame too many, so is_state_xml_usable,
-state_xml_step_count, dcd_header_info and truncate_dcd_to_nframes are here to
-check that and trim it.
+Resuming. The last frame of a generation's trajectory has to sit at exactly the
+step its state.xml stopped at, or the next append lands at the wrong point in
+time and gen-to-gen concatenation drifts. A run killed between the trajectory
+report and the checkpoint report has one frame too many, so is_state_xml_usable
+and state_xml_step_count are here to find the step, and truncate_traj_to_nframes
+to trim to it. It trims a .dcd, an .xtc or an .h5 alike, in place and from what
+the file really holds rather than from the count it claims, since a kill leaves
+none of the three counting honestly.
 """
 
 import inspect
@@ -145,21 +147,13 @@ def get_traj_len(traj_fn, top_fn, dry_topology_name=DRY_TOPOLOGY_NAME):
     return 0
 
 
-def frame_timing(traj_fn, n_frames=None):
-    """(step0, steps_per_frame, time0, time_per_frame), or None for a DCD.
-
-    Neither LOOS nor mdtraj keeps a source's step and time on its own: LOOS
-    numbers frames from zero at 1 ps apart, and mdtraj writes the frame index as
-    the step. Anything that rewrites a trajectory has to read these and pass
-    them back in.
+def _xtc_frame_timing(traj_p, n_frames=None):
+    """An .xtc's frame timing, read off the step and time it stamps per frame.
 
     Given n_frames, the spacing read off frames 0 and 1 is checked against the
     last frame, since extrapolating from two frames is only right if the source
     is evenly spaced.
     """
-    traj_p = Path(traj_fn)
-    if traj_p.suffix.lower() != '.xtc':
-        return None          # a DCD keeps its timing in the header
     with _mdtraj.open(str(traj_p)) as fh:
         available = len(fh)
         _, time, step, _ = fh.read(min(2, available))
@@ -183,6 +177,72 @@ def frame_timing(traj_fn, n_frames=None):
             f'step {predicted_step}, but it is at {int(last_step[0])}. Refusing '
             'to restamp frames from an assumption the trajectory contradicts.')
     return step0, steps_per_frame, time0, time_per_frame
+
+
+# CHARMM keeps a DCD's timestep in AKMA time units, and OpenMM's writer divides
+# by this on the way in, so reading it back multiplies.
+DCD_AKMA_PICOSECONDS = 0.04888821
+
+
+def dcd_frame_timing(traj_fn, n_frames=None, akma_ps=DCD_AKMA_PICOSECONDS):
+    """A DCD's (step0, steps_per_frame, time0, time_per_frame), or None.
+
+    A DCD stamps nothing on a frame: istart, nsavc and delta describe the whole
+    file at once, putting frame k at step istart + k*nsavc and at time
+    (istart + k*nsavc) * delta. OpenMM's DCDReporter makes that map exact for a
+    generation, because it hands DCDFile the report interval as both firstStep
+    and interval, so frame 0 is the first report, one interval of steps in, and
+    an append reuses those same two numbers. The steps count from the file's
+    own beginning rather than from the campaign's -- which is the clock
+    XTCReporter stamps on its frames too, so the two formats answer in the same
+    units and the recovery path still has to add the earlier generations' steps
+    itself.
+
+    None when nothing filled the header in. mdtraj's DCD writer, which is what
+    writes a reimaged or harvested DCD, leaves istart 0, nsavc 1 and delta 1,
+    placing frame 0 at step 0 -- a frame no reporter ever writes, since a
+    reporter's first comes one interval in. Handing that back as a time axis
+    would be a fabrication, so the caller is told there is none.
+
+    n_frames is accepted and ignored: one linear rule covers every frame, so
+    there is no last frame that could disagree with the first two.
+    """
+    info = dcd_header_info(Path(traj_fn))
+    istart, nsavc, delta = info['istart'], info['nsavc'], info['delta']
+    if istart <= 0 or nsavc <= 0 or delta <= 0:
+        return None
+    ps_per_step = delta * akma_ps
+    return istart, nsavc, istart * ps_per_step, nsavc * ps_per_step
+
+
+# What frame_timing answers for. dcd_frame_timing is deliberately not wired in
+# here: what a caller does with an answer is hand a step and a time to a writer,
+# and loos.DCDWriter.writeFrame takes a group and nothing else, so a DCD's
+# reconstructed timing would only make harvester and reimage raise TypeError on
+# the format they can already read. Ask dcd_frame_timing directly until those
+# two branch on what the output writer accepts rather than on this being None.
+_FRAME_TIMING = {'.xtc': _xtc_frame_timing}
+
+
+def frame_timing(traj_fn, n_frames=None, backends=_FRAME_TIMING):
+    """(step0, steps_per_frame, time0, time_per_frame) a rewrite has to carry
+    forward, or None when there is nothing to carry.
+
+    Neither LOOS nor mdtraj keeps a source's step and time on its own: LOOS
+    numbers frames from zero at 1 ps apart, and mdtraj writes the frame index as
+    the step. Anything that rewrites a trajectory has to read these and pass
+    them back in.
+
+    Only an .xtc answers. A DCD's timing is recoverable, but from its header
+    rather than its frames, and dcd_frame_timing is where to ask for it. An
+    .h5 has no answer to give at all: an mdtraj HDF5 file records a time per
+    frame and no step whatsoever, and half an axis would put a fabricated step
+    counter into whatever was written from it.
+    """
+    backend = backends.get(Path(traj_fn).suffix.lower())
+    if backend is None:
+        return None
+    return backend(Path(traj_fn), n_frames)
 
 
 def strip_and_downsample(config_fn, harvester_config_fn):
@@ -868,7 +928,7 @@ def state_xml_step_count(p: Path) -> int:
 
 
 def dcd_header_info(p: Path) -> dict:
-    """Parse a DCD header. Returns nset, istart, nsavc, with_unitcell,
+    """Parse a DCD header. Returns nset, istart, nsavc, delta, with_unitcell,
     n_atoms, and header_size (file offset where the first frame begins).
     """
     with open(p, 'rb') as f:
@@ -878,8 +938,11 @@ def dcd_header_info(p: Path) -> dict:
         magic = f.read(4)
         if magic != b'CORD':
             raise ValueError(f'DCD magic {magic!r} != b"CORD" at {p}')
-        ints = struct.unpack('<20i', f.read(80))
+        block = f.read(80)
+        ints = struct.unpack('<20i', block)
         nset, istart, nsavc = ints[0], ints[1], ints[2]
+        # Word 9 of the block, at byte 44, is the timestep, and a float.
+        delta = struct.unpack('<f', block[36:40])[0]
         # ints[10], at byte 48, is 1 when frames carry the 6-double box record.
         with_unitcell = ints[10]
         be1 = struct.unpack('<i', f.read(4))[0]
@@ -900,7 +963,7 @@ def dcd_header_info(p: Path) -> dict:
         if be3 != 4:
             raise ValueError(f'DCD natoms block end marker {be3} != 4 at {p}')
         header_size = f.tell()
-    return {'nset': nset, 'istart': istart, 'nsavc': nsavc,
+    return {'nset': nset, 'istart': istart, 'nsavc': nsavc, 'delta': delta,
             'with_unitcell': bool(with_unitcell), 'n_atoms': n_atoms,
             'header_size': header_size}
 
@@ -937,6 +1000,169 @@ def truncate_dcd_to_nframes(p: Path, target_nframes: int) -> int:
         f.write(struct.pack('<i', achievable))
     os.truncate(str(p), header_size + achievable * frame_size)
     return achievable
+
+
+# An .xtc frame is a 56-byte header ending in the atom count xdr3dfcoord
+# repeats, then either raw coordinates for a system of nine atoms or fewer or a
+# 36-byte compression header and the packed bytes its last word sizes.
+XTC_MAGIC = 1995
+XTC_HEADER_SIZE = 56
+XTC_COMPRESSED_HEADER_SIZE = 92
+XTC_UNCOMPRESSED_ATOMS = 9
+XTC_BYTES_PER_COORD = 12
+XTC_PAD = 4
+
+
+def xtc_frame_offsets(p: Path, magic=XTC_MAGIC, header_size=XTC_HEADER_SIZE,
+                      compressed_header_size=XTC_COMPRESSED_HEADER_SIZE,
+                      uncompressed_atoms=XTC_UNCOMPRESSED_ATOMS,
+                      bytes_per_coord=XTC_BYTES_PER_COORD, pad=XTC_PAD) -> list:
+    """Where every whole frame of an .xtc starts, and where the last one ends.
+
+    The list is one longer than the frame count, so offsets[n] is the length a
+    file trimmed to n frames has to have, for any n from zero to that count.
+    An .xtc frame is a variable-length compressed block and cannot be located
+    by arithmetic the way a fixed-record DCD frame can, so the frames are
+    walked instead: each header gives the atom count and, above the handful
+    that go in uncompressed, the byte length of the packed coordinates.
+
+    Bytes are authoritative here as they are for a DCD. A frame the walk cannot
+    complete -- the torn tail a kill mid-write leaves -- ends the list rather
+    than joining it, so trimming to offsets[-1] is what removes it. A first
+    frame with no magic number is a different complaint, a file that is not an
+    .xtc at all, and raises.
+    """
+    size = p.stat().st_size
+    offsets = []
+    position = 0
+    with open(p, 'rb') as f:
+        while position + header_size <= size:
+            f.seek(position)
+            head = f.read(header_size)
+            frame_magic, n_atoms = struct.unpack('>2i', head[:8])
+            if frame_magic != magic or n_atoms <= 0:
+                if position == 0:
+                    raise ValueError(
+                        f'{p} does not begin with an XTC frame header: magic '
+                        f'{frame_magic} (want {magic}), {n_atoms} atoms.')
+                break
+            if n_atoms <= uncompressed_atoms:
+                end = position + header_size + bytes_per_coord * n_atoms
+            else:
+                tail = f.read(compressed_header_size - header_size)
+                if len(tail) < compressed_header_size - header_size:
+                    break
+                n_bytes = struct.unpack('>i', tail[-4:])[0]
+                if n_bytes < 0:
+                    break
+                end = (position + compressed_header_size
+                       + ((n_bytes + pad - 1) // pad) * pad)
+            if end > size:
+                break
+            offsets.append(position)
+            position = end
+        offsets.append(position)
+    return offsets
+
+
+def truncate_xtc_to_nframes(p: Path, target_nframes: int) -> int:
+    """Cut an .xtc down to at most target_nframes, or however many whole
+    frames its bytes actually hold if that is fewer. Never grows the file.
+    Idempotent.
+
+    Nothing is re-encoded: the frames that stay keep their own bytes, so their
+    coordinates, steps, times and compressed-x-precision are exactly what the
+    writer produced, and a run that asked for a precision finer than mdtraj's
+    fixed 1000 does not lose it here. A torn trailing frame goes even when
+    target_nframes was already met, because mdtraj raises on one rather than
+    stopping short of it.
+
+    Returns the frame count actually achieved, which the caller must compare
+    against target_nframes the way it does for a DCD.
+    """
+    p = Path(p)
+    offsets = xtc_frame_offsets(p)
+    whole_frames = len(offsets) - 1
+    achievable = max(0, min(target_nframes, whole_frames))
+    if achievable != target_nframes:
+        print(f'{p}: asked to trim to {target_nframes} frames but only '
+              f'{whole_frames} whole frames are actually on disk; '
+              f'trimming to {achievable} instead.')
+    os.truncate(str(p), offsets[achievable])
+    return achievable
+
+
+def truncate_h5_to_nframes(p: Path, target_nframes: int) -> int:
+    """Cut an mdtraj HDF5 trajectory down to at most target_nframes, or
+    however many whole frames it holds if that is fewer. Never grows it.
+    Idempotent.
+
+    Every per-frame quantity is a PyTables EArray extendable along the frame
+    axis, and /topology, the one node that is not per frame, is a plain Array,
+    so truncating each EArray is the whole job. The shortest of them is what
+    the file really holds: mdtraj appends to them one after another, so a kill
+    between two appends leaves coordinates a frame ahead of time.
+
+    HDF5 hands freed space back to the file's own free list rather than to the
+    filesystem, so what shrinks is the frame count and not the size on disk.
+
+    Returns the frame count actually achieved, as the other truncators do.
+    """
+    p = Path(p)
+    try:
+        import tables
+    except ImportError as exc:
+        raise ImportError(
+            f'Trimming {p} needs PyTables, which mdtraj installs.') from exc
+    with tables.open_file(str(p), 'a') as handle:
+        arrays = list(handle.walk_nodes('/', 'EArray'))
+        if not arrays:
+            raise ValueError(
+                f'{p} holds no extendable per-frame arrays, so it is not an '
+                'mdtraj HDF5 trajectory.')
+        whole_frames = min(int(a.shape[0]) for a in arrays)
+        achievable = max(0, min(target_nframes, whole_frames))
+        if achievable != target_nframes:
+            print(f'{p}: asked to trim to {target_nframes} frames but only '
+                  f'{whole_frames} whole frames are actually on disk; '
+                  f'trimming to {achievable} instead.')
+        # A shrink or a no-op for every array, since achievable is their
+        # shortest at most, and truncate() would grow one asked for more.
+        for array in arrays:
+            array.truncate(achievable)
+    return achievable
+
+
+# Trimming a trajectory back to a frame count, keyed by suffix. Each one works
+# in place and from what the file's bytes really hold, not from any count it
+# records, and each returns the frame count it reached.
+TRUNCATORS = {
+    '.dcd': truncate_dcd_to_nframes,
+    '.xtc': truncate_xtc_to_nframes,
+    '.h5': truncate_h5_to_nframes,
+}
+
+TRUNCATABLE_SUFFIXES = frozenset(TRUNCATORS)
+
+
+def truncate_traj_to_nframes(traj_fn, target_nframes, truncators=TRUNCATORS):
+    """Cut a trajectory to at most target_nframes, whatever format it is in.
+
+    Returns the frame count reached, which the caller has to compare against
+    what it asked for: fewer means the file held fewer whole frames than its
+    own bookkeeping claimed, and a generation resumed on that basis would be
+    discontiguous. ValueError for a format with no truncator, which a caller
+    recovering a generation treats the way it treats a truncation that missed
+    -- redo the generation rather than append to a trajectory it cannot trim.
+    """
+    traj_p = Path(traj_fn)
+    try:
+        truncate = truncators[traj_p.suffix.lower()]
+    except KeyError:
+        raise ValueError(
+            f'No truncator for {traj_p.suffix!r}; the formats that can be '
+            f'trimmed are {sorted(truncators)}.') from None
+    return truncate(traj_p, target_nframes)
 
 
 def check_whole_frames(total_steps, write_interval, source='config_template'):
