@@ -64,20 +64,36 @@ class StubClone:
     """Answers the handful of calls launch makes, and reports what it did.
 
     `succeeds` is what its check_start_gen returns, so a test can stage a run
-    of failures and then a recovery.
+    of failures and then a recovery. It carries the same restart budget a real
+    Clone does, since that is what the tender now consults.
     """
 
-    def __init__(self, tag='stub', current_gen=0, succeeds=False):
+    def __init__(self, tag='stub', current_gen=0, succeeds=False,
+                 restarts_per_gen=FAILURE_LIMIT, raises=False):
         self.tag = tag
         self.current_gen = current_gen
         self.succeeds = succeeds
+        self.raises = raises
+        self.restarts_per_gen = restarts_per_gen
+        self.restart_attempts = 0
         self.starts = 0
 
     def get_tag(self):
         return self.tag
 
+    def spend_restart(self):
+        if self.restart_attempts >= self.restarts_per_gen:
+            return False
+        self.restart_attempts += 1
+        return True
+
     def check_start_gen(self, scheduler_report, overwrite=False):
         self.starts += 1
+        if self.raises:
+            raise RuntimeError('the filesystem stalled')
+        if self.succeeds:
+            # A real advance clears the generation's budget; so does this one.
+            self.restart_attempts = 0
         return self.succeeds
 
 
@@ -87,7 +103,6 @@ def tend(farmer, clone):
     farmer.active_clone_set = {clone}
     farmer.finished_clones = set()
     farmer.failed_clone_set = set()
-    farmer.submit_failures = {}
     return farmer
 
 
@@ -245,49 +260,62 @@ def main(n_clones=N_CLONES, pack_size=PACK_SIZE,
     suite.check('waiting is not reported as a launch-logic failure',
                 'not accounted for' not in log)
 
-    suite.section('a clone that cannot advance is retried before it is failed')
+    suite.section('a clone that says its budget is spent is failed at once')
     limit = failure_limit
-    farmer, _ = captured(lambda: make_farmer(work, submit_failure_limit=limit))
-    stub = StubClone('always-fails')
+    farmer, _ = captured(lambda: make_farmer(work))
+    stub = StubClone('budget-spent')
     tend(farmer, stub)
-    for attempt in range(1, limit):
-        still_running, _ = captured(lambda: farmer.launch(update_jids=False))
-        suite.check(f'failure {attempt} of {limit} keeps the clone',
-                    still_running == [True]
-                    and farmer.priority_ordered_clones == [[stub]]
-                    and not farmer.failed_clone_set,
-                    f'-> {still_running}')
     still_running, _ = captured(lambda: farmer.launch(update_jids=False))
-    suite.check(f'failure {limit} of {limit} fails the clone',
+    suite.check('the tender keeps no second budget of its own',
                 still_running == [False] and stub in farmer.failed_clone_set,
                 f'-> {still_running}')
-    suite.check('it took every attempt before giving up',
-                stub.starts == limit, f'-> {stub.starts}')
+    suite.check('it asked the clone exactly once', stub.starts == 1,
+                f'-> {stub.starts}')
+    suite.check('it did not charge the clone again on the way out',
+                stub.restart_attempts == 0, f'-> {stub.restart_attempts}')
 
-    farmer, _ = captured(lambda: make_farmer(work, submit_failure_limit=limit))
+    farmer, _ = captured(lambda: make_farmer(work))
     stub = StubClone('never-launches')
     tend(farmer, stub)
     farmer.active_clone_set = set()
     still_running, _ = captured(lambda: farmer.launch(update_jids=False))
-    suite.check('a clone that will not start at all is retried too',
-                still_running == [True] and not farmer.failed_clone_set,
+    suite.check('a clone waiting for its first launch is failed the same way',
+                still_running == [False] and stub in farmer.failed_clone_set,
                 f'-> {still_running}')
 
-    suite.section('an advance that works clears the failure count')
-    farmer, _ = captured(lambda: make_farmer(work, submit_failure_limit=limit))
-    stub = StubClone('recovers')
+    suite.section('a raise while advancing is charged to the restart budget')
+    farmer, _ = captured(lambda: make_farmer(work))
+    stub = StubClone('raises', restarts_per_gen=limit, raises=True)
+    tend(farmer, stub)
+    for attempt in range(1, limit + 1):
+        still_running, _ = captured(lambda: farmer.launch(update_jids=False))
+        suite.check(f'raise {attempt} of {limit} costs a restart, not the clone',
+                    still_running == [True]
+                    and farmer.priority_ordered_clones == [[stub]]
+                    and stub.restart_attempts == attempt
+                    and not farmer.failed_clone_set,
+                    f'-> {still_running}, {stub.restart_attempts}')
+    still_running, _ = captured(lambda: farmer.launch(update_jids=False))
+    suite.check('the raise past the budget fails the clone',
+                still_running == [False] and stub in farmer.failed_clone_set,
+                f'-> {still_running}')
+
+    suite.section('an advance that works clears the restart count')
+    farmer, _ = captured(lambda: make_farmer(work))
+    stub = StubClone('recovers', restarts_per_gen=limit, raises=True)
     tend(farmer, stub)
     captured(lambda: farmer.launch(update_jids=False))
+    stub.raises = False
     stub.succeeds = True
     captured(lambda: farmer.launch(update_jids=False))
     suite.check('the count is cleared by the advance that worked',
-                farmer.submit_failures.get(stub, 0) == 0,
-                f'-> {farmer.submit_failures.get(stub, 0)}')
-    stub.succeeds = False
+                stub.restart_attempts == 0, f'-> {stub.restart_attempts}')
+    stub.raises = True
     still_running, _ = captured(lambda: farmer.launch(update_jids=False))
     suite.check('so the next failure starts the count over',
-                still_running == [True] and not farmer.failed_clone_set,
-                f'-> {still_running}')
+                still_running == [True] and stub.restart_attempts == 1
+                and not farmer.failed_clone_set,
+                f'-> {still_running}, {stub.restart_attempts}')
 
     suite.section('a threshold that would leave every clone waiting')
     try:

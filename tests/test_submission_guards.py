@@ -1,9 +1,10 @@
-"""A submission whose job number cannot be read must not read as a failure.
+"""A submission whose job number cannot be read must not abandon the clone.
 
 The job is already running when the id is parsed, so mistaking an unparseable
-id for a failed submission leaves that job writing into a generation directory
-the tender has stopped minding. What the operator needs to be told is that the
-submission SUCCEEDED, so the orphan can be found and cancelled.
+id for a spent restart budget leaves that job writing into a generation
+directory the tender has stopped minding. What the operator needs to be told is
+that the submission SUCCEEDED, so the orphan can be found and cancelled; the
+clone itself keeps whatever restarts it has left.
 """
 import sys
 
@@ -87,8 +88,10 @@ def main(no_id_stdout=NO_ID_STDOUT, no_id_stderr=NO_ID_STDERR):
     started, output = submit_with(stub, clone.start_current)
     suite.check('the submission is not retried', stub.calls == 1,
                 f'-> {stub.calls} calls')
-    suite.check('it does not raise, and reports no launch', started is False,
-                f'-> {started}')
+    suite.check('it does not raise, and keeps the clone in the campaign',
+                started is True, f'-> {started}')
+    suite.check('the attempt cost one restart', clone.restart_attempts == 1,
+                f'-> {clone.restart_attempts}')
     suite.check('the message says the job was submitted',
                 'SUBMITTED' in output)
     suite.check('the message says the job is untracked',
@@ -107,7 +110,11 @@ def main(no_id_stdout=NO_ID_STDOUT, no_id_stderr=NO_ID_STDERR):
                      run_script='print("hi")', cpus_per_task=4, sep='_')
     stub = FakeSp(FakeResult(no_id_stdout, no_id_stderr))
     started, output = submit_with(stub, lambda: pack.check_start_gen(set()))
-    suite.check('the pack reports no launch', started is False, f'-> {started}')
+    suite.check('the pack keeps its members in the campaign', started is True,
+                f'-> {started}')
+    suite.check('the pack charged its member exactly one restart',
+                pack.clones[0].restart_attempts == 1,
+                f'-> {pack.clones[0].restart_attempts}')
     suite.check('the pack message says the job was submitted',
                 'SUBMITTED' in output and 'UNTRACKED' in output)
     suite.check('the pack names its own directory',
