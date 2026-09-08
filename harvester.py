@@ -351,6 +351,7 @@ def _harvest_loos(traj_fn, structure_fn, subset_spec, dry_out, down_out,
 
     dry_writer = reimage._loos_writer(Path(dry_out))
     down_writer = reimage._loos_writer(Path(down_out))
+    dry_axis, down_axis = reimage.WrittenAxis(), reimage.WrittenAxis()
     traj = pyloos.Trajectory(str(traj_fn), model)
     n_orig = n_dry = n_down = 0
     for local, _ in enumerate(traj):
@@ -360,7 +361,7 @@ def _harvest_loos(traj_fn, structure_fn, subset_spec, dry_out, down_out,
         if not (dry or down):
             continue
         if timing is None:
-            # No per-frame timing to carry (DCD); let the writer count.
+            # Nothing to carry: the source stamped no axis on its frames.
             if dry:
                 dry_writer.writeFrame(subset)
             if down:
@@ -373,9 +374,16 @@ def _harvest_loos(traj_fn, structure_fn, subset_spec, dry_out, down_out,
                 dry_writer.writeFrame(subset, step, time)
             if down:
                 down_writer.writeFrame(model, step, time)
+        if dry:
+            dry_axis.took(local)
+        if down:
+            down_axis.took(local)
         n_dry += dry
         n_down += down
     del dry_writer, down_writer
+    # The two streams keep different frames, so each states its own spacing.
+    reimage.stamp_written_axis(Path(dry_out), timing, dry_axis)
+    reimage.stamp_written_axis(Path(down_out), timing, down_axis)
 
     # Solute-only topology for anything that reads the dry stream later.
     subset.pruneBonds()
@@ -398,6 +406,7 @@ def _harvest_mdtraj(traj_fn, structure_fn, subset_spec, dry_out, down_out,
     indices = None if subset_spec is None else subset_spec['indices']
     dry_writer = reimage._MdtrajWriter(Path(dry_out))
     down_writer = reimage._MdtrajWriter(Path(down_out))
+    dry_axis, down_axis = reimage.WrittenAxis(), reimage.WrittenAxis()
     n_orig = n_dry = n_down = 0
     try:
         for chunk in md.iterload(str(traj_fn), top=model.top,
@@ -426,16 +435,24 @@ def _harvest_mdtraj(traj_fn, structure_fn, subset_spec, dry_out, down_out,
                 dry_writer.write(sub if indices is None
                                  else sub.atom_slice(indices),
                                  step=None if step is None else step[keep_dry])
+                for index in local[keep_dry]:
+                    dry_axis.took(int(index))
                 n_dry += int(keep_dry.sum())
             if keep_down.any():
                 down_writer.write(
                     chunk[keep_down],
                     step=None if step is None else step[keep_down])
+                for index in local[keep_down]:
+                    down_axis.took(int(index))
                 n_down += int(keep_down.sum())
             n_orig += chunk.n_frames
     finally:
         dry_writer.close()
         down_writer.close()
+    # mdtraj's DCD writer takes no timing either, so a DCD output gets its axis
+    # the same way the LOOS backend's does: written into the header at the end.
+    reimage.stamp_written_axis(Path(dry_out), timing, dry_axis)
+    reimage.stamp_written_axis(Path(down_out), timing, down_axis)
 
     dry_model = model if indices is None else model.atom_slice(indices)
     dry_model.save_pdb(str(Path(dry_out).parent / dry_topology_name))

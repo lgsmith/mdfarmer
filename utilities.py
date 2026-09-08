@@ -198,11 +198,16 @@ def dcd_frame_timing(traj_fn, n_frames=None, akma_ps=DCD_AKMA_PICOSECONDS):
     units and the recovery path still has to add the earlier generations' steps
     itself.
 
-    None when nothing filled the header in. mdtraj's DCD writer, which is what
-    writes a reimaged or harvested DCD, leaves istart 0, nsavc 1 and delta 1,
-    placing frame 0 at step 0 -- a frame no reporter ever writes, since a
-    reporter's first comes one interval in. Handing that back as a time axis
-    would be a fabrication, so the caller is told there is none.
+    None when a field is zero or negative, which is what mdtraj's DCD writer
+    leaves: istart 0, placing frame 0 at a step no reporter writes, since a
+    reporter's first comes one interval in. Handing that back would be a
+    fabrication, so the caller is told there is none.
+
+    LOOS is not caught by that and cannot be. DCDWriter::writeHeader hardcodes
+    istart and nsavc to 1 and defaults delta to 0.001, all positive and all
+    fiction -- frame k at step k+1, 4.9e-5 ps apart. Nothing in the header says
+    which of the two wrote it, so a rewritten DCD has its real axis stamped back
+    by stamp_dcd_timing rather than being detected here after the fact.
 
     n_frames is accepted and ignored: one linear rule covers every frame, so
     there is no last frame that could disagree with the first two.

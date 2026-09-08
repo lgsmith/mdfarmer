@@ -413,6 +413,7 @@ def reimage_with_loos(traj_fn, structure_fn, out_fn, top_fn=None,
     # quantised back to the default on its way through LOOS.
     writer = _loos_writer(out_p, precision=source_precision(traj_p))
     timing = util.frame_timing(traj_p)
+    axis = WrittenAxis()
     traj = pyloos.Trajectory(str(traj_p), model)
     n_written = 0
     for index, _ in enumerate(traj):
@@ -435,8 +436,10 @@ def reimage_with_loos(traj_fn, structure_fn, out_fn, top_fn=None,
             step0, steps_per_frame, time0, time_per_frame = timing
             writer.writeFrame(model, step0 + index * steps_per_frame,
                               time0 + index * time_per_frame)
+        axis.took(index)
         n_written += 1
     del writer
+    stamp_written_axis(out_p, timing, axis)
 
     if verify:
         _verify_reimaged(out_p, top_fn=top_fn, include_dir=include_dir,
@@ -491,13 +494,77 @@ def source_precision(traj_p, default=XTC_PRECISION):
     return default if found is None else found
 
 
+class _DcdWriter:
+    """loos.DCDWriter, taking the same three arguments an XTCWriter takes.
+
+    A DCD keeps one timing rule in its header rather than a stamp per frame, so
+    the step and time handed in here are recorded for stamp_written_axis to
+    write at close, not passed to LOOS -- whose writeFrame takes a group and
+    nothing else, and whose header hardcodes istart and nsavc to 1.
+    """
+
+    def __init__(self, out_p):
+        import loos
+        self.inner = loos.DCDWriter(str(out_p))
+
+    def writeFrame(self, group, step=None, time=None):
+        self.inner.writeFrame(group)
+
+
+class WrittenAxis:
+    """Where the frames a writer kept sit on the axis of the source it read.
+
+    A stream that keeps every Nth frame has its own spacing, not its source's,
+    and a DCD can stated only one uniform rule -- so what was kept is tracked
+    as it is written rather than assumed from the policy that chose it.
+    """
+
+    def __init__(self):
+        self.first = self.stride = self.last = None
+        self.count = 0
+
+    def took(self, index):
+        if self.count == 0:
+            self.first = index
+        elif self.count == 1:
+            self.stride = index - self.first
+        self.last = index
+        self.count += 1
+
+    def uniform(self):
+        """Whether one linear rule reaches every frame that was kept."""
+        if self.count < 2:
+            return True
+        return self.last == self.first + (self.count - 1) * self.stride
+
+
+def stamp_written_axis(out_p, timing, axis):
+    """Carry a source's axis onto a DCD output, in that output's own spacing.
+
+    Does nothing for the formats that stamp their frames as they go, or when
+    the source had no axis to carry. True when the header was written.
+    """
+    out_p = Path(out_p)
+    if timing is None or out_p.suffix.lower() != '.dcd' or axis.count < 2:
+        return False
+    if not axis.uniform():
+        raise ValueError(
+            f'{out_p} keeps frames {axis.first} to {axis.last} of its source '
+            f'unevenly, and a DCD states one rule for the whole file. Refusing '
+            'to stamp an axis that skips frames it claims to cover.')
+    step0, steps_per_frame, time0, time_per_frame = timing
+    return util.stamp_dcd_timing(
+        out_p,
+        step0 + axis.first * steps_per_frame, axis.stride * steps_per_frame,
+        time0 + axis.first * time_per_frame, axis.stride * time_per_frame)
+
+
 def _loos_writer(out_p, precision=XTC_PRECISION):
     suffix = out_p.suffix.lower()
     if suffix == '.xtc':
         return loos_xtc_writer(out_p, precision=precision)
     if suffix == '.dcd':
-        import loos
-        return loos.DCDWriter(str(out_p))
+        return _DcdWriter(out_p)
     raise ValueError(
         f'{out_p.suffix} is not a format the LOOS backend writes; use .xtc or '
         '.dcd')
