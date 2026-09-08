@@ -377,9 +377,12 @@ def report_readiness(steps_per_gen=STEPS_PER_GEN,
           f'{reps_per_pack} x {n_gens} gens, {active_packs} packs at once')
     print(f'  {steps_per_gen:,} steps/gen ({steps_per_gen * dt_ps:g} ps), '
           f'{frames} new frames at {write_interval * dt_ps:g} ps '
-          f'({frames + 1} on disk after gen 0, seam included), '
+          f'({frames + 1} on disk every gen, the seam included), '
           f'wet every {downsample_frq} -> {write_interval * dt_ps * downsample_frq:g} ps')
-    print(f'  {n_gens * frames} dry frames per clone over '
+    # One more than the generations contribute between them: GROMACS writes a
+    # frame at the step it restarts from, so generation 0's own first frame --
+    # the seed state, at step 0 -- is a frame no later generation repeats.
+    print(f'  {n_gens * frames + 1} dry frames per clone over '
           f'{n_gens * steps_per_gen * dt_ps:g} ps')
     print(f'  {pack_cpus} cores/pack, {pack_cpus // reps_per_pack} per '
           f'replica, -update {UPDATE_MODE}')

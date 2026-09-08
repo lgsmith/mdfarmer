@@ -129,8 +129,8 @@ already submitted keep running. Everything a run writes lands in `data/` and
 | steps per generation | 10 000 (20 ps at dt = 2 fs) |
 | write interval | 2 000 steps (4 ps) → **5 new frames per generation** |
 | frames on disk | 6 — GROMACS also writes the restart-step frame |
-| downsample | every 5th frame → 1 wet frame per generation |
-| generations | 5, so 100 ps and 25 dry frames per clone |
+| downsample | every 5th frame → 1 wet frame per generation, 2 from generation 0 |
+| generations | 5, so 100 ps and **26** dry frames per clone — see below |
 | MD time per generation | **3.5–3.8 s** per replica, two sharing an RTX A6000 without MPS (454 and 498 ns/day, against 785 solo); 11.6 s for the whole pack job including grompp and start-up |
 | whole campaign | 25 pack jobs of about a minute each; wall time is queue time |
 
@@ -140,6 +140,17 @@ checkpoint the next one restarts from; `harvester.check_commensurability`
 additionally requires `(10000 / 2000) % 5 == 0`, so the downsampled stream keeps
 its spacing across a generation boundary. Five is the *new*-frame count, which
 is the one both rules are stated in.
+
+**Twenty-six, not twenty-five.** Every generation holds 6 frames on disk, and
+every generation after the first drops one as a duplicate of its predecessor's
+last — but generation 0 has no predecessor, so its step-0 frame (the seed state)
+is kept and belongs to no other generation. The total is `n_gens * 5 + 1`.
+`first_global_index` counts frames *on disk*, duplicate included, so a global
+index is always `step / write_interval` and the kept stream stays contiguous:
+generation 0 supplies indices 0–5, generation 1 supplies 6–10, and its own
+index 5 is the duplicate it drops. The OpenMM arm has no such frame — its
+reporters write nothing at step 0 of a generation — so the two engines differ by
+exactly one frame per clone, by design.
 
 `maxh = 0.25` inside a 20-minute block: mdrun's own backstop, well clear of a
 generation that takes seconds, so a generation ends at its step target and not
