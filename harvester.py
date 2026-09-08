@@ -111,19 +111,28 @@ class Harvester:
 
 
 def frames_before(config, downsample_frq, config_name=CONFIG_NAME):
-    """Frames the generations before this one wrote, from their own configs.
+    """Frames the generations before this one wrote, from their own configs."""
+    return chain_offsets(config, downsample_frq, config_name=config_name)[0]
+
+
+def chain_offsets(config, downsample_frq, config_name=CONFIG_NAME):
+    """(frames, steps) the generations before this one contributed.
 
     Counted, not multiplied by this generation's length: a seed may be given a
     different generation length between boots, and a wallclock-matched scheme
-    ends generations wherever the clock ran out.
+    ends generations wherever the clock ran out. The step total is where this
+    generation starts, so its target step is that plus its own steps_per_gen.
     """
-    return sum(
-        check_commensurability(earlier['steps_per_gen'],
-                               earlier['write_interval'], downsample_frq)
-        for earlier in util.earlier_gen_configs(
+    frames = steps = 0
+    for earlier in util.earlier_gen_configs(
             config['traj_dir_top_level'], config['seed_index'],
             config['clone_index'], config['gen_index'], config['dirname_pad'],
-            sep=config['sep'], config_name=config_name))
+            sep=config['sep'], config_name=config_name):
+        frames += check_commensurability(earlier['steps_per_gen'],
+                                         earlier['write_interval'],
+                                         downsample_frq)
+        steps += earlier['steps_per_gen']
+    return frames, steps
 
 
 def check_commensurability(steps_per_gen, write_interval, downsample_frq):
