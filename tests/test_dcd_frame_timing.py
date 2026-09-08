@@ -6,11 +6,15 @@ OpenMM's DCDReporter wrote that map is exact, so this suite runs one generation
 of argon twice from the same seed, once to .dcd and once to .xtc, and checks
 the reconstruction agrees frame for frame with the clock the XTC carries.
 
-The other half is refusal. A DCD whose header nothing filled in -- mdtraj's,
-which is what a harvested or reimaged DCD has -- would reconstruct to a frame 0
-at step 0, a frame no reporter writes. That has to come back as None rather
-than as a plausible-looking axis, so each field the reconstruction rests on is
-knocked out in turn and the answer checked.
+The other half is refusal. A DCD whose header nothing filled in -- mdtraj's --
+would reconstruct to a frame 0 at step 0, a frame no reporter writes. That has
+to come back as None rather than as a plausible-looking axis, so each field the
+reconstruction rests on is knocked out in turn and the answer checked.
+
+A DCD written by LOOS is not caught that way and cannot be: istart 1, nsavc 1
+and a 0.001 delta are all positive, so the reconstruction answers with fiction.
+That is why a rewritten DCD has its real axis stamped back into the header
+instead -- see tests/test_dcd_axis_carry.py.
 """
 import struct
 import sys
@@ -141,13 +145,18 @@ def main():
                     util.dcd_frame_timing(knocked) is None,
                     f'-> {util.dcd_frame_timing(knocked)}')
 
-    suite.section('frame_timing still declines a DCD')
-    suite.check('because loos.DCDWriter takes no step and no time',
-                util.frame_timing(dcd_p) is None)
+    suite.section('frame_timing answers for a DCD, from the same header')
+    suite.check('the general entry point agrees with the DCD-specific one',
+                util.frame_timing(dcd_p) == util.dcd_frame_timing(dcd_p),
+                f'-> {util.frame_timing(dcd_p)}')
     suite.check('while an xtc answers as it always did',
                 util.frame_timing(xtc_p) is not None)
     suite.check('and an .h5 answers for neither, having no step field',
                 util.frame_timing(work / 'nothing.h5') is None)
+    # A DCD with nothing in its header still declines, which is the case that
+    # kept frame_timing out of this format: an answer there would be invented.
+    suite.check('a DCD written by mdtraj still declines',
+                util.frame_timing(mdtraj_dcd(work / 'unstamped.dcd')) is None)
     return suite.report()
 
 
