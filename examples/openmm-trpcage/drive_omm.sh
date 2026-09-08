@@ -127,6 +127,7 @@ start_tender() {
 # every clone from disk and re-adopts the running job ids, so re-entering is
 # the recovery.
 tender_loop() {
+    mkdir -p "$(dirname "$LOCK")"
     exec 9>>"$LOCK"
     if ! flock -n 9; then
         echo "another tender holds $LOCK; this one exits"
