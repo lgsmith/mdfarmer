@@ -301,6 +301,13 @@ def omm_generation(traj_dir_top_level: str,
                    # Sentinel to watch; None means this generation's own directory.
                    sentinel_path=None,
                    sentinel_name=PREEMPT_SENTINEL_NAME,
+                   # Clone writes the whole config into every generation's
+                   # config.json, and some of it addresses the chain rather
+                   # than this run: steps_per_gen and target_step are the
+                   # GROMACS runner's absolute step target, structure_fn is its
+                   # grompp input. Swallowed so a config round-trips through
+                   # either engine, the way gmx_generation swallows ours.
+                   **_unused,
                    ):
     """Run one generation of MD and return the path to the trajectory written.
 
