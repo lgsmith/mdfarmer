@@ -67,6 +67,24 @@ def campaign_path(value, traj_dir_top_level, default_name):
     return str((Path(traj_dir_top_level) / (value or default_name)).resolve())
 
 
+def campaign_and_recorded_jobs(report, title, sep, known_jids,
+                               index_count=util.JOB_NAME_INDEX_COUNT):
+    """A queue report split into this campaign's jobs and its orphaned ids.
+
+    Returns (jobs, orphans). jobs is what campaign_jobs bound by name, as
+    (job_id, indices) pairs. orphans are the queued ids in known_jids whose
+    name does not split into a title and indices at all, so nothing can be
+    bound to them: ours by record rather than by name. A name that does split
+    belongs to whichever campaign its title names and is never orphaned here,
+    so a reused id running somebody else's job is not claimed back.
+    """
+    jobs = util.campaign_jobs(report, title, sep=sep, index_count=index_count)
+    unbindable = {jid for jid, name in util.parse_scheduler_report(report)
+                  if util.split_job_name(name, sep=sep,
+                                         index_count=index_count) is None}
+    return jobs, (unbindable & set(known_jids)) - {jid for jid, _ in jobs}
+
+
 def seed_slice(name, values, n_seeds):
     """The first n_seeds entries of a seed-indexed list, or None for None.
 
@@ -97,6 +115,34 @@ class Farmer:
                  'pack_run_script', 'pack_member_cores',
                  'seed_config_overrides', 'seed_labels')
 
+    def write_jids(self):
+        """Mirror the live job ids to jids_file, for the next tick to read."""
+        self.jids_file.write_text(' '.join(map(str, sorted(self.current_jids))))
+
+    def recorded_jids(self):
+        """The job ids an earlier tick wrote to jids_file, or an empty set.
+
+        A missing or unreadable file is not an error: a campaign's first boot
+        has none, and the record is only ever a safety net over the job names.
+        """
+        try:
+            text = self.jids_file.read_text()
+        except OSError:
+            return set()
+        return {int(f) for f in text.split() if f.isascii() and f.isdigit()}
+
+    def known_jids(self):
+        """Every job id this campaign has reason to believe is its own.
+
+        The job numbers its clones or packs are bound to, which a tender learns
+        as it submits them, plus what an earlier tick recorded, which is all a
+        fresh boot has to go on.
+        """
+        bound = {unit.job_number
+                 for queue in self.priority_ordered_clones for unit in queue
+                 if unit.job_number is not None}
+        return bound | self.recorded_jids()
+
     def update_jids(self):
         """Refresh the set of job ids the scheduler says are ours and alive.
 
@@ -109,9 +155,14 @@ class Farmer:
             print(f'WARNING: keeping the previous {len(self.current_jids)} job '
                   'ids and skipping this tick rather than relaunching live jobs.')
             return False
-        self.current_jids = {jid for jid, _ in util.campaign_jobs(
-            report, self.config_template['title'], sep=self.sep)}
-        self.jids_file.write_text(' '.join(map(str, sorted(self.current_jids))))
+        jobs, orphans = campaign_and_recorded_jobs(
+            report, self.config_template['title'], self.sep, self.known_jids())
+        if orphans:
+            print(f'NOTE: queued jobs {sorted(orphans)} carry names this '
+                  'campaign cannot parse, but it recorded them as its own; '
+                  'counting them as live rather than launching over them.')
+        self.current_jids = {jid for jid, _ in jobs} | orphans
+        self.write_jids()
         return True
 
     def check_path(self, p: Path):
@@ -172,7 +223,9 @@ class Farmer:
         One query answers both which jobs are alive and whose they are: two
         would let a job come or go in between, binding a dead id to a Clone.
         Raises if the scheduler cannot be reached, since booting blind would
-        submit a second job into every live generation directory.
+        submit a second job into every live generation directory. Only a name
+        carries the indices a Clone is bound by, so a recorded id queued under
+        an unreadable one is counted as live and warned about, not bound.
         """
         self.current_jids = set()
         rep_dict = {}
@@ -185,8 +238,10 @@ class Farmer:
                 'directory. Fix the query and start again.')
         print('boot re-association scheduler report:')
         print(assoc_raw)
-        for jid, key in util.campaign_jobs(
-                assoc_raw, self.config_template['title'], sep=self.sep):
+        jobs, orphans = campaign_and_recorded_jobs(
+            assoc_raw, self.config_template['title'], self.sep,
+            self.known_jids())
+        for jid, key in jobs:
             self.current_jids.add(jid)
             # The tender cannot cancel either job, so all it can do is say so.
             if key in rep_dict:
@@ -195,7 +250,14 @@ class Farmer:
                       'generation directory will corrupt it -- cancel one by '
                       'hand.')
             rep_dict[key] = jid
-        self.jids_file.write_text(' '.join(map(str, sorted(self.current_jids))))
+        if orphans:
+            print(f'WARNING: an earlier tick recorded jobs {sorted(orphans)} '
+                  'as this campaign\'s and they are still queued, but their '
+                  'names carry no seed/clone/gen, so no clone can be bound to '
+                  'them. A second job may launch into their generation '
+                  'directories -- cancel them by hand.')
+        self.current_jids |= orphans
+        self.write_jids()
         return rep_dict
 
     def pack_template(self):
@@ -483,10 +545,11 @@ class Farmer:
             self.config_template.get('traj_list') or traj_list,
             self.config_template['traj_dir_top_level'], TRAJ_LIST_NAME)
 
+        # Empty before boot re-association, which asks it what ids are bound.
+        self.priority_ordered_clones = []
         rep_dict = self.reassociate_running_jobs()
 
         tdir = Path(self.config_template['traj_dir_top_level'])
-        self.priority_ordered_clones = []
         if self.seeds_first:
             # One queue per clone index, holding every seed of it.
             queue_keys = [[(seed_index, clone_index)
