@@ -147,7 +147,7 @@ def main():
     sim.SentinelReporter = SentinelAfter
     cwd = Path.cwd()
     try:
-        os.chdir(gen_dir)       # state.xml and the sentinel are cwd-relative
+        os.chdir(gen_dir)       # the solo case: cwd is the gen directory
         sim.omm_generation(**config)
         preempted = False
     except sim.Preempted:
