@@ -57,7 +57,8 @@ harvester = mdf.Harvester(  # The default harvester makes a dry trajectory at fu
 farmer = mdf.Farmer(
     n_seeds=1,
     n_clones=100,
-    active_clone_threshold=50  # how many clones will we try to schedule simultaneously. With pack_size set this counts packs, so pack_size times as many clones run at once.
+    active_clone_threshold=50,  # how many clones will we try to schedule simultaneously. With pack_size set this counts packs, so pack_size times as many clones run at once.
+    launch_interval=0,  # seconds to wait between one submission and the next. Some schedulers do not mind two thousand jobs at once and some fall over on a handful; raise this if yours is the second kind.
     n_gens=9,
     config_template=cfg_template,
     seed_structure_fns=['start-state.xml'],
@@ -81,6 +82,8 @@ The above should be saved in some python script--name it however you like. Here 
 Here we are asking for 50 clones to be run simultaneously, across a dataset of 100 clones. Each clone is going to do 2.5 million steps per generation, and each clone is going to do 9 sequential generations. As the comment says, shorten the generation time (and also the update interval) if you want to test whether things will be working properly with your system.
 
 Right now, the actual tender process (i.e. the one that the instance of Farmer is being run by) should sit on your head-node and remain running even if you log off. If it checks up on its jobs every 60-120 seconds and sleeps the rest of the time, it is extremely unlikely to bog down your head node much. Choosing an extremely short `update_interval` (say `5`, or `1`) could be bad for a number of reasons, one being that schedulers take time to update and so the tender process could accidentally submit the same clone twice, because it believes the first time didn't work, which will sow chaos in your data fields. How short too short is could be different for different systems, but after you finish debugging I very much doubt you're gaining much by having that interval be on the long side. I recommend something like 20-30 seconds for debugging, and between 1 and 5 minutes for normal usage.
+
+`update_interval` is the wait between ticks; `launch_interval` is the wait *within* a tick, between one clone's submission and the next. It defaults to 0, which hands the scheduler the whole tick at once. That is fine on most Slurm sites, but some schedulers -- LSF clusters especially -- misbehave when even a handful of jobs land nearly simultaneously, so if yours does, set `launch_interval` to a second or two. It is an empirical setting; there is no way to know the right value but to try one. `Farmer.launch(sleep=...)` was the old, per-call spelling of the same wait. It still works and still overrides `launch_interval`, but it warns, and it will go away.
 
 You launch the tender process by just calling the correct python on the script above. For debugging I recommend doing this in an interactive session, but normally these datasets take weeks or even months to collect so I often run them using the shell utility `nohup`, in a script such as the following. This allows me to call `tail` on `straight-sampling-farmer.out` to read what's going on.
 
@@ -174,9 +177,11 @@ farmer = mdf.Farmer(
 )
 ```
 
-Once packing is on, the tender schedules packs rather than clones, so
-`active_clone_threshold` counts packs: with `pack_size=2` and a threshold of
-50, 100 clones run at once. The boot log prints the figure it arrived at.
+Once packing is on, the tender schedules packs rather than clones. The
+Farmer's `active_set` holds whichever unit is being scheduled -- clones
+normally, packs once packing -- and `active_clone_threshold` bounds it, so it
+counts packs: with `pack_size=2` and a threshold of 50, 100 clones run at once.
+The boot log prints the figure it arrived at.
 
 Each replica gets a private, contiguous block of cores (`-ntomp`, `-pinoffset`,
 `-pinstride`), and `-ntmpi 1` on the thread-MPI builds that accept it — a
@@ -242,7 +247,7 @@ Another nice troubleshooting step can be simply trying to resubmit the job gener
 
 There are two modes of analysis with this type of dataset. If you have fewer clones, but long length per clone, you could do a classical 'replicate' analysis of an observable across contiguous trajectories. If you have multiple seeds, or many clones with short generations, or some combination thereof, you're better off making some kind of transition-counting model from the data, such as a Markov State Model.
 
-We're hoping to add some scripts for both modes of analysis--mostly these will be simple functions that just use the configurations you've given for the farmer and or the structure of the data-set tree to provide you with lists of trajectories that might be useful, such as a nested list of file-paths that follows the overall structure of the tree. If you're writing functions like this yourself, note that python's `glob` and `iterdir` functionalities provide sub-paths in no particular order. The reason the directory names are padded is so that the built-in `sorted` will 'just work' with a semantic sort on the file names, but you do have to bother to use sorted if you're writing your own iterator and you want the order to be 1. the same and 2. for the generations to be sequential each time you read the files. Note that the top level file titled `traj_list.txt` records the trajectory paths in the order they are produced, which could be good for some things like a function that surveys how much data has been collected thus far, but is probably not what you want for most analysis.
+We're hoping to add some scripts for both modes of analysis--mostly these will be simple functions that just use the configurations you've given for the farmer and or the structure of the data-set tree to provide you with lists of trajectories that might be useful, such as a nested list of file-paths that follows the overall structure of the tree. If you're writing functions like this yourself, note that python's `glob` and `iterdir` functionalities provide sub-paths in no particular order. The reason the directory names are padded is so that the built-in `sorted` will 'just work' with a semantic sort on the file names, but you do have to bother to use sorted if you're writing your own iterator and you want the order to be 1. the same and 2. for the generations to be sequential each time you read the files. Note that the top level file titled `traj_list.txt` records the trajectory paths in the order they are produced, which could be good for some things like a function that surveys how much data has been collected thus far, but is probably not what you want for most analysis. It lives at the top of `traj_dir_top_level`, and a `traj_list` you name yourself is taken relative to that same directory unless you give an absolute path, so the campaign directory can be picked up and restarted on another cluster without the tender writing its list somewhere else.
 
 ### Reimaging (making molecules whole again)
 

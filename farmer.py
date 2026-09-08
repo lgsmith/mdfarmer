@@ -11,6 +11,14 @@ import time
 # Stands in for a seed index that runs off the end of one of the input lists.
 MISSING_ENTRY = '<no entry>'
 
+# Seconds between one submission and the next. 0 hands the scheduler the whole
+# tick at once, which some of them mind and some do not.
+LAUNCH_INTERVAL = 0
+
+# Where every finished generation's trajectory path is appended, if the
+# campaign does not name the file itself.
+TRAJ_LIST_NAME = 'traj_list.txt'
+
 
 def missing_seed_inputs(seed_structure_fns, system_fns, top_fns,
                         missing_entry=MISSING_ENTRY):
@@ -46,6 +54,37 @@ def ready_seed_count(seed_structure_fns, system_fns, top_fns):
     return next((i for i in range(n_given) if i in missing), n_given)
 
 
+def campaign_path(value, traj_dir_top_level, default_name):
+    """An absolute path for value, anchored to the campaign directory.
+
+    A relative value hangs off traj_dir_top_level rather than off whatever
+    directory the driver script was started in, so the campaign names its own
+    files and the whole tree can be moved to another cluster. An absolute one
+    is left where it was put. The result is absolute either way: every
+    generation runs from its own directory, so a relative path would give each
+    of them a private file.
+    """
+    return str((Path(traj_dir_top_level) / (value or default_name)).resolve())
+
+
+def campaign_and_recorded_jobs(report, title, sep, known_jids,
+                               index_count=util.JOB_NAME_INDEX_COUNT):
+    """A queue report split into this campaign's jobs and its orphaned ids.
+
+    Returns (jobs, orphans). jobs is what campaign_jobs bound by name, as
+    (job_id, indices) pairs. orphans are the queued ids in known_jids whose
+    name does not split into a title and indices at all, so nothing can be
+    bound to them: ours by record rather than by name. A name that does split
+    belongs to whichever campaign its title names and is never orphaned here,
+    so a reused id running somebody else's job is not claimed back.
+    """
+    jobs = util.campaign_jobs(report, title, sep=sep, index_count=index_count)
+    unbindable = {jid for jid, name in util.parse_scheduler_report(report)
+                  if util.split_job_name(name, sep=sep,
+                                         index_count=index_count) is None}
+    return jobs, (unbindable & set(known_jids)) - {jid for jid, _ in jobs}
+
+
 def seed_slice(name, values, n_seeds):
     """The first n_seeds entries of a seed-indexed list, or None for None.
 
@@ -65,16 +104,44 @@ def seed_slice(name, values, n_seeds):
 class Farmer:
     __slots__ = ('priority_ordered_clones', 'n_seeds', 'n_clones', 'n_gens', 'runner', 'jids_file',
                  'config_template', 'jn_regex', 'current_jids', 'dry_run', 'overwrite',
-                 'active_clone_threshold', 'active_clone_set', 'failed_clone_set', 'seeds_first',
+                 'active_clone_threshold', 'active_set', 'failed_clone_set', 'seeds_first',
                  'job_name_fstring', 'job_number_re', 'finished_clones', 'harvester',
                  'quiet', 'sep', 'dirname_pad', 'seed_state_fns', 'scheduler',
                  'scheduler_report_cmd', 'scheduler_fstring', 'scheduler_kws',
                  'scheduler_assoc_rep_cmd', 'system_fns', 'top_fns',
                  'node_blocklist', 'run_script', 'recover_fn', 'progress_fn',
-                 'restarts_per_gen', 'pack_size', 'pack_grouping',
-                 'pack_cpus_per_task', 'pack_scheduler_fstring',
+                 'launch_interval', 'restarts_per_gen', 'pack_size',
+                 'pack_grouping', 'pack_cpus_per_task', 'pack_scheduler_fstring',
                  'pack_run_script', 'pack_member_cores',
                  'seed_config_overrides', 'seed_labels')
+
+    def write_jids(self):
+        """Mirror the live job ids to jids_file, for the next tick to read."""
+        self.jids_file.write_text(' '.join(map(str, sorted(self.current_jids))))
+
+    def recorded_jids(self):
+        """The job ids an earlier tick wrote to jids_file, or an empty set.
+
+        A missing or unreadable file is not an error: a campaign's first boot
+        has none, and the record is only ever a safety net over the job names.
+        """
+        try:
+            text = self.jids_file.read_text()
+        except OSError:
+            return set()
+        return {int(f) for f in text.split() if f.isascii() and f.isdigit()}
+
+    def known_jids(self):
+        """Every job id this campaign has reason to believe is its own.
+
+        The job numbers its clones or packs are bound to, which a tender learns
+        as it submits them, plus what an earlier tick recorded, which is all a
+        fresh boot has to go on.
+        """
+        bound = {unit.job_number
+                 for queue in self.priority_ordered_clones for unit in queue
+                 if unit.job_number is not None}
+        return bound | self.recorded_jids()
 
     def update_jids(self):
         """Refresh the set of job ids the scheduler says are ours and alive.
@@ -88,9 +155,14 @@ class Farmer:
             print(f'WARNING: keeping the previous {len(self.current_jids)} job '
                   'ids and skipping this tick rather than relaunching live jobs.')
             return False
-        self.current_jids = {jid for jid, _ in util.campaign_jobs(
-            report, self.config_template['title'], sep=self.sep)}
-        self.jids_file.write_text(' '.join(map(str, sorted(self.current_jids))))
+        jobs, orphans = campaign_and_recorded_jobs(
+            report, self.config_template['title'], self.sep, self.known_jids())
+        if orphans:
+            print(f'NOTE: queued jobs {sorted(orphans)} carry names this '
+                  'campaign cannot parse, but it recorded them as its own; '
+                  'counting them as live rather than launching over them.')
+        self.current_jids = {jid for jid, _ in jobs} | orphans
+        self.write_jids()
         return True
 
     def check_path(self, p: Path):
@@ -115,10 +187,14 @@ class Farmer:
         return util.check_seed_map(seed_map_p, self.seed_labels)
 
     def mark_clone_failed(self, clone):
-        """Move a clone off the active list and onto the failed one."""
+        """Move a clone out of active_set and onto the failed one.
+
+        active_set holds whichever unit is being scheduled, so the argument is
+        a Clone in an unpacked campaign and a ClonePack in a packed one.
+        """
         self.failed_clone_set.add(clone)
         try:
-            self.active_clone_set.remove(clone)
+            self.active_set.remove(clone)
         except KeyError:  # if clone isn't in active set that's OK.
             pass
         print('FAILED CLONE:', clone.get_tag())
@@ -126,8 +202,9 @@ class Farmer:
     def check_mark_clone_finished(self, clone):
         """True when the clone has run all n_gens generations.
 
-        A finished clone is moved out of the active set and into
-        finished_clones.
+        A finished clone is moved out of active_set and into
+        finished_clones. Either holds whichever unit is being scheduled: a
+        Clone, or a ClonePack once packing.
         """
         next_up_gen = clone.current_gen
         enough_gens = next_up_gen >= self.n_gens
@@ -135,7 +212,7 @@ class Farmer:
             print('Finished:', clone.get_tag())
             self.finished_clones.add(clone)
             try:
-                self.active_clone_set.remove(clone)
+                self.active_set.remove(clone)
             except KeyError:
                 print('done_before_launch', clone.get_tag())
         return enough_gens
@@ -146,7 +223,9 @@ class Farmer:
         One query answers both which jobs are alive and whose they are: two
         would let a job come or go in between, binding a dead id to a Clone.
         Raises if the scheduler cannot be reached, since booting blind would
-        submit a second job into every live generation directory.
+        submit a second job into every live generation directory. Only a name
+        carries the indices a Clone is bound by, so a recorded id queued under
+        an unreadable one is counted as live and warned about, not bound.
         """
         self.current_jids = set()
         rep_dict = {}
@@ -159,8 +238,10 @@ class Farmer:
                 'directory. Fix the query and start again.')
         print('boot re-association scheduler report:')
         print(assoc_raw)
-        for jid, key in util.campaign_jobs(
-                assoc_raw, self.config_template['title'], sep=self.sep):
+        jobs, orphans = campaign_and_recorded_jobs(
+            assoc_raw, self.config_template['title'], self.sep,
+            self.known_jids())
+        for jid, key in jobs:
             self.current_jids.add(jid)
             # The tender cannot cancel either job, so all it can do is say so.
             if key in rep_dict:
@@ -169,7 +250,14 @@ class Farmer:
                       'generation directory will corrupt it -- cancel one by '
                       'hand.')
             rep_dict[key] = jid
-        self.jids_file.write_text(' '.join(map(str, sorted(self.current_jids))))
+        if orphans:
+            print(f'WARNING: an earlier tick recorded jobs {sorted(orphans)} '
+                  'as this campaign\'s and they are still queued, but their '
+                  'names carry no seed/clone/gen, so no clone can be bound to '
+                  'them. A second job may launch into their generation '
+                  'directories -- cancel them by hand.')
+        self.current_jids |= orphans
+        self.write_jids()
         return rep_dict
 
     def pack_template(self):
@@ -284,7 +372,7 @@ class Farmer:
                   f'during setup: {type(exc).__name__}: {exc}')
             return None
         if clone.job_number is not None:
-            self.active_clone_set.add(clone)
+            self.active_set.add(clone)
         return clone
 
     def __init__(self, n_seeds: int, n_clones: int, n_gens: int,
@@ -298,10 +386,14 @@ class Farmer:
                  scheduler_kws: dict,
                  scheduler_report_cmd: str,
                  scheduler_assoc_rep_cmd: str,
+                 # Where finished trajectories are listed. Relative to
+                 # traj_dir_top_level; None -> its 'traj_list.txt'.
                  traj_list=None,
                  quiet=False,
                  # Slots for running clones at once, or for packs once packing.
                  active_clone_threshold=50,
+                 # Seconds to wait between one submission and the next.
+                 launch_interval=LAUNCH_INTERVAL,
                  dirname_pad=3,
                  job_number_re='[1-9][0-9]*',
                  # Where live job ids are mirrored; None -> '<title>-jids.txt'.
@@ -444,17 +536,20 @@ class Farmer:
                 'clone waiting for a slot that never opens. It must be at '
                 'least 1.')
         self.active_clone_threshold = active_clone_threshold
-        self.active_clone_set = set()
+        self.launch_interval = launch_interval
+        # Whichever unit is being scheduled: Clones, or packs once packing.
+        self.active_set = set()
         self.failed_clone_set = set()
-        # Every gen appends from its own directory, so it must be absolute.
-        self.config_template['traj_list'] = str(Path(
-            self.config_template.get('traj_list') or traj_list
-            or 'traj_list.txt').resolve())
+        # Anchored to the campaign directory, so the tree can be moved whole.
+        self.config_template['traj_list'] = campaign_path(
+            self.config_template.get('traj_list') or traj_list,
+            self.config_template['traj_dir_top_level'], TRAJ_LIST_NAME)
 
+        # Empty before boot re-association, which asks it what ids are bound.
+        self.priority_ordered_clones = []
         rep_dict = self.reassociate_running_jobs()
 
         tdir = Path(self.config_template['traj_dir_top_level'])
-        self.priority_ordered_clones = []
         if self.seeds_first:
             # One queue per clone index, holding every seed of it.
             queue_keys = [[(seed_index, clone_index)
@@ -520,7 +615,7 @@ class Farmer:
         """Replace the clone queues with ClonePacks, one queue per pack.
 
         A pack answers every call launch makes on a Clone, so the tending
-        loop is unchanged. active_clone_set is rebuilt because
+        loop is unchanged. active_set is rebuilt over the packs because
         _setup_one_clone populated it with the individual Clones.
         """
         fstring = self.pack_template()
@@ -550,15 +645,15 @@ class Farmer:
                 job_number_re=self.job_number_re,
                 dry_run=self.dry_run))
         self.priority_ordered_clones = [[pack] for pack in packs]
-        self.active_clone_set = {pack for pack in packs
-                                 if pack.job_number is not None}
+        self.active_set = {pack for pack in packs
+                           if pack.job_number is not None}
         if packs:
             biggest = max(len(pack.clones) for pack in packs)
             print(f'NOTE: {len(packs)} packs of up to {biggest} clones. '
                   f'active_clone_threshold={self.active_clone_threshold} '
-                  'counts packs, not clones, so up to '
-                  f'{self.active_clone_threshold * biggest} clones will run at '
-                  'once.')
+                  'counts what active_set holds, which is now packs rather '
+                  f'than clones, so up to {self.active_clone_threshold * biggest} '
+                  'clones will run at once.')
         return packs
 
     def _safe_check_start_gen(self, clone):
@@ -590,6 +685,19 @@ class Farmer:
         self.mark_clone_failed(clone)
         return False
 
+    def resolve_launch_interval(self, sleep):
+        """The campaign's launch_interval, or a deprecated sleep= overriding it.
+
+        sleep was the per-call name for the same wait; it still works so that
+        existing driver scripts keep running, and says so once.
+        """
+        if sleep is None:
+            return self.launch_interval
+        print(f'WARNING: sleep={sleep} is deprecated. Pass '
+              f'Farmer(launch_interval={sleep}) instead; honouring sleep for '
+              'now.')
+        return sleep
+
     def launch(self, sleep=None, update_jids=True):
         """One tick: advance, finish or fail every clone the queues still hold.
 
@@ -597,6 +705,7 @@ class Farmer:
         still part of the campaign. A clone that is waiting for a free slot
         counts as running, not as a failure.
         """
+        launch_interval = self.resolve_launch_interval(sleep)
         still_running = []  # note, this will be flat
         if update_jids and not self.update_jids():
             # Scheduler unreachable; presume all running, retry next tick.
@@ -612,10 +721,10 @@ class Farmer:
             survivors = []
             for clone in clone_list:
                 print('starting into clone loop for', clone.get_tag())
-                # Seconds to wait between clones, so a big campaign does not
-                # hand the scheduler every submission at once.
-                if sleep:
-                    time.sleep(sleep)
+                # Spaces the submissions out, for a scheduler that minds a
+                # whole campaign landing at once.
+                if launch_interval:
+                    time.sleep(launch_interval)
                 # This probably shouldn't happen, but it's worth checking for
                 if clone in self.finished_clones or \
                         clone in self.failed_clone_set:
@@ -625,7 +734,7 @@ class Farmer:
                     print('clone was just marked finished')
                     still_running.append(False)
                 # In the active set, so it may have just finished a gen.
-                elif clone in self.active_clone_set:
+                elif clone in self.active_set:
                     print('clone is in active clone list')
                     # Try to start another.
                     if self.advance_clone(clone):
@@ -635,13 +744,13 @@ class Farmer:
                         still_running.append(False)
 
                 # Few enough active clones that we could launch another.
-                elif len(self.active_clone_set) < self.active_clone_threshold:
+                elif len(self.active_set) < self.active_clone_threshold:
                     print(
                         'there are some more active clones, let us launch', clone.get_tag())
                     #  So we try to launch another.
                     if self.advance_clone(clone):
-                        print('started clone, adding to active_clone_set')
-                        self.active_clone_set.add(clone)
+                        print('started clone, adding to active_set')
+                        self.active_set.add(clone)
                         survivors.append(clone)
                         still_running.append(True)
                     else:
@@ -662,8 +771,10 @@ class Farmer:
         Whether you are starting or restarting, this is probably what you
         want. Returns True once every clone has finished, and False if a
         'stop' brake file halted the loop or any clone was given up on.
-        Raises if no clone could be built at all.
+        Raises if no clone could be built at all. sleep is the deprecated
+        spelling of Farmer(launch_interval=...) and overrides it for this run.
         """
+        self.launch_interval = self.resolve_launch_interval(sleep)
         if not self.priority_ordered_clones or not any(
                 self.priority_ordered_clones):
             # All of them failing is not the campaign finishing.
@@ -671,7 +782,7 @@ class Farmer:
                 'No clones could be set up; nothing to tend. Check the '
                 'per-clone setup errors printed above (missing structure, '
                 'topology, .mdp, or an unreadable checkpoint).')
-        still_running = self.launch(sleep=sleep, update_jids=False)
+        still_running = self.launch(update_jids=False)
         brake_file_p = Path('stop')
         print('still_running:', *still_running, flush=True)
         # If dry run, short circuit the tending loop.
@@ -686,7 +797,7 @@ class Farmer:
             time.sleep(update_interval)
             # Losing the tender leaves every running job unminded.
             try:
-                still_running = self.launch(sleep=sleep)
+                still_running = self.launch()
             except Exception as exc:
                 print(f'ERROR in tending loop: {type(exc).__name__}: {exc}')
                 traceback.print_exc()

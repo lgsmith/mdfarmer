@@ -129,11 +129,12 @@ def main(n_gens=N_GENS, pack_n_gens=PACK_N_GENS, steps_per_gen=STEPS_PER_GEN):
     farm = object.__new__(fm.Farmer)
     farm.n_gens = n_gens
     farm.finished_clones = set()
-    farm.active_clone_set = {clone}
+    farm.active_set = {clone}
     farm.failed_clone_set = set()
     farm.priority_ordered_clones = [[clone]]
     farm.current_jids = set()
     farm.overwrite = True
+    farm.launch_interval = 0
 
     for _ in range(n_gens + 3):
         if clone in farm.finished_clones:
@@ -142,8 +143,8 @@ def main(n_gens=N_GENS, pack_n_gens=PACK_N_GENS, steps_per_gen=STEPS_PER_GEN):
 
     suite.check('the clone reaches finished_clones',
                 clone in farm.finished_clones)
-    suite.check('it is dropped from active_clone_set',
-                clone not in farm.active_clone_set)
+    suite.check('it is dropped from active_set',
+                clone not in farm.active_set)
     suite.check(f'exactly {n_gens} generations were harvested, not one more',
                 len(reaper.reaped) == n_gens, f'-> {len(reaper.reaped)}')
     suite.check(f'exactly {n_gens} generation directories were created',

@@ -27,6 +27,8 @@ PACK_SIZE = 2
 PACK_THRESHOLD = 3
 SHORT_CLONES = 4
 FAILURE_LIMIT = 3
+# Seconds a spaced-out campaign waits between submissions.
+LAUNCH_INTERVAL = 7
 
 
 def make_template(work, steps_per_gen=STEPS_PER_GEN,
@@ -100,7 +102,7 @@ class StubClone:
 def tend(farmer, clone):
     """Put one stub clone in the tender's care, as an already-running clone."""
     farmer.priority_ordered_clones = [[clone]]
-    farmer.active_clone_set = {clone}
+    farmer.active_set = {clone}
     farmer.finished_clones = set()
     farmer.failed_clone_set = set()
     return farmer
@@ -119,6 +121,17 @@ class HalfBuildingFarmer(fm.Farmer):
                                         rep_dict)
 
 
+class FakeClock:
+    """Stands in for farmer's time module, recording waits instead of taking
+    them."""
+
+    def __init__(self):
+        self.waits = []
+
+    def sleep(self, seconds):
+        self.waits.append(seconds)
+
+
 def captured(call):
     """Run call(), returning (result, everything it printed)."""
     out = io.StringIO()
@@ -129,7 +142,7 @@ def captured(call):
 
 def main(n_clones=N_CLONES, pack_size=PACK_SIZE,
          pack_threshold=PACK_THRESHOLD, short_clones=SHORT_CLONES,
-         failure_limit=FAILURE_LIMIT):
+         failure_limit=FAILURE_LIMIT, launch_interval=LAUNCH_INTERVAL):
     suite = Suite('farmer_findings')
     work = harness.workdir('farmer_findings')
     for name in ('a.gro', 'topol.top', 'base.mdp'):
@@ -188,23 +201,35 @@ def main(n_clones=N_CLONES, pack_size=PACK_SIZE,
     suite.check('a template without write_interval still boots',
                 'write_interval' not in farmer.config_template)
 
-    suite.section('traj_list is resolved however it arrives')
+    suite.section('traj_list is anchored to the campaign directory')
     relative = 'given-by-hand.txt'
     template = make_template(work)
     template.pop('traj_list')
     farmer, _ = captured(lambda: make_farmer(work, template=template,
                                              traj_list=relative))
-    suite.check('a relative traj_list argument is resolved against the cwd',
-                farmer.config_template['traj_list']
-                == str(Path(relative).resolve()),
+    tdir = Path(farmer.config_template['traj_dir_top_level'])
+    suite.check('a relative traj_list argument hangs off traj_dir_top_level',
+                farmer.config_template['traj_list'] == str(tdir / relative),
                 f"-> {farmer.config_template['traj_list']}")
+    suite.check('and not off the directory the driver was started in',
+                farmer.config_template['traj_list']
+                != str(Path(relative).resolve()))
     template = make_template(work)
     template['traj_list'] = ''
     farmer, _ = captured(lambda: make_farmer(work, template=template))
-    suite.check('an empty entry in the template falls back to traj_list.txt',
+    suite.check('an empty entry falls back to traj_list.txt in that directory',
                 farmer.config_template['traj_list']
-                == str(Path('traj_list.txt').resolve()),
+                == str(tdir / fm.TRAJ_LIST_NAME),
                 f"-> {farmer.config_template['traj_list']}")
+    named = work / 'named-by-hand.txt'
+    template = make_template(work)
+    template['traj_list'] = str(named)
+    farmer, _ = captured(lambda: make_farmer(work, template=template))
+    suite.check('an absolute traj_list is left where it was put',
+                farmer.config_template['traj_list'] == str(named),
+                f"-> {farmer.config_template['traj_list']}")
+    suite.check('every generation is handed an absolute path either way',
+                Path(farmer.config_template['traj_list']).is_absolute())
 
     suite.section('clones that could not be set up are counted, not just listed')
     farmer, log = captured(lambda: make_farmer(
@@ -251,6 +276,32 @@ def main(n_clones=N_CLONES, pack_size=PACK_SIZE,
     suite.check('both jobs are still counted as ours',
                 farmer.current_jids == {11, 22}, f'-> {farmer.current_jids}')
 
+    suite.section('launch_interval spaces the submissions out')
+    clock, real_time = FakeClock(), fm.time
+    fm.time = clock
+    try:
+        farmer, _ = captured(lambda: make_farmer(
+            work, launch_interval=launch_interval))
+        tend(farmer, StubClone('spaced', succeeds=True))
+        captured(lambda: farmer.launch(update_jids=False))
+        suite.check('the campaign-wide interval is waited before each clone',
+                    clock.waits == [launch_interval], f'-> {clock.waits}')
+        del clock.waits[:]
+        _, log = captured(lambda: farmer.launch(sleep=1, update_jids=False))
+        suite.check('the old sleep= argument still overrides it',
+                    clock.waits == [1], f'-> {clock.waits}')
+        suite.check('and says it is deprecated',
+                    'deprecated' in log and 'launch_interval' in log,
+                    f'-> {log.strip()[:70]}')
+        del clock.waits[:]
+        farmer, _ = captured(lambda: make_farmer(work))
+        tend(farmer, StubClone('unspaced', succeeds=True))
+        captured(lambda: farmer.launch(update_jids=False))
+        suite.check('the default interval waits not at all', clock.waits == [],
+                    f'-> {clock.waits}')
+    finally:
+        fm.time = real_time
+
     suite.section('a clone waiting for a free slot')
     farmer, _ = captured(lambda: make_farmer(
         work, seeds_first=False, active_clone_threshold=1))
@@ -285,7 +336,7 @@ def main(n_clones=N_CLONES, pack_size=PACK_SIZE,
     farmer, _ = captured(lambda: make_farmer(work))
     stub = StubClone('never-launches')
     tend(farmer, stub)
-    farmer.active_clone_set = set()
+    farmer.active_set = set()
     still_running, _ = captured(lambda: farmer.launch(update_jids=False))
     suite.check('a clone waiting for its first launch is failed the same way',
                 still_running == [False] and stub in farmer.failed_clone_set,
