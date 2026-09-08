@@ -110,7 +110,7 @@ MDTRAJ_XTC_PRECISION = 1000.0
 XTC_PRECISION_OFFSET = 56
 
 # Atoms at or under which GROMACS stores coordinates raw, with no precision.
-XTC_UNCOMPRESSED_ATOMS = 9
+XTC_UNCOMPRESSED_ATOMS = util.XTC_UNCOMPRESSED_ATOMS
 
 # Nominal clock LOOS's XTCWriter stamps frames with when it is not told one.
 # Every frame here is written with its own step and time, so it is never used.
