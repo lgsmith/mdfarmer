@@ -145,21 +145,13 @@ def get_traj_len(traj_fn, top_fn, dry_topology_name=DRY_TOPOLOGY_NAME):
     return 0
 
 
-def frame_timing(traj_fn, n_frames=None):
-    """(step0, steps_per_frame, time0, time_per_frame), or None for a DCD.
-
-    Neither LOOS nor mdtraj keeps a source's step and time on its own: LOOS
-    numbers frames from zero at 1 ps apart, and mdtraj writes the frame index as
-    the step. Anything that rewrites a trajectory has to read these and pass
-    them back in.
+def _xtc_frame_timing(traj_p, n_frames=None):
+    """An .xtc's frame timing, read off the step and time it stamps per frame.
 
     Given n_frames, the spacing read off frames 0 and 1 is checked against the
     last frame, since extrapolating from two frames is only right if the source
     is evenly spaced.
     """
-    traj_p = Path(traj_fn)
-    if traj_p.suffix.lower() != '.xtc':
-        return None          # a DCD keeps its timing in the header
     with _mdtraj.open(str(traj_p)) as fh:
         available = len(fh)
         _, time, step, _ = fh.read(min(2, available))
@@ -183,6 +175,72 @@ def frame_timing(traj_fn, n_frames=None):
             f'step {predicted_step}, but it is at {int(last_step[0])}. Refusing '
             'to restamp frames from an assumption the trajectory contradicts.')
     return step0, steps_per_frame, time0, time_per_frame
+
+
+# CHARMM keeps a DCD's timestep in AKMA time units, and OpenMM's writer divides
+# by this on the way in, so reading it back multiplies.
+DCD_AKMA_PICOSECONDS = 0.04888821
+
+
+def dcd_frame_timing(traj_fn, n_frames=None, akma_ps=DCD_AKMA_PICOSECONDS):
+    """A DCD's (step0, steps_per_frame, time0, time_per_frame), or None.
+
+    A DCD stamps nothing on a frame: istart, nsavc and delta describe the whole
+    file at once, putting frame k at step istart + k*nsavc and at time
+    (istart + k*nsavc) * delta. OpenMM's DCDReporter makes that map exact for a
+    generation, because it hands DCDFile the report interval as both firstStep
+    and interval, so frame 0 is the first report, one interval of steps in, and
+    an append reuses those same two numbers. The steps count from the file's
+    own beginning rather than from the campaign's -- which is the clock
+    XTCReporter stamps on its frames too, so the two formats answer in the same
+    units and the recovery path still has to add the earlier generations' steps
+    itself.
+
+    None when nothing filled the header in. mdtraj's DCD writer, which is what
+    writes a reimaged or harvested DCD, leaves istart 0, nsavc 1 and delta 1,
+    placing frame 0 at step 0 -- a frame no reporter ever writes, since a
+    reporter's first comes one interval in. Handing that back as a time axis
+    would be a fabrication, so the caller is told there is none.
+
+    n_frames is accepted and ignored: one linear rule covers every frame, so
+    there is no last frame that could disagree with the first two.
+    """
+    info = dcd_header_info(Path(traj_fn))
+    istart, nsavc, delta = info['istart'], info['nsavc'], info['delta']
+    if istart <= 0 or nsavc <= 0 or delta <= 0:
+        return None
+    ps_per_step = delta * akma_ps
+    return istart, nsavc, istart * ps_per_step, nsavc * ps_per_step
+
+
+# What frame_timing answers for. dcd_frame_timing is deliberately not wired in
+# here: what a caller does with an answer is hand a step and a time to a writer,
+# and loos.DCDWriter.writeFrame takes a group and nothing else, so a DCD's
+# reconstructed timing would only make harvester and reimage raise TypeError on
+# the format they can already read. Ask dcd_frame_timing directly until those
+# two branch on what the output writer accepts rather than on this being None.
+_FRAME_TIMING = {'.xtc': _xtc_frame_timing}
+
+
+def frame_timing(traj_fn, n_frames=None, backends=_FRAME_TIMING):
+    """(step0, steps_per_frame, time0, time_per_frame) a rewrite has to carry
+    forward, or None when there is nothing to carry.
+
+    Neither LOOS nor mdtraj keeps a source's step and time on its own: LOOS
+    numbers frames from zero at 1 ps apart, and mdtraj writes the frame index as
+    the step. Anything that rewrites a trajectory has to read these and pass
+    them back in.
+
+    Only an .xtc answers. A DCD's timing is recoverable, but from its header
+    rather than its frames, and dcd_frame_timing is where to ask for it. An
+    .h5 has no answer to give at all: an mdtraj HDF5 file records a time per
+    frame and no step whatsoever, and half an axis would put a fabricated step
+    counter into whatever was written from it.
+    """
+    backend = backends.get(Path(traj_fn).suffix.lower())
+    if backend is None:
+        return None
+    return backend(Path(traj_fn), n_frames)
 
 
 def strip_and_downsample(config_fn, harvester_config_fn):
@@ -852,7 +910,7 @@ def state_xml_step_count(p: Path) -> int:
 
 
 def dcd_header_info(p: Path) -> dict:
-    """Parse a DCD header. Returns nset, istart, nsavc, with_unitcell,
+    """Parse a DCD header. Returns nset, istart, nsavc, delta, with_unitcell,
     n_atoms, and header_size (file offset where the first frame begins).
     """
     with open(p, 'rb') as f:
@@ -862,8 +920,11 @@ def dcd_header_info(p: Path) -> dict:
         magic = f.read(4)
         if magic != b'CORD':
             raise ValueError(f'DCD magic {magic!r} != b"CORD" at {p}')
-        ints = struct.unpack('<20i', f.read(80))
+        block = f.read(80)
+        ints = struct.unpack('<20i', block)
         nset, istart, nsavc = ints[0], ints[1], ints[2]
+        # Word 9 of the block, at byte 44, is the timestep, and a float.
+        delta = struct.unpack('<f', block[36:40])[0]
         # ints[10], at byte 48, is 1 when frames carry the 6-double box record.
         with_unitcell = ints[10]
         be1 = struct.unpack('<i', f.read(4))[0]
@@ -884,7 +945,7 @@ def dcd_header_info(p: Path) -> dict:
         if be3 != 4:
             raise ValueError(f'DCD natoms block end marker {be3} != 4 at {p}')
         header_size = f.tell()
-    return {'nset': nset, 'istart': istart, 'nsavc': nsavc,
+    return {'nset': nset, 'istart': istart, 'nsavc': nsavc, 'delta': delta,
             'with_unitcell': bool(with_unitcell), 'n_atoms': n_atoms,
             'header_size': header_size}
 
