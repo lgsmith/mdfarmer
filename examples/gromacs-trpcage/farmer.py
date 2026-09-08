@@ -7,11 +7,13 @@ It proves the packed path end to end -- one sbatch, one MPS daemon, one pack
 lock, two pinned mdruns, per-member failure and recovery, and a harvest per
 generation -- before a real campaign is committed to it.
 
-    PY=/mnt/home/lsmith/miniforge3/envs/omm/bin/python
-    $PY farmer.py --check                   # readiness table, no writes
-    $PY farmer.py --dry-run                 # dirs, configs, scripts; submit nothing
-    nohup $PY -u farmer.py > shakedown-gmx.tend.out 2>&1 &   # for real
-    touch stop                              # graceful stop, at the next tick
+drive_gmx.sh is how it is launched: it holds the campaign's tender lock, logs
+somewhere findable, and detaches. The driver runs on its own just as well.
+
+    ./drive_gmx.sh --check      # readiness table, no writes
+    ./drive_gmx.sh --dry-run    # dirs, configs, scripts; submit nothing
+    ./drive_gmx.sh              # start the tender, detached
+    ./drive_gmx.sh --stop       # graceful stop, at the next tick
 """
 import argparse
 import gzip
