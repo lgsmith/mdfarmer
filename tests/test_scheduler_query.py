@@ -39,6 +39,8 @@ def main(lsf_empty=LSF_EMPTY, failed_pipeline=FAILED_PIPELINE):
                 util.scheduler_query('false')[0] is False)
     suite.check('a query that cannot run at all is not trusted',
                 util.scheduler_query('exit 127')[0] is False)
+    suite.check('a query that never comes back is not trusted',
+                util.scheduler_query('sleep 30', timeout=1)[0] is False)
 
     suite.section('a scheduler that reports an empty queue by exiting non-zero')
     suite.check('LSF\'s empty queue is trusted, not treated as a failure',
