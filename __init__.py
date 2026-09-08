@@ -2,7 +2,9 @@ from . import harvester
 from .harvester import (Harvester, HarvestError, harvest_generation,
                         check_commensurability, unharvested_gen_dirs,
                         verify_dry_chain, select_backend, resolve_subset,
-                        frame_plan, expected_counts)
+                        frame_plan, expected_counts,
+                        classify_gen_dir, classify_campaign, format_report,
+                        harvest_recovered, completion_witness)
 from .farmer import *
 from .utilities import *
 from .simulate import *
@@ -35,6 +37,10 @@ __all__ = ['fdir', 'dir_seeds_clones', 'dir_seeds_clones_gens', 'omm_generation'
            'check_commensurability', 'unharvested_gen_dirs',
            'verify_dry_chain', 'select_backend', 'resolve_subset',
            'frame_plan', 'expected_counts',
+           # How a finished campaign is inspected and repaired, which the
+           # README walks through and unharvested_gen_dirs alone cannot do.
+           'classify_gen_dir', 'classify_campaign', 'format_report',
+           'harvest_recovered', 'completion_witness',
            'strip_and_downsample',
            'default_straight_sampling_config_template',
            'default_straight_sampling_init_config',
