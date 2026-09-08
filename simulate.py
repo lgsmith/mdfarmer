@@ -304,7 +304,9 @@ def omm_generation(traj_dir_top_level: str,
     Parameters are documented inline in the signature above. Every reporter
     writes on the same write_interval, so the trajectory, state.xml and .out
     file stay frame-aligned on disk and an interrupted generation can be picked
-    up later with append=True.
+    up later with append=True. Every per-generation artefact -- trajectory,
+    .out, restart file and tandem files -- is addressed under the generation
+    directory, so the caller's cwd does not decide where any of them land.
 
     With handle_preempt, Preempted is raised at the first reporter cycle after
     the batch script's SIGTERM trap touches PREEMPT_SIGTERM in cwd; this needs a
@@ -409,8 +411,10 @@ def omm_generation(traj_dir_top_level: str,
         **state_data_kwargs)
 
     # This will write xmls with system velocities in them
+    restart_p = traj_dir / restart_name
+    # CheckpointReporter treats a non-str as an open file object, so pass str.
     restart_reporter = app.CheckpointReporter(
-        restart_name,
+        str(restart_p),
         write_interval,
         writeState=True)
 
