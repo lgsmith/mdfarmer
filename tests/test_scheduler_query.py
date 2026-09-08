@@ -1,9 +1,11 @@
 """A failed scheduler query must not read as an empty queue.
 
-Every launch decision rests on which jobs the scheduler says are alive. The
-query commands end in a pipe, so without pipefail a squeue that dies still exits
-0 and prints nothing, which looks exactly like a quiet queue and relaunches
-every live clone on top of itself.
+Every launch decision rests on which jobs the scheduler says are alive. A
+squeue that dies and prints nothing looks exactly like a quiet queue, and read
+that way it relaunches every live clone on top of itself. The shipped reports
+are single commands whose own exit status settles that; pipefail is still set
+for the pipelines a site may substitute, where the last stage would otherwise
+exit 0 over a dead first stage.
 """
 import sys
 
