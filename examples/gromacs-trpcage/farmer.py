@@ -171,22 +171,34 @@ HARVEST_FSTRING = """#!/bin/bash
 
 
 def inflate(src_gz, dest):
-    """Decompress one committed .gz input to `dest`, and return `dest`.
+    """Decompress one committed .gz input to `dest` once, and return `dest`.
 
     The inputs are committed gzipped so the example is self-contained without
     carrying a megabyte of .gro and .top. GROMACS cannot read them that way --
     grompp takes file names, not streams -- so they are inflated once, here,
     before the Farmer is built.
+
+    A `dest` already on disk is left alone: every tender boot calls this, and
+    re-inflating each time would be waste, not safety. The inflated file only
+    appears under its real name once it is whole, so a boot killed mid-inflate
+    leaves nothing a later boot can mistake for done.
     """
     dest = Path(dest)
+    if dest.is_file():
+        return dest
     dest.parent.mkdir(parents=True, exist_ok=True)
-    with gzip.open(src_gz, 'rb') as fin, dest.open('wb') as fout:
+    staged = dest.with_name(dest.name + '.partial')
+    with gzip.open(src_gz, 'rb') as fin, staged.open('wb') as fout:
         shutil.copyfileobj(fin, fout)
-    return dest
+    return staged.replace(dest)
 
 
 def prepare_inputs(inputs=INPUTS, prepared=PREPARED):
-    """Inflate the committed inputs; the .mdp is small enough to commit plain."""
+    """Inflate the committed inputs; the .mdp is small enough to commit plain.
+
+    Cheap enough to call on every tender boot: the inflation is skipped once
+    the inflated file is there.
+    """
     paths = dict(
         structure_fn=inflate(inputs / 'gmx.gro.gz', Path(prepared) / 'gmx.gro'),
         top_fn=inflate(inputs / 'gmx.top.gz', Path(prepared) / 'gmx.top'),

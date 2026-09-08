@@ -134,20 +134,31 @@ STATE_COUNTER_RE = re.compile(r'stepCount="\d+" time="[^"]*"')
 STATE_COUNTER_ZERO = 'stepCount="0" time="0.0"'
 
 
-def inflate(src_gz, dest):
-    """Decompress one committed .gz input to `dest`, and return `dest`.
+def inflate(src_gz, dest, finish=None):
+    """Decompress one committed .gz input to `dest` once, and return `dest`.
 
     The inputs are committed gzipped so the example is self-contained without
     carrying 7 MB of XML, but omm_generation reads system_fn with
     `Path(system_fn).read_text()` and hands seed_fn to `Simulation.loadState`,
     neither of which inflates. So they are inflated once, here, rather than in
     the runner.
+
+    A `dest` already on disk is left alone: every tender boot calls this, and
+    re-inflating 7 MB each time would be waste, not safety. The inflated file
+    only appears under its real name once it is whole, so a boot killed
+    mid-inflate leaves nothing a later boot can mistake for done. `finish` is
+    called on the staged file first, for edits that must happen exactly once.
     """
     dest = Path(dest)
+    if dest.is_file():
+        return dest
     dest.parent.mkdir(parents=True, exist_ok=True)
-    with gzip.open(src_gz, 'rb') as fin, dest.open('wb') as fout:
+    staged = dest.with_name(dest.name + '.partial')
+    with gzip.open(src_gz, 'rb') as fin, staged.open('wb') as fout:
         shutil.copyfileobj(fin, fout)
-    return dest
+    if finish is not None:
+        finish(staged)
+    return staged.replace(dest)
 
 
 def zero_state_counters(state_p, pattern=STATE_COUNTER_RE,
@@ -183,14 +194,20 @@ def write_integrator(dest, temperature=TEMPERATURE, dt_ps=DT_PS,
 
 
 def prepare_inputs(inputs=INPUTS, prepared=PREPARED):
-    """Inflate the committed inputs and write the integrator beside them."""
+    """Inflate the committed inputs and write the integrator beside them.
+
+    Cheap enough to call on every tender boot: the inflation is skipped once
+    the inflated file is there, and the integrator is three numbers.
+    """
     prepared = Path(prepared)
     paths = dict(
         system_fn=inflate(inputs / 'system.xml.gz', prepared / 'system.xml'),
         top_fn=inflate(inputs / 'topology.pdb.gz', prepared / 'topology.pdb'),
-        seed_fn=inflate(inputs / 'state.xml.gz', prepared / 'state.xml'),
+        # Rewound while staged, so the seed is never on disk under its real
+        # name still carrying its equilibration's step count.
+        seed_fn=inflate(inputs / 'state.xml.gz', prepared / 'state.xml',
+                        finish=zero_state_counters),
     )
-    zero_state_counters(paths['seed_fn'])
     paths['integrator_xml'] = write_integrator(prepared / 'integrator.xml')
     return {key: str(p.resolve()) for key, p in paths.items()}
 
