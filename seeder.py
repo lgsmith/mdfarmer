@@ -611,6 +611,30 @@ class Clone:
             return False
         return self.preemption_checker(self.job_number)
 
+    def spend_restart(self):
+        """Charge one restart of this generation, and say whether to go on.
+
+        The one place a clone is written off for good: every failure to advance
+        funnels through here, and False means restarts_per_gen is spent. Any
+        advance that gets somewhere clears the counter, so the budget is per
+        generation and not per campaign.
+        """
+        if self.restart_attempts >= self.restarts_per_gen:
+            print(self.current_gen_dir, 'has been restarted',
+                  self.restart_attempts, 'times. Aborting this clone.')
+            return False
+        self.restart_attempts += 1
+        return True
+
+    def note_failed_submission(self, count_as_restart):
+        """Report a submission that did not take, as a strike not a give-up.
+
+        A refused sbatch or an unreadable job id is a failed attempt at this
+        generation, so it costs a restart and not the rest of the campaign.
+        plow_harrow_plant already charged one unless the caller waived that.
+        """
+        return count_as_restart or self.spend_restart()
+
     def plow_harrow_plant(self, overwrite=False, count_as_restart=True):
         """Make this generation's directory and write the files a launch needs.
 
@@ -639,12 +663,9 @@ class Clone:
         # chain, and the runners are handed the number.
         self.config['target_step'] = self.target_step()
         # Rewritten even when overwrite is False: a stale config on disk would
-        # relaunch a half-finished gen from scratch. Temp name, so no torn read.
+        # relaunch a half-finished gen from scratch.
         config_p = self.current_gen_dir / 'config.json'
-        tmp_p = config_p.with_name(config_p.name + '.tmp')
-        with tmp_p.open('w') as f:
-            json.dump(self.config, f, indent=4)
-        tmp_p.replace(config_p)
+        util.write_json_atomic(config_p, self.config, indent=4)
 
         job_name = self.job_name_fstring.format(**self.config)
         scheduler_script = self.scheduler_fstring.format(job_name=job_name,
@@ -658,18 +679,15 @@ class Clone:
             run_script_p.write_text(self.run_script)
         if not count_as_restart:
             return True
-        if self.restart_attempts < self.restarts_per_gen:
-            self.restart_attempts += 1
-            return True
-        else:
-            print(self.current_gen_dir, 'has been restarted',
-                  self.restart_attempts, 'times. Aborting this clone.')
-            return False
+        return self.spend_restart()
 
     def start_current(self, overwrite=False, count_as_restart=True,
                       submit=True):
         """Prepare this generation's launch, and (unless submit is False)
         submit it.
+
+        False only once this generation's restart budget is spent: a submission
+        that is refused costs a restart and still returns True.
 
         submit=False is what lets a ClonePack do every member's preparation,
         gen directory, seed copy, config.json, run script, and then send a
@@ -691,12 +709,12 @@ class Clone:
                     text=True, capture_output=True)
             if result.returncode != 0:
                 # Submission failed: bad QOS, account, scheduler hiccup or
-                # script. Fail this clone rather than the whole orchestrator.
+                # script. Worth another tick, so it costs a restart.
                 print(f'{self.scheduler} call for {self.get_tag()} returned '
                       f'exit code {result.returncode}')
                 print('  stdout:', result.stdout)
                 print('  stderr:', result.stderr)
-                return False
+                return self.note_failed_submission(count_as_restart)
             # Assumes the scheduler prints something on submission, whose first
             # job_number_re match is the job number.
             match = self.job_number_re.search(result.stdout)
@@ -709,7 +727,7 @@ class Clone:
                       f'UNTRACKED: find and cancel it by hand.')
                 print('  stdout:', result.stdout)
                 print('  stderr:', result.stderr)
-                return False
+                return self.note_failed_submission(count_as_restart)
             self.job_number = int(match.group(0))
             print('Started:', self.get_tag())
         return should_launch
@@ -977,14 +995,43 @@ class ClonePack:
         head = dict(self.clones[0].config)
         return self.job_name_fstring.format(**head)
 
+    def live_indexes(self):
+        """Positions of the members that have not been retired, in pack order."""
+        return [i for i in range(len(self.clones)) if i not in self.retired]
+
+    def retire(self, index):
+        """Drop a member that has spent its restart budget, keeping its slot.
+
+        It stays in self.clones, which member_cores and the pack's job name
+        index positionally; only live_indexes stops naming it.
+        """
+        self.retired.add(index)
+        print(f'{self.clones[index].get_tag()}: exhausted its restart budget; '
+              'retiring it from the pack.')
+
+    def spend_restart(self):
+        """Charge every live member one restart; False once none are left.
+
+        A member whose budget runs out retires instead of failing the pack, so
+        this says what Clone.spend_restart says: whether there is anything left
+        to try.
+        """
+        for index in self.live_indexes():
+            if not self.clones[index].spend_restart():
+                self.retire(index)
+        return bool(self.live_indexes())
+
     def check_start_gen(self, scheduler_report: set, overwrite=False):
-        """Advance every member, then submit one job for the pack."""
+        """Advance every member, then submit one job for the pack.
+
+        False only once every member has spent its restart budget; a pack whose
+        submission is refused charges the budget and returns True.
+        """
         if self.job_number in scheduler_report:
             print('Pack job', self.job_number, 'still running', self._job_name())
             return True
 
-        live_indexes = [i for i in range(len(self.clones))
-                        if i not in self.retired]
+        live_indexes = self.live_indexes()
         if not live_indexes:
             print(f'{self.get_tag()}: every member retired; failing pack.')
             return False
@@ -1006,9 +1053,7 @@ class ClonePack:
             if not ok:
                 # Its restart budget is spent, and a member that never runs can
                 # never earn it back; retire it so it stops pinning the pack.
-                self.retired.add(index)
-                print(f'{clone.get_tag()}: exhausted its restart budget; '
-                      'retiring it from the pack.')
+                self.retire(index)
                 continue
             if clone.is_done:
                 # That call finished this member's last gen; nothing to submit.
@@ -1017,8 +1062,7 @@ class ClonePack:
             member_configs.append(clone.current_gen_dir / 'config.json')
             member_indexes.append(index)
 
-        still_live = [i for i in range(len(self.clones))
-                      if i not in self.retired]
+        still_live = self.live_indexes()
         if not still_live:
             print(f'{self.get_tag()}: every member retired; failing pack.')
             return False
@@ -1027,8 +1071,10 @@ class ClonePack:
                   'generations.')
             return True
         if not member_configs:
-            print(f'{self.get_tag()}: no member could be prepared; failing pack.')
-            return False
+            # Every live member raised on the way in, so none was charged for
+            # the attempt; charge them here rather than retrying forever.
+            print(f'{self.get_tag()}: no member could be prepared.')
+            return self.spend_restart()
         unfinished = tried - newly_finished
         if len(member_configs) < unfinished:
             # Launch the healthy members rather than shrinking the pack for
@@ -1059,11 +1105,13 @@ class ClonePack:
             result = sp.run(self.scheduler, stdin=f, cwd=self.pack_dir,
                             text=True, capture_output=True)
         if result.returncode != 0:
+            # Preparing the members already charged their budgets for this
+            # attempt, so the pack retries until those run out.
             print(f'{self.scheduler} call for {self.get_tag()} returned '
                   f'exit code {result.returncode}')
             print('  stdout:', result.stdout)
             print('  stderr:', result.stderr)
-            return False
+            return True
         match = self.job_number_re.search(result.stdout)
         if match is None:
             # As for a solo clone: the pack's job is running, untracked.
@@ -1073,7 +1121,7 @@ class ClonePack:
                   f'it by hand.')
             print('  stdout:', result.stdout)
             print('  stderr:', result.stderr)
-            return False
+            return True
         self.job_number = int(match.group(0))
         # Every member answers to the pack's job id, so per-member checks work.
         for clone in self.clones:
