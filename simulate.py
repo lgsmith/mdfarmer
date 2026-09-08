@@ -296,8 +296,11 @@ def omm_generation(traj_dir_top_level: str,
                    velocity_traj_suffix=None,
                    # Parallel force file: '.dcd', '.xtc', '.h5', or None for none.
                    force_traj_suffix=None,
-                   # If True, install a SentinelReporter watching cwd for PREEMPT_SIGTERM.
+                   # If True, install a SentinelReporter watching for the preempt sentinel.
                    handle_preempt=False,
+                   # Sentinel to watch; None means this generation's own directory.
+                   sentinel_path=None,
+                   sentinel_name=PREEMPT_SENTINEL_NAME,
                    ):
     """Run one generation of MD and return the path to the trajectory written.
 
@@ -305,13 +308,15 @@ def omm_generation(traj_dir_top_level: str,
     writes on the same write_interval, so the trajectory, state.xml and .out
     file stay frame-aligned on disk and an interrupted generation can be picked
     up later with append=True. Every per-generation artefact -- trajectory,
-    .out, restart file and tandem files -- is addressed under the generation
-    directory, so the caller's cwd does not decide where any of them land.
+    .out, restart file, tandem files and the default sentinel -- is addressed
+    under the generation directory, so the caller's cwd does not decide where
+    any of them land.
 
     With handle_preempt, Preempted is raised at the first reporter cycle after
-    the batch script's SIGTERM trap touches PREEMPT_SIGTERM in cwd; this needs a
-    batch script that installs that trap and background+waits the python
-    invocation (see basic_scheduler_fstrings_preempt).
+    the batch script's SIGTERM trap touches PREEMPT_SIGTERM; this needs a batch
+    script that installs that trap and background+waits the python invocation
+    (see basic_scheduler_fstrings_preempt). sentinel_path points several packed
+    members at one shared sentinel; left None each generation watches its own.
 
     Written so calls can be uplifted with jug's 'Task' class.
     """
@@ -504,11 +509,12 @@ def omm_generation(traj_dir_top_level: str,
     # Appended last, so this cycle's writes land on disk before it can raise:
     # only traj_reporter asks for positions, so Simulation reports one group.
     if handle_preempt:
-        sentinel_p = Path(PREEMPT_SENTINEL_NAME)
-        # A sentinel left in this gen dir by an earlier preempt would fire at once.
-        if sentinel_p.exists():
+        sentinel_p = Path(sentinel_path) if sentinel_path else traj_dir / sentinel_name
+        # A gen clears its own stale sentinel; a pack's owner clears the shared one.
+        if sentinel_path is None and sentinel_p.exists():
             sentinel_p.unlink()
-        simulation.reporters.append(SentinelReporter(write_interval))
+        simulation.reporters.append(
+            SentinelReporter(write_interval, sentinel_path=sentinel_p))
     try:
         simulation.step(steps)
     except Preempted as exc:
