@@ -378,7 +378,10 @@ def main():
                           steps_per_gen=args.steps,
                           write_interval=args.write_interval,
                           harvest=not args.no_harvest, dry_run=args.dry_run)
-    farmer.start_tending_fields(update_interval=args.update_interval)
+    finished = farmer.start_tending_fields(update_interval=args.update_interval)
+    # The exit status a re-entering tender loop reads: 0 only when every clone
+    # finished, so a braked or failed run is re-entered rather than called done.
+    raise SystemExit(0 if finished else 1)
 
 
 if __name__ == '__main__':
