@@ -32,7 +32,18 @@ TRAJ_TOP = HERE / 'data' / PROJECT
 # in the right environment, so its own python is the honest default; --python
 # overrides it when the node needs a different one.
 PYTHON_CMD = sys.executable
-GMX_BIN = 'gmx_mpi'              # what ENV_SETUP's module puts on PATH
+# Every CUDA GROMACS in this module tree is an MPI build, and such a binary
+# calls MPI_Init even for grompp. Run one directly inside a Slurm allocation
+# and OpenMPI sees the SLURM_* environment, tries Slurm's PMI, finds this
+# OpenMPI was not built with it, and aborts before any MD -- so mpirun has to
+# launch it. A site with a thread-MPI gmx wants the bare string instead:
+#
+#     GMX_BIN = 'gmx'
+#
+# which is the default, and is why nothing in mdfarmer knows what mpirun is.
+GMX_LAUNCHER = ['mpirun', '-n', '1']   # empty list for a thread-MPI gmx
+GMX_BINARY = 'gmx_mpi'                 # the binary itself, for the job's guard
+GMX_BIN = [*GMX_LAUNCHER, GMX_BINARY]
 
 # Loaded inside the job, since a compute node inherits no module environment
 # worth relying on. gmx_pack probes for -ntmpi rather than assuming it, so an
@@ -135,7 +146,9 @@ echo "DATE: $(date -Is)"
 printf '%s\\t%s\\t%s\\n' "$(date -Is)" "$SLURM_JOB_ID" "$SLURMD_NODENAME" >> node_history.tsv
 
 {env_setup}
-command -v {gmx_bin} >/dev/null || {{ echo "MISSING {gmx_bin} after env setup"; exit 1; }}
+for cmd in {gmx_check}; do
+  command -v "$cmd" >/dev/null || {{ echo "MISSING $cmd after env setup"; exit 1; }}
+done
 
 # Per-job MPS daemon, keyed on the job id so two packed jobs on one node never
 # share or clobber each other's. Without it the replicas time-slice the card.
@@ -270,12 +283,17 @@ def build_harvester(paths, steps_per_gen=STEPS_PER_GEN,
 
 def scheduler_kws(partition=PARTITION, qos=QOS, gres=GRES, mem=MEM,
                   walltime=WALLTIME, cpus=PACK_CPUS, extra_sbatch=EXTRA_SBATCH,
-                  python=PYTHON_CMD, gmx_bin=GMX_BIN, env_setup=ENV_SETUP):
+                  python=PYTHON_CMD, gmx_bin=GMX_BIN, env_setup=ENV_SETUP,
+                  gmx_launcher=GMX_LAUNCHER, gmx_binary=GMX_BINARY):
+    # The guard checks each command by name, so a launcher vector cannot reach
+    # the shell as a python list -- which would fail every job at the guard.
+    checks = ([gmx_launcher[0]] if gmx_launcher else []) + [gmx_binary]
     return dict(
         partition=partition, gres=gres, cpus=cpus, mem=mem, walltime=walltime,
         qos_line=(f'#SBATCH -q {qos}\n' if qos else ''),
         extra_sbatch=(extra_sbatch + '\n' if extra_sbatch else ''),
         exclude_nodes='', python=python, gmx_bin=gmx_bin,
+        gmx_check=' '.join(checks),
         env_setup=env_setup, run_script_name='run.py')
 
 
