@@ -77,8 +77,8 @@ class Harvester:
     def prep_and_write_inputs(self, current_dir: Path):
         if self.run_config:
             harvest_script = self.harvester_template.format(**self.run_config)
-            harvest_config_p = current_dir/self.run_config_name
-            harvest_config_p.write_text(json.dumps(self.run_config))
+            util.write_json_atomic(current_dir/self.run_config_name,
+                                   self.run_config)
         else:
             harvest_script = self.harvester_template
         harvest_script_p = current_dir/self.scriptname
