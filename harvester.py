@@ -649,6 +649,24 @@ def _verify_counts(traj_p, dry_p, down_p, dry_top_p, structure_fn, n_orig,
             f'{traj_p.name} is being left alone:\n  ' + '\n  '.join(problems))
 
 
+def repair_candidates(n_dry_on_disk, n_down_on_disk, frames_per_gen, gen_index,
+                      first_global_index, downsample_frq, seam=SEAM_AUTO):
+    """Original frame counts whose plan produces the outputs already on disk.
+
+    Empty means the two outputs are not what any harvest of this generation
+    would have written, so the deleted original cannot be accounted for.
+    """
+    matches = []
+    for candidate in (frames_per_gen + 1, frames_per_gen):
+        skip_first = resolve_seam(candidate, frames_per_gen, gen_index,
+                                  seam=seam)
+        n_dry, n_down = expected_counts(candidate, first_global_index,
+                                        downsample_frq, skip_first)
+        if (n_dry_on_disk, n_down_on_disk) == (n_dry, n_down):
+            matches.append((candidate, skip_first, n_dry, n_down))
+    return matches
+
+
 def _repair_from_symlink(traj_p, dry_p, down_p, sentinel_p, dry_top_p,
                          structure_fn, frames_per_gen, gen_index,
                          first_global_index, downsample_frq, seam=SEAM_AUTO):
@@ -665,14 +683,9 @@ def _repair_from_symlink(traj_p, dry_p, down_p, sentinel_p, dry_top_p,
     dry_on_disk = util.get_traj_len(
         dry_p, dry_top_p if dry_top_p.is_file() else None)
     down_on_disk = util.get_traj_len(down_p, structure_fn)
-    matches = []
-    for candidate in (frames_per_gen + 1, frames_per_gen):
-        skip_first = resolve_seam(candidate, frames_per_gen, gen_index,
-                                  seam=seam)
-        n_dry, n_down = expected_counts(candidate, first_global_index,
-                                        downsample_frq, skip_first)
-        if (dry_on_disk, down_on_disk) == (n_dry, n_down):
-            matches.append((candidate, skip_first, n_dry, n_down))
+    matches = repair_candidates(dry_on_disk, down_on_disk, frames_per_gen,
+                                gen_index, first_global_index, downsample_frq,
+                                seam=seam)
     if matches:
         # After generation 0 both candidates produce the same two counts, so
         # how many frames the deleted original held cannot be recovered from
