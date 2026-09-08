@@ -639,12 +639,9 @@ class Clone:
         # chain, and the runners are handed the number.
         self.config['target_step'] = self.target_step()
         # Rewritten even when overwrite is False: a stale config on disk would
-        # relaunch a half-finished gen from scratch. Temp name, so no torn read.
+        # relaunch a half-finished gen from scratch.
         config_p = self.current_gen_dir / 'config.json'
-        tmp_p = config_p.with_name(config_p.name + '.tmp')
-        with tmp_p.open('w') as f:
-            json.dump(self.config, f, indent=4)
-        tmp_p.replace(config_p)
+        util.write_json_atomic(config_p, self.config, indent=4)
 
         job_name = self.job_name_fstring.format(**self.config)
         scheduler_script = self.scheduler_fstring.format(job_name=job_name,
