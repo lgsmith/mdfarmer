@@ -174,9 +174,11 @@ farmer = mdf.Farmer(
 )
 ```
 
-Once packing is on, the tender schedules packs rather than clones, so
-`active_clone_threshold` counts packs: with `pack_size=2` and a threshold of
-50, 100 clones run at once. The boot log prints the figure it arrived at.
+Once packing is on, the tender schedules packs rather than clones. The
+Farmer's `active_set` holds whichever unit is being scheduled -- clones
+normally, packs once packing -- and `active_clone_threshold` bounds it, so it
+counts packs: with `pack_size=2` and a threshold of 50, 100 clones run at once.
+The boot log prints the figure it arrived at.
 
 Each replica gets a private, contiguous block of cores (`-ntomp`, `-pinoffset`,
 `-pinstride`), and `-ntmpi 1` on the thread-MPI builds that accept it — a

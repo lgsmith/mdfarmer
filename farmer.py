@@ -65,7 +65,7 @@ def seed_slice(name, values, n_seeds):
 class Farmer:
     __slots__ = ('priority_ordered_clones', 'n_seeds', 'n_clones', 'n_gens', 'runner', 'jids_file',
                  'config_template', 'jn_regex', 'current_jids', 'dry_run', 'overwrite',
-                 'active_clone_threshold', 'active_clone_set', 'failed_clone_set', 'seeds_first',
+                 'active_clone_threshold', 'active_set', 'failed_clone_set', 'seeds_first',
                  'job_name_fstring', 'job_number_re', 'finished_clones', 'harvester',
                  'quiet', 'sep', 'dirname_pad', 'seed_state_fns', 'scheduler',
                  'scheduler_report_cmd', 'scheduler_fstring', 'scheduler_kws',
@@ -115,10 +115,14 @@ class Farmer:
         return util.check_seed_map(seed_map_p, self.seed_labels)
 
     def mark_clone_failed(self, clone):
-        """Move a clone off the active list and onto the failed one."""
+        """Move a clone out of active_set and onto the failed one.
+
+        active_set holds whichever unit is being scheduled, so the argument is
+        a Clone in an unpacked campaign and a ClonePack in a packed one.
+        """
         self.failed_clone_set.add(clone)
         try:
-            self.active_clone_set.remove(clone)
+            self.active_set.remove(clone)
         except KeyError:  # if clone isn't in active set that's OK.
             pass
         print('FAILED CLONE:', clone.get_tag())
@@ -126,8 +130,9 @@ class Farmer:
     def check_mark_clone_finished(self, clone):
         """True when the clone has run all n_gens generations.
 
-        A finished clone is moved out of the active set and into
-        finished_clones.
+        A finished clone is moved out of active_set and into
+        finished_clones. Either holds whichever unit is being scheduled: a
+        Clone, or a ClonePack once packing.
         """
         next_up_gen = clone.current_gen
         enough_gens = next_up_gen >= self.n_gens
@@ -135,7 +140,7 @@ class Farmer:
             print('Finished:', clone.get_tag())
             self.finished_clones.add(clone)
             try:
-                self.active_clone_set.remove(clone)
+                self.active_set.remove(clone)
             except KeyError:
                 print('done_before_launch', clone.get_tag())
         return enough_gens
@@ -284,7 +289,7 @@ class Farmer:
                   f'during setup: {type(exc).__name__}: {exc}')
             return None
         if clone.job_number is not None:
-            self.active_clone_set.add(clone)
+            self.active_set.add(clone)
         return clone
 
     def __init__(self, n_seeds: int, n_clones: int, n_gens: int,
@@ -444,7 +449,8 @@ class Farmer:
                 'clone waiting for a slot that never opens. It must be at '
                 'least 1.')
         self.active_clone_threshold = active_clone_threshold
-        self.active_clone_set = set()
+        # Whichever unit is being scheduled: Clones, or packs once packing.
+        self.active_set = set()
         self.failed_clone_set = set()
         # Every gen appends from its own directory, so it must be absolute.
         self.config_template['traj_list'] = str(Path(
@@ -520,7 +526,7 @@ class Farmer:
         """Replace the clone queues with ClonePacks, one queue per pack.
 
         A pack answers every call launch makes on a Clone, so the tending
-        loop is unchanged. active_clone_set is rebuilt because
+        loop is unchanged. active_set is rebuilt over the packs because
         _setup_one_clone populated it with the individual Clones.
         """
         fstring = self.pack_template()
@@ -550,15 +556,15 @@ class Farmer:
                 job_number_re=self.job_number_re,
                 dry_run=self.dry_run))
         self.priority_ordered_clones = [[pack] for pack in packs]
-        self.active_clone_set = {pack for pack in packs
-                                 if pack.job_number is not None}
+        self.active_set = {pack for pack in packs
+                           if pack.job_number is not None}
         if packs:
             biggest = max(len(pack.clones) for pack in packs)
             print(f'NOTE: {len(packs)} packs of up to {biggest} clones. '
                   f'active_clone_threshold={self.active_clone_threshold} '
-                  'counts packs, not clones, so up to '
-                  f'{self.active_clone_threshold * biggest} clones will run at '
-                  'once.')
+                  'counts what active_set holds, which is now packs rather '
+                  f'than clones, so up to {self.active_clone_threshold * biggest} '
+                  'clones will run at once.')
         return packs
 
     def _safe_check_start_gen(self, clone):
@@ -625,7 +631,7 @@ class Farmer:
                     print('clone was just marked finished')
                     still_running.append(False)
                 # In the active set, so it may have just finished a gen.
-                elif clone in self.active_clone_set:
+                elif clone in self.active_set:
                     print('clone is in active clone list')
                     # Try to start another.
                     if self.advance_clone(clone):
@@ -635,13 +641,13 @@ class Farmer:
                         still_running.append(False)
 
                 # Few enough active clones that we could launch another.
-                elif len(self.active_clone_set) < self.active_clone_threshold:
+                elif len(self.active_set) < self.active_clone_threshold:
                     print(
                         'there are some more active clones, let us launch', clone.get_tag())
                     #  So we try to launch another.
                     if self.advance_clone(clone):
-                        print('started clone, adding to active_clone_set')
-                        self.active_clone_set.add(clone)
+                        print('started clone, adding to active_set')
+                        self.active_set.add(clone)
                         survivors.append(clone)
                         still_running.append(True)
                     else:

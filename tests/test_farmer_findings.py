@@ -100,7 +100,7 @@ class StubClone:
 def tend(farmer, clone):
     """Put one stub clone in the tender's care, as an already-running clone."""
     farmer.priority_ordered_clones = [[clone]]
-    farmer.active_clone_set = {clone}
+    farmer.active_set = {clone}
     farmer.finished_clones = set()
     farmer.failed_clone_set = set()
     return farmer
@@ -285,7 +285,7 @@ def main(n_clones=N_CLONES, pack_size=PACK_SIZE,
     farmer, _ = captured(lambda: make_farmer(work))
     stub = StubClone('never-launches')
     tend(farmer, stub)
-    farmer.active_clone_set = set()
+    farmer.active_set = set()
     still_running, _ = captured(lambda: farmer.launch(update_jids=False))
     suite.check('a clone waiting for its first launch is failed the same way',
                 still_running == [False] and stub in farmer.failed_clone_set,
