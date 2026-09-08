@@ -71,16 +71,23 @@ the code, and no performance work belongs in this example.
 One conda environment for mdfarmer, and GROMACS from somewhere else entirely:
 
 ```bash
-mamba create -n mdfarmer -c conda-forge python=3.12 loos mdtraj
+mamba create -n mdfarmer -c conda-forge python=3.12 openmm loos mdtraj
 mamba activate mdfarmer
 pip install -e /path/to/mdfarmer      # editable: this checkout is what runs
 ```
 
-No `openmm` and no `gromacs` in that list. The tender never runs MD — it writes
-job scripts and reads what came back — and `gmx` reaches the compute node
-through `ENV_SETUP`, which the job script sources there. `loos` and `mdtraj` are
-both needed, because the harvest picks between them per trajectory: LOOS for a
-rectangular box, mdtraj for a triclinic one it cannot represent.
+No `gromacs` in that list: `gmx` reaches the compute node through `ENV_SETUP`,
+which the job script sources there, and the tender never runs MD itself.
+
+`openmm` is in it even though this arm never uses OpenMM to simulate.
+`utilities.py` imports it at module scope — for serialised-state reading and
+platform inspection — so `import mdfarmer` needs it whichever engine you run.
+Making that import lazy would let a GROMACS-only site skip it; until then it is
+a real dependency and saying otherwise would strand someone at `--check`.
+
+`loos` and `mdtraj` are both needed, because the harvest picks between them per
+trajectory: LOOS for a rectangular box, mdtraj for a triclinic one it cannot
+represent.
 
 Install **editable**. It puts a pointer to your checkout in the environment
 rather than a copy, so the code you edit is the code the compute node runs. A
