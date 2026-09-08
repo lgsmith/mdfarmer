@@ -548,8 +548,9 @@ def harvest_generation(config_fn, harvester_config_fn,
     else:
         record['unlinked'] = False
 
-    # Written last: everything above is redoable, this is what says not to.
-    sentinel_p.write_text(json.dumps(record, indent=2))
+    # Written last and atomically: everything above is redoable, and a torn
+    # read of this one would say the generation still needs harvesting.
+    util.write_json_atomic(sentinel_p, record)
     return record
 
 
@@ -656,7 +657,7 @@ def _repair_from_symlink(traj_p, dry_p, down_p, sentinel_p, dry_top_p,
             downsample_frq=downsample_frq, skip_first=skip_first,
             dry=dry_p.name, downsample=down_p.name, original=traj_p.name,
             unlinked=True, ambiguous=ambiguous)
-        sentinel_p.write_text(json.dumps(record, indent=2))
+        util.write_json_atomic(sentinel_p, record)
         print(f'[harvest] {traj_p.parent}: a previous harvest completed but '
               f'never wrote {sentinel_p.name}; counts match the plan '
               f'({n_dry} dry, {n_down} downsampled), sentinel written.'
