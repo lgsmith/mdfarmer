@@ -1,0 +1,72 @@
+; ===========================================================================
+; trp-cage shakedown PRODUCTION @ 277 K.
+;
+; This is sampling-trpcage/mdp/prod-277-a19opc3.mdp with only the output
+; strides and the step count shortened: the physics is untouched, so what the
+; shakedown exercises is the same integrator, coupling and constraint setup a
+; real campaign would run.
+;
+;   nstlog / nstenergy / nstxout-compressed  50000 -> 2000
+;   nsteps                              500000000 -> 10000
+;
+; 2000 steps is 4 ps at dt=0.002, so a 10000-step generation writes 5 new
+; frames -- enough to see a step axis, few enough to run in seconds.
+;
+; v-rescale + C-rescale are kept from the source mdp. On an OPC3 system they
+; are what allows `mdrun -update gpu`; here the water is 4-site (TIP4P-ice,
+; one virtual site per molecule) so GROMACS refuses GPU update regardless, and
+; the driver runs `-update cpu`. Keeping the couplings anyway means switching
+; this example onto a 3-site system needs no mdp edit.
+;
+; nsteps / init-step / nstxout-compressed / gen-vel / continuation / gen-seed
+; are OVERRIDDEN per generation by mdfarmer (gmx_simulate.write_gen_mdp); the
+; values here are what a hand grompp would get.
+; ===========================================================================
+integrator               = md
+dt                       = 0.002
+nsteps                   = 10000            ; overridden per generation
+ld-seed                  = -1
+
+continuation             = no
+gen-vel                  = yes
+gen-temp                 = 277
+gen-seed                 = -1
+
+; OUTPUT  (4 ps/frame)
+nstxout                  = 0
+nstvout                  = 0
+nstfout                  = 0
+nstlog                   = 2000
+nstenergy                = 2000
+nstxout-compressed       = 2000
+
+; NEIGHBOR SEARCHING
+cutoff-scheme            = Verlet
+nstlist                  = 100
+pbc                      = xyz
+
+; ELECTROSTATICS / VDW
+coulombtype              = PME
+coulomb-modifier         = Potential-shift-Verlet
+rcoulomb                 = 1.0
+vdw-type                 = cut-off
+rvdw                     = 1.0
+fourierspacing           = 0.12
+DispCorr                 = No
+
+; TEMPERATURE COUPLING
+tcoupl                   = v-rescale
+tc-grps                  = system
+tau-t                    = 0.5
+ref-t                    = 277
+
+; PRESSURE COUPLING
+pcoupl                   = C-rescale
+pcoupltype               = isotropic
+tau-p                    = 2.0
+compressibility          = 4.5e-5
+ref-p                    = 1
+
+; CONSTRAINTS
+constraints              = h-bonds
+constraint-algorithm     = Lincs
