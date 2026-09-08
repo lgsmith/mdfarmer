@@ -224,13 +224,30 @@ _STEP_RE = re.compile(r'^\s*step\s*=\s*(\d+)', re.MULTILINE)
 _PART_RE = re.compile(r'^\s*simulation part\s*#\s*=\s*(\d+)', re.MULTILINE)
 
 
+def gmx_argv(gmx_bin, *args):
+    """The argv for one gmx call, from a gmx_bin that may carry a launcher.
+
+    gmx_bin is either a bare command -- 'gmx', or a path to one -- or the whole
+    vector that has to run it, like ['mpirun', '-n', '1', 'gmx_mpi']. Sites
+    whose only GROMACS is an MPI build need the second form: such a binary calls
+    MPI_Init even for grompp, and under a scheduler that aborts unless it was
+    launched the way its MPI expects.
+
+    A string is one word and is never split, so a path containing a space still
+    works. Nothing here knows what a launcher is for -- whether one is needed,
+    and which, is the site's business and belongs beside its module load.
+    """
+    prefix = [gmx_bin] if isinstance(gmx_bin, str) else list(gmx_bin)
+    return [*prefix, *args]
+
+
 def checkpoint_part_step(cpt_fn, gmx_bin=GMX_BIN):
     """(simulation part #, step) recorded in a GROMACS checkpoint.
 
     The part number is the part mdrun was writing when the checkpoint was
     saved; a relaunch with -cpi on this checkpoint writes part number + 1.
     """
-    out = _run_capture([gmx_bin, 'dump', '-cp', str(cpt_fn)])
+    out = _run_capture(gmx_argv(gmx_bin, 'dump', '-cp', str(cpt_fn)))
     step_match = _STEP_RE.search(out)
     if step_match is None:
         raise ValueError(f'no step counter in checkpoint {cpt_fn}')
@@ -846,9 +863,9 @@ def gmx_generation(traj_dir_top_level: str,
 
     if reached is None:
         # -noappend: mdrun cannot append into a dir lacking its cpt's own files.
-        mdrun = [gmx_bin, 'mdrun', '-s', tpr, '-deffnm', deffnm,
-                 '-cpo', own_cpt, '-maxh', maxh, '-cpt', checkpoint_minutes,
-                 '-noappend', *mdrun_args]
+        mdrun = gmx_argv(gmx_bin, 'mdrun', '-s', tpr, '-deffnm', deffnm,
+                         '-cpo', own_cpt, '-maxh', maxh,
+                         '-cpt', checkpoint_minutes, '-noappend', *mdrun_args)
         if resume_from is not None:
             mdrun += ['-cpi', str(resume_from)]
         try:
@@ -926,11 +943,11 @@ def _build_gen_tpr(*, tpr, gen_dir, gen_index, new_velocities, target_step,
                                     + clone_index),
                           ld_seed=ld_seed,
                           gen_temp=temperature)
-            grompp = [gmx_bin, 'grompp', '-f', gen_mdp,
-                      '-c', str(Path(start_fn).resolve()),
-                      '-p', str(Path(top_fn).resolve()),
-                      '-o', tpr, '-po', gen_dir / 'mdout.mdp',
-                      '-maxwarn', grompp_maxwarn]
+            grompp = gmx_argv(gmx_bin, 'grompp', '-f', gen_mdp,
+                              '-c', str(Path(start_fn).resolve()),
+                              '-p', str(Path(top_fn).resolve()),
+                              '-o', tpr, '-po', gen_dir / 'mdout.mdp',
+                              '-maxwarn', grompp_maxwarn)
             if ndx_fn:
                 grompp += ['-n', str(Path(ndx_fn).resolve())]
             # Run from the topology's dir so relative #includes still resolve.
@@ -939,8 +956,9 @@ def _build_gen_tpr(*, tpr, gen_dir, gen_index, new_velocities, target_step,
             prev_tpr = _previous_gen_tpr(
                 Path(traj_dir_top_level), seed_index, clone_index, gen_index,
                 dirname_pad, sep, tpr_name)
-            _run([gmx_bin, 'convert-tpr', '-s', str(prev_tpr),
-                  '-nsteps', str(target_step), '-o', str(tpr)], gen_dir)
+            _run(gmx_argv(gmx_bin, 'convert-tpr', '-s', str(prev_tpr),
+                          '-nsteps', str(target_step), '-o', str(tpr)),
+                 gen_dir)
     return tpr
 
 

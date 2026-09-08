@@ -162,11 +162,11 @@ def gmx_supports_ntmpi(gmx_bin=gmx.GMX_BIN,
     returns False.
     """
     try:
-        result = sp.run([gmx_bin, '-version'], capture_output=True, text=True,
-                        timeout=timeout)
+        result = sp.run(gmx.gmx_argv(gmx_bin, '-version'),
+                        capture_output=True, text=True, timeout=timeout)
     except (FileNotFoundError, sp.TimeoutExpired, OSError) as exc:
-        print(f'[pack] could not probe {gmx_bin} for its MPI flavour ({exc}); '
-              'not emitting -ntmpi.', flush=True)
+        print(f'[pack] could not probe {" ".join(gmx.gmx_argv(gmx_bin))} '
+              f'for its MPI flavour ({exc}); not emitting -ntmpi.', flush=True)
         return False
     for line in (result.stdout + result.stderr).splitlines():
         if line.strip().startswith(mpi_version_key):
@@ -295,7 +295,8 @@ def gmx_pack_sim_block_json(manifest_fn=PACK_MANIFEST_NAME,
         gmx_bin = json.loads(Path(members[0]).read_text()).get(
             'gmx_bin', gmx.GMX_BIN)
     if ntmpi is not None and not gmx_supports_ntmpi(gmx_bin):
-        print(f'[pack] {gmx_bin} is a real-MPI build; omitting -ntmpi (it gets '
+        print(f'[pack] {" ".join(gmx.gmx_argv(gmx_bin))} is a real-MPI build; '
+              'omitting -ntmpi (it gets '
               'one rank per replica from being launched without mpirun).',
               flush=True)
         ntmpi = None
