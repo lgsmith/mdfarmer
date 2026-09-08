@@ -2,14 +2,16 @@
 
 Job scripts. basic_scheduler_fstrings and its variants are ready-made submit
 scripts, keyed by scheduler. Anything you put in their place has to keep the
-placeholders: {job_name}, which the queue reports below match on, {queue_name},
+placeholders: {job_name}, which campaign_jobs below matches on, {queue_name},
 {gpu_line}, and {exclude_nodes}, which expands to a directive line excluding the
 nodes BadNodeRegistry has flagged and to nothing when none are. Keep the NODE:
 and GPU: echoes as well, since that registry reads them out of the job's log.
 
 Job names. A job is named title, seed, clone and gen joined by the config's sep,
-so 'mycampaign-0-3-5'. The reports match that whole name rather than the title
-as a prefix, because a second campaign titled 'mycampaign-long' names its jobs
+so 'mycampaign-0-3-5'. The queue reports ask for the whole queue and
+campaign_jobs picks ours out in Python, splitting the trailing indices off and
+comparing the title that remains by string equality. Equality rather than a
+prefix, because a second campaign titled 'mycampaign-long' names its jobs
 'mycampaign-long-0-3-5', and a looser test would bind those ids to this
 campaign's clone (0, 3, 5).
 
@@ -337,29 +339,85 @@ basic_scheduler_fstrings_mps = {
                 """)
 }
 
-# Job ids belonging to this campaign, for Farmer.update_jids. The awk anchors
-# the whole name field, for the reason the module docstring gives, and doubles
-# its braces to survive str.format. '-' is the default sep; edit if yours is not.
+# One 'jobid jobname' line per job in this user's whole queue. Which of them
+# belong to a campaign is decided by campaign_jobs below, not by the shell.
 basic_scheduler_reports = {
-    # -o 'JOBID JOB_NAME', not -o JOBID, since the name is what awk tests.
-    "lsf": "bjobs -o 'JOBID JOB_NAME' -noheader -J '{title}-*'"
-           " | awk '$2 ~ /^{title}-[0-9]+-[0-9]+-[0-9]+$/ {{print $1}}'",
+    # -o 'JOBID JOB_NAME', not the default, which pads out several columns.
+    "lsf": "bjobs -o 'JOBID JOB_NAME' -noheader",
     # '%i %j' prints the id and the untruncated name; -O Name would truncate to
     # 8 characters and silently stop matching.
     "slurm": "squeue --me -h -o '%i %j'"
-             " | awk '$2 ~ /^{title}-[0-9]+-[0-9]+-[0-9]+$/ {{print $1}}'"
 }
 
-# The same, but one 'jobid jobname' line per job, so the orchestrator can map a
-# running job back to its seed, clone and gen.
-basic_scheduler_assoc_reports = {
-    "lsf": "bjobs -o 'JOBID JOB_NAME' -noheader -J '{title}-*'"
-           " | awk '$2 ~ /^{title}-[0-9]+-[0-9]+-[0-9]+$/'",
-    # awk, not grep: an empty queue has to exit 0, or the boot-time query in
-    # Farmer.__init__ raises instead of reporting no jobs.
-    "slurm": "squeue --me -h -o '%i %j'"
-             " | awk '$2 ~ /^{title}-[0-9]+-[0-9]+-[0-9]+$/'"
-}
+# The name Farmer's association argument takes. Both reports read the same
+# lines now, and differ only in what the orchestrator takes out of them.
+basic_scheduler_assoc_reports = dict(basic_scheduler_reports)
+
+# A job name ends in this many integers: its seed, clone and gen index.
+JOB_NAME_INDEX_COUNT = 3
+
+
+def parse_scheduler_report(text):
+    """The (job_id, job_name) pairs in a queue report, one per line.
+
+    The id is the first whitespace-separated field and the name is the rest of
+    the line, so a name holding a space survives. A line carrying no name is
+    warned about, since a report without names can never match; a line whose id
+    is not an integer is dropped quietly, being an array task or a header, and
+    so never one of ours.
+    """
+    jobs = []
+    for line in text.splitlines():
+        fields = line.split(None, 1)
+        if not fields:
+            continue
+        if len(fields) < 2:
+            print(f'WARNING: scheduler report line {line!r} carries a job id '
+                  'and no job name, so no clone can be bound to it.')
+        elif fields[0].isascii() and fields[0].isdigit():
+            jobs.append((int(fields[0]), fields[1].strip()))
+    return jobs
+
+
+def split_job_name(name, sep='-', index_count=JOB_NAME_INDEX_COUNT):
+    """A job name split into (title, indices), or None.
+
+    None when the name does not end in index_count integers. The title leads
+    and may itself contain sep, so only the last index_count fields are read as
+    indices and everything before them is rejoined as the title.
+    """
+    fields = name.split(sep)
+    if len(fields) <= index_count:
+        return None
+    tail = fields[-index_count:]
+    if not all(f.isascii() and f.isdigit() for f in tail):
+        return None
+    return sep.join(fields[:-index_count]), tuple(int(f) for f in tail)
+
+
+def campaign_jobs(text, title, sep='-', index_count=JOB_NAME_INDEX_COUNT):
+    """This campaign's jobs in a queue report, as (job_id, indices) pairs.
+
+    Ordered as the report listed them. The title is compared by equality
+    against the title each name was split into, never as a pattern and never as
+    a bare prefix, so a campaign called 'sampling' does not claim the jobs of
+    one called 'sampling-long'. A name that reads as ours but carries the wrong
+    indices is warned about and left out: nothing can be bound to it, so a
+    second job may land on top of it.
+    """
+    ours = []
+    for jid, name in parse_scheduler_report(text):
+        split = split_job_name(name, sep=sep, index_count=index_count)
+        if split is None:
+            if name == title or name.startswith(title + sep):
+                print(f'WARNING: queued job {jid} is named {name!r}, which '
+                      f'does not end in {index_count} {sep!r}-separated '
+                      'indices. No clone will be bound to it, and one may '
+                      'launch a second job on top of it.')
+            continue
+        if split[0] == title:
+            ours.append((jid, split[1]))
+    return ours
 
 
 def slurm_was_preempted(jid):
@@ -429,10 +487,11 @@ def scheduler_query(command, timeout=SCHEDULER_QUERY_TIMEOUT,
     """Ask the scheduler something. Returns (trusted, text).
 
     trusted is False when the query itself failed, which is not at all the same
-    as the queue being empty. These commands end in a pipe, so a squeue that
-    times out still exits 0 through awk and prints nothing; reading that as "no
-    jobs are running" relaunches every live clone on top of itself. pipefail
-    makes the pipeline fail instead, and a scheduler that reports an empty
+    as the queue being empty: reading a squeue that died as "no jobs are
+    running" relaunches every live clone on top of itself. The reports above
+    are single commands, so their own exit status settles that, but pipefail
+    stays for the pipelines a site may substitute, where the last stage would
+    otherwise exit 0 over a dead first stage. A scheduler that reports an empty
     queue by exiting non-zero is recognised by what it says.
     """
     try:

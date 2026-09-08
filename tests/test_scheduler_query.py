@@ -1,9 +1,11 @@
 """A failed scheduler query must not read as an empty queue.
 
-Every launch decision rests on which jobs the scheduler says are alive. The
-query commands end in a pipe, so without pipefail a squeue that dies still exits
-0 and prints nothing, which looks exactly like a quiet queue and relaunches
-every live clone on top of itself.
+Every launch decision rests on which jobs the scheduler says are alive. A
+squeue that dies and prints nothing looks exactly like a quiet queue, and read
+that way it relaunches every live clone on top of itself. The shipped reports
+are single commands whose own exit status settles that; pipefail is still set
+for the pipelines a site may substitute, where the last stage would otherwise
+exit 0 over a dead first stage.
 """
 import sys
 
@@ -37,6 +39,8 @@ def main(lsf_empty=LSF_EMPTY, failed_pipeline=FAILED_PIPELINE):
                 util.scheduler_query('false')[0] is False)
     suite.check('a query that cannot run at all is not trusted',
                 util.scheduler_query('exit 127')[0] is False)
+    suite.check('a query that never comes back is not trusted',
+                util.scheduler_query('sleep 30', timeout=1)[0] is False)
 
     suite.section('a scheduler that reports an empty queue by exiting non-zero')
     suite.check('LSF\'s empty queue is trusted, not treated as a failure',
