@@ -447,8 +447,12 @@ def harvest_generation(config_fn, harvester_config_fn,
                        iterload_chunk=ITERLOAD_CHUNK,
                        triclinic_rtol=reimage.TRICLINIC_RTOL,
                        default_syntax=SYNTAX_LOOS,
-                       backends=None):
+                       backends=None,
+                       unlink=None):
     """Harvest one generation directory. Safe to re-run and safe to interrupt.
+
+    unlink overrides the harvester config's harvester_unlink; None, the
+    default, leaves the decision to that file.
 
     Keys read from the harvester config file:
       harvester_subset         which atoms the dry trajectory keeps (all, if unset)
@@ -546,7 +550,9 @@ def harvest_generation(config_fn, harvester_config_fn,
         n_subset_atoms=(None if subset_spec is None
                         else len(subset_spec['indices'])))
 
-    if hconfig.get('harvester_unlink', True):
+    if unlink is None:
+        unlink = hconfig.get('harvester_unlink', True)
+    if unlink:
         traj_p.unlink()
         # Leave a symlink so frame counting on the original name still works.
         traj_p.symlink_to(dry_p.name)
