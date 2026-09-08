@@ -78,11 +78,15 @@ def check_parsing(suite, text):
     spaced, _ = said(util.parse_scheduler_report, '55 a name with spaces-0-0-1')
     suite.check('a name holding a space survives whole',
                 spaced == [(55, 'a name with spaces-0-0-1')], f'-> {spaced}')
-    junk, warned = said(util.parse_scheduler_report,
-                        'slurm_load_jobs error: Socket timed out\n')
-    suite.check('a line that is not a job is dropped, and said so',
-                junk == [] and 'WARNING' in warned, f'-> {junk}')
-    blank, warned = said(util.parse_scheduler_report, '\n\n')
+    array, warned = said(util.parse_scheduler_report,
+                         '77_3 someone-elses-array\n88 sampling-0-0-1')
+    suite.check("an array task's id is not ours, and is dropped quietly",
+                array == [(88, 'sampling-0-0-1')] and warned == '',
+                f'-> {array} {warned!r}')
+    nameless, warned = said(util.parse_scheduler_report, '12345\n')
+    suite.check('a report with no names at all is warned about',
+                nameless == [] and 'WARNING' in warned, f'-> {warned!r}')
+    blank, warned = said(util.parse_scheduler_report, '\n \n')
     suite.check('blank lines are not worth a warning',
                 blank == [] and warned == '', f'-> {warned!r}')
 

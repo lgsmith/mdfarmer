@@ -361,19 +361,21 @@ def parse_scheduler_report(text):
     """The (job_id, job_name) pairs in a queue report, one per line.
 
     The id is the first whitespace-separated field and the name is the rest of
-    the line, so a name holding a space survives. A line not shaped that way is
-    dropped with a warning, since -h and -noheader mean every line is a job.
+    the line, so a name holding a space survives. A line carrying no name is
+    warned about, since a report without names can never match; a line whose id
+    is not an integer is dropped quietly, being an array task or a header, and
+    so never one of ours.
     """
     jobs = []
     for line in text.splitlines():
-        if not line.strip():
-            continue
         fields = line.split(None, 1)
-        if len(fields) == 2 and fields[0].isascii() and fields[0].isdigit():
+        if not fields:
+            continue
+        if len(fields) < 2:
+            print(f'WARNING: scheduler report line {line!r} carries a job id '
+                  'and no job name, so no clone can be bound to it.')
+        elif fields[0].isascii() and fields[0].isdigit():
             jobs.append((int(fields[0]), fields[1].strip()))
-        else:
-            print(f'WARNING: scheduler report line {line!r} is not a job id '
-                  'and a job name; ignoring it.')
     return jobs
 
 
