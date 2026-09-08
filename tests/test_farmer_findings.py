@@ -220,16 +220,24 @@ def main(n_clones=N_CLONES, pack_size=PACK_SIZE,
     suite.check('a campaign that builds every clone says nothing',
                 'could not be set up' not in log)
 
-    suite.section('a queued job whose name does not parse')
+    suite.section('another campaign\'s job in the same queue')
     farmer, _ = captured(lambda: make_farmer(work))
     farmer.scheduler_assoc_rep_cmd = "printf '77 someone-elses-job\\n'"
     rep_dict, log = captured(farmer.reassociate_running_jobs)
-    suite.check('the job still counts as ours, so nothing relaunches over it',
-                farmer.current_jids == {77}, f'-> {farmer.current_jids}')
+    suite.check('it is not taken for one of ours',
+                farmer.current_jids == set(), f'-> {farmer.current_jids}')
+    suite.check('no clone is bound to it', rep_dict == {}, f'-> {rep_dict}')
+    suite.check('and it is passed over quietly, not warned about every tick',
+                'WARNING' not in log, f'-> {log.strip()[:60]}')
+
+    suite.section('our own job with a name that does not parse')
+    farmer, _ = captured(lambda: make_farmer(work))
+    farmer.scheduler_assoc_rep_cmd = "printf '88 fm_0_0\\n'"
+    rep_dict, log = captured(farmer.reassociate_running_jobs)
     suite.check('no clone is bound to it', rep_dict == {}, f'-> {rep_dict}')
     suite.check('boot names the job id and the name it could not parse',
-                'WARNING' in log and '77' in log
-                and 'someone-elses-job' in log)
+                'WARNING' in log and '88' in log and 'fm_0_0' in log,
+                f'-> {log.strip()[:70]}')
 
     suite.section('two queued jobs for one generation')
     farmer, _ = captured(lambda: make_farmer(work))

@@ -80,24 +80,17 @@ class Farmer:
         """Refresh the set of job ids the scheduler says are ours and alive.
 
         False means the answer could not be trusted and current_jids was left
-        alone. The report command is a pipeline, so a squeue that fails still
-        exits 0 and prints nothing; read as "no jobs running" that would
-        relaunch every live clone.
+        alone. A query that failed prints nothing, and reading that as "no jobs
+        running" would relaunch every live clone on top of itself.
         """
-        trusted, jids_string = util.scheduler_query(self.scheduler_report_cmd)
+        trusted, report = util.scheduler_query(self.scheduler_report_cmd)
         if not trusted:
             print(f'WARNING: keeping the previous {len(self.current_jids)} job '
                   'ids and skipping this tick rather than relaunching live jobs.')
             return False
-        print(f'jids_string:\n{jids_string}')
-        try:
-            jids = set(map(int, jids_string.split()))
-        except ValueError:
-            print(f'WARNING: could not parse job ids from scheduler output '
-                  f'{jids_string!r}; keeping the previous set.')
-            return False
-        self.current_jids = jids
-        self.jids_file.write_text(jids_string)
+        self.current_jids = {jid for jid, _ in util.campaign_jobs(
+            report, self.config_template['title'], sep=self.sep)}
+        self.jids_file.write_text(' '.join(map(str, sorted(self.current_jids))))
         return True
 
     def check_path(self, p: Path):
@@ -166,24 +159,9 @@ class Farmer:
                 'directory. Fix the query and start again.')
         print('boot re-association scheduler report:')
         print(assoc_raw)
-        for line in assoc_raw.split('\n'):
-            fields = line.split()
-            try:
-                jid = int(fields[0])
-            except (ValueError, IndexError):
-                continue
+        for jid, key in util.campaign_jobs(
+                assoc_raw, self.config_template['title'], sep=self.sep):
             self.current_jids.add(jid)
-            name = fields[1] if len(fields) > 1 else ''
-            try:
-                # Last three fields only: the title leads and may contain sep.
-                six, cix, gix = map(int, name.split(self.sep)[-3:])
-            except ValueError:
-                print(f'WARNING: queued job {jid} is named {name!r}, which '
-                      f'does not end in {self.sep}seed{self.sep}clone'
-                      f'{self.sep}gen indices. No clone will be bound to it, '
-                      'and one may launch a second job on top of it.')
-                continue
-            key = (six, cix, gix)
             # The tender cannot cancel either job, so all it can do is say so.
             if key in rep_dict:
                 print(f'WARNING: jobs {rep_dict[key]} and {jid} are both '
