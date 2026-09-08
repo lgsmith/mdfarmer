@@ -201,23 +201,35 @@ def main(n_clones=N_CLONES, pack_size=PACK_SIZE,
     suite.check('a template without write_interval still boots',
                 'write_interval' not in farmer.config_template)
 
-    suite.section('traj_list is resolved however it arrives')
+    suite.section('traj_list is anchored to the campaign directory')
     relative = 'given-by-hand.txt'
     template = make_template(work)
     template.pop('traj_list')
     farmer, _ = captured(lambda: make_farmer(work, template=template,
                                              traj_list=relative))
-    suite.check('a relative traj_list argument is resolved against the cwd',
-                farmer.config_template['traj_list']
-                == str(Path(relative).resolve()),
+    tdir = Path(farmer.config_template['traj_dir_top_level'])
+    suite.check('a relative traj_list argument hangs off traj_dir_top_level',
+                farmer.config_template['traj_list'] == str(tdir / relative),
                 f"-> {farmer.config_template['traj_list']}")
+    suite.check('and not off the directory the driver was started in',
+                farmer.config_template['traj_list']
+                != str(Path(relative).resolve()))
     template = make_template(work)
     template['traj_list'] = ''
     farmer, _ = captured(lambda: make_farmer(work, template=template))
-    suite.check('an empty entry in the template falls back to traj_list.txt',
+    suite.check('an empty entry falls back to traj_list.txt in that directory',
                 farmer.config_template['traj_list']
-                == str(Path('traj_list.txt').resolve()),
+                == str(tdir / fm.TRAJ_LIST_NAME),
                 f"-> {farmer.config_template['traj_list']}")
+    named = work / 'named-by-hand.txt'
+    template = make_template(work)
+    template['traj_list'] = str(named)
+    farmer, _ = captured(lambda: make_farmer(work, template=template))
+    suite.check('an absolute traj_list is left where it was put',
+                farmer.config_template['traj_list'] == str(named),
+                f"-> {farmer.config_template['traj_list']}")
+    suite.check('every generation is handed an absolute path either way',
+                Path(farmer.config_template['traj_list']).is_absolute())
 
     suite.section('clones that could not be set up are counted, not just listed')
     farmer, log = captured(lambda: make_farmer(

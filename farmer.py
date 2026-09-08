@@ -15,6 +15,10 @@ MISSING_ENTRY = '<no entry>'
 # tick at once, which some of them mind and some do not.
 LAUNCH_INTERVAL = 0
 
+# Where every finished generation's trajectory path is appended, if the
+# campaign does not name the file itself.
+TRAJ_LIST_NAME = 'traj_list.txt'
+
 
 def missing_seed_inputs(seed_structure_fns, system_fns, top_fns,
                         missing_entry=MISSING_ENTRY):
@@ -48,6 +52,19 @@ def ready_seed_count(seed_structure_fns, system_fns, top_fns):
     missing = missing_seed_inputs(seed_structure_fns, system_fns, top_fns)
     n_given = min(len(seed_structure_fns), len(system_fns), len(top_fns))
     return next((i for i in range(n_given) if i in missing), n_given)
+
+
+def campaign_path(value, traj_dir_top_level, default_name):
+    """An absolute path for value, anchored to the campaign directory.
+
+    A relative value hangs off traj_dir_top_level rather than off whatever
+    directory the driver script was started in, so the campaign names its own
+    files and the whole tree can be moved to another cluster. An absolute one
+    is left where it was put. The result is absolute either way: every
+    generation runs from its own directory, so a relative path would give each
+    of them a private file.
+    """
+    return str((Path(traj_dir_top_level) / (value or default_name)).resolve())
 
 
 def seed_slice(name, values, n_seeds):
@@ -307,6 +324,8 @@ class Farmer:
                  scheduler_kws: dict,
                  scheduler_report_cmd: str,
                  scheduler_assoc_rep_cmd: str,
+                 # Where finished trajectories are listed. Relative to
+                 # traj_dir_top_level; None -> its 'traj_list.txt'.
                  traj_list=None,
                  quiet=False,
                  # Slots for running clones at once, or for packs once packing.
@@ -459,10 +478,10 @@ class Farmer:
         # Whichever unit is being scheduled: Clones, or packs once packing.
         self.active_set = set()
         self.failed_clone_set = set()
-        # Every gen appends from its own directory, so it must be absolute.
-        self.config_template['traj_list'] = str(Path(
-            self.config_template.get('traj_list') or traj_list
-            or 'traj_list.txt').resolve())
+        # Anchored to the campaign directory, so the tree can be moved whole.
+        self.config_template['traj_list'] = campaign_path(
+            self.config_template.get('traj_list') or traj_list,
+            self.config_template['traj_dir_top_level'], TRAJ_LIST_NAME)
 
         rep_dict = self.reassociate_running_jobs()
 
