@@ -395,12 +395,39 @@ time and write them explicitly, verified against the source's last frame.
 > 1 ps per frame, stamped with the frame index. Recompute from the generation's
 > `write_interval` and `dt`; the coordinates are fine.
 
-Two things to check on a campaign after the fact:
+### Checking a campaign after the fact
+
+Start with the report, which classifies every generation directory rather than
+just naming the ones without a sentinel:
+
+```bash
+python -m mdfarmer harvest trajectories --skip-newest
+```
+
+`--skip-newest` leaves out each clone's newest generation, which on a running
+campaign is the one in flight. Nothing is modified without `--harvest`, and
+even then only the categories that are provably safe to re-run are touched: a
+generation whose trajectory is short, damaged or ambiguous is reported and left
+exactly where it is, because harvesting one would destroy the evidence of what
+went wrong.
+
+The same three steps from Python:
 
 ```python
-# Generations that ran but have no sentinel. On a campaign that is still
-# running, skip_newest=True leaves out the one each clone is mid-way through.
-mdf.unharvested_gen_dirs('trajectories', skip_newest=True)
+rows = mdf.classify_campaign('trajectories', skip_newest=True)
+print(mdf.format_report(rows))
+mdf.harvest_recovered(rows)              # only the safe categories
+```
+
+`mdf.unharvested_gen_dirs('trajectories', skip_newest=True)` still answers the
+narrower question — which generations ran without leaving a sentinel — but it
+cannot tell a generation that merely lost its sentinel from one that was killed
+mid-frame, and those want opposite treatment. Prefer the report.
+
+Then check the seams, which is a different question from whether each
+generation harvested:
+
+```python
 # Frame count, spacing and duplicates across a clone's harvested generations.
 mdf.verify_dry_chain(sorted_gen_dirs)
 ```
