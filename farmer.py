@@ -11,6 +11,10 @@ import time
 # Stands in for a seed index that runs off the end of one of the input lists.
 MISSING_ENTRY = '<no entry>'
 
+# Seconds between one submission and the next. 0 hands the scheduler the whole
+# tick at once, which some of them mind and some do not.
+LAUNCH_INTERVAL = 0
+
 
 def missing_seed_inputs(seed_structure_fns, system_fns, top_fns,
                         missing_entry=MISSING_ENTRY):
@@ -71,8 +75,8 @@ class Farmer:
                  'scheduler_report_cmd', 'scheduler_fstring', 'scheduler_kws',
                  'scheduler_assoc_rep_cmd', 'system_fns', 'top_fns',
                  'node_blocklist', 'run_script', 'recover_fn', 'progress_fn',
-                 'restarts_per_gen', 'pack_size', 'pack_grouping',
-                 'pack_cpus_per_task', 'pack_scheduler_fstring',
+                 'launch_interval', 'restarts_per_gen', 'pack_size',
+                 'pack_grouping', 'pack_cpus_per_task', 'pack_scheduler_fstring',
                  'pack_run_script', 'pack_member_cores',
                  'seed_config_overrides', 'seed_labels')
 
@@ -307,6 +311,8 @@ class Farmer:
                  quiet=False,
                  # Slots for running clones at once, or for packs once packing.
                  active_clone_threshold=50,
+                 # Seconds to wait between one submission and the next.
+                 launch_interval=LAUNCH_INTERVAL,
                  dirname_pad=3,
                  job_number_re='[1-9][0-9]*',
                  # Where live job ids are mirrored; None -> '<title>-jids.txt'.
@@ -449,6 +455,7 @@ class Farmer:
                 'clone waiting for a slot that never opens. It must be at '
                 'least 1.')
         self.active_clone_threshold = active_clone_threshold
+        self.launch_interval = launch_interval
         # Whichever unit is being scheduled: Clones, or packs once packing.
         self.active_set = set()
         self.failed_clone_set = set()
@@ -596,6 +603,19 @@ class Farmer:
         self.mark_clone_failed(clone)
         return False
 
+    def resolve_launch_interval(self, sleep):
+        """The campaign's launch_interval, or a deprecated sleep= overriding it.
+
+        sleep was the per-call name for the same wait; it still works so that
+        existing driver scripts keep running, and says so once.
+        """
+        if sleep is None:
+            return self.launch_interval
+        print(f'WARNING: sleep={sleep} is deprecated. Pass '
+              f'Farmer(launch_interval={sleep}) instead; honouring sleep for '
+              'now.')
+        return sleep
+
     def launch(self, sleep=None, update_jids=True):
         """One tick: advance, finish or fail every clone the queues still hold.
 
@@ -603,6 +623,7 @@ class Farmer:
         still part of the campaign. A clone that is waiting for a free slot
         counts as running, not as a failure.
         """
+        launch_interval = self.resolve_launch_interval(sleep)
         still_running = []  # note, this will be flat
         if update_jids and not self.update_jids():
             # Scheduler unreachable; presume all running, retry next tick.
@@ -618,10 +639,10 @@ class Farmer:
             survivors = []
             for clone in clone_list:
                 print('starting into clone loop for', clone.get_tag())
-                # Seconds to wait between clones, so a big campaign does not
-                # hand the scheduler every submission at once.
-                if sleep:
-                    time.sleep(sleep)
+                # Spaces the submissions out, for a scheduler that minds a
+                # whole campaign landing at once.
+                if launch_interval:
+                    time.sleep(launch_interval)
                 # This probably shouldn't happen, but it's worth checking for
                 if clone in self.finished_clones or \
                         clone in self.failed_clone_set:
@@ -668,8 +689,10 @@ class Farmer:
         Whether you are starting or restarting, this is probably what you
         want. Returns True once every clone has finished, and False if a
         'stop' brake file halted the loop or any clone was given up on.
-        Raises if no clone could be built at all.
+        Raises if no clone could be built at all. sleep is the deprecated
+        spelling of Farmer(launch_interval=...) and overrides it for this run.
         """
+        self.launch_interval = self.resolve_launch_interval(sleep)
         if not self.priority_ordered_clones or not any(
                 self.priority_ordered_clones):
             # All of them failing is not the campaign finishing.
@@ -677,7 +700,7 @@ class Farmer:
                 'No clones could be set up; nothing to tend. Check the '
                 'per-clone setup errors printed above (missing structure, '
                 'topology, .mdp, or an unreadable checkpoint).')
-        still_running = self.launch(sleep=sleep, update_jids=False)
+        still_running = self.launch(update_jids=False)
         brake_file_p = Path('stop')
         print('still_running:', *still_running, flush=True)
         # If dry run, short circuit the tending loop.
@@ -692,7 +715,7 @@ class Farmer:
             time.sleep(update_interval)
             # Losing the tender leaves every running job unminded.
             try:
-                still_running = self.launch(sleep=sleep)
+                still_running = self.launch()
             except Exception as exc:
                 print(f'ERROR in tending loop: {type(exc).__name__}: {exc}')
                 traceback.print_exc()

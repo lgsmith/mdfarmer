@@ -27,6 +27,8 @@ PACK_SIZE = 2
 PACK_THRESHOLD = 3
 SHORT_CLONES = 4
 FAILURE_LIMIT = 3
+# Seconds a spaced-out campaign waits between submissions.
+LAUNCH_INTERVAL = 7
 
 
 def make_template(work, steps_per_gen=STEPS_PER_GEN,
@@ -119,6 +121,17 @@ class HalfBuildingFarmer(fm.Farmer):
                                         rep_dict)
 
 
+class FakeClock:
+    """Stands in for farmer's time module, recording waits instead of taking
+    them."""
+
+    def __init__(self):
+        self.waits = []
+
+    def sleep(self, seconds):
+        self.waits.append(seconds)
+
+
 def captured(call):
     """Run call(), returning (result, everything it printed)."""
     out = io.StringIO()
@@ -129,7 +142,7 @@ def captured(call):
 
 def main(n_clones=N_CLONES, pack_size=PACK_SIZE,
          pack_threshold=PACK_THRESHOLD, short_clones=SHORT_CLONES,
-         failure_limit=FAILURE_LIMIT):
+         failure_limit=FAILURE_LIMIT, launch_interval=LAUNCH_INTERVAL):
     suite = Suite('farmer_findings')
     work = harness.workdir('farmer_findings')
     for name in ('a.gro', 'topol.top', 'base.mdp'):
@@ -250,6 +263,32 @@ def main(n_clones=N_CLONES, pack_size=PACK_SIZE,
                 rep_dict == {(0, 0, 0): 22}, f'-> {rep_dict}')
     suite.check('both jobs are still counted as ours',
                 farmer.current_jids == {11, 22}, f'-> {farmer.current_jids}')
+
+    suite.section('launch_interval spaces the submissions out')
+    clock, real_time = FakeClock(), fm.time
+    fm.time = clock
+    try:
+        farmer, _ = captured(lambda: make_farmer(
+            work, launch_interval=launch_interval))
+        tend(farmer, StubClone('spaced', succeeds=True))
+        captured(lambda: farmer.launch(update_jids=False))
+        suite.check('the campaign-wide interval is waited before each clone',
+                    clock.waits == [launch_interval], f'-> {clock.waits}')
+        del clock.waits[:]
+        _, log = captured(lambda: farmer.launch(sleep=1, update_jids=False))
+        suite.check('the old sleep= argument still overrides it',
+                    clock.waits == [1], f'-> {clock.waits}')
+        suite.check('and says it is deprecated',
+                    'deprecated' in log and 'launch_interval' in log,
+                    f'-> {log.strip()[:70]}')
+        del clock.waits[:]
+        farmer, _ = captured(lambda: make_farmer(work))
+        tend(farmer, StubClone('unspaced', succeeds=True))
+        captured(lambda: farmer.launch(update_jids=False))
+        suite.check('the default interval waits not at all', clock.waits == [],
+                    f'-> {clock.waits}')
+    finally:
+        fm.time = real_time
 
     suite.section('a clone waiting for a free slot')
     farmer, _ = captured(lambda: make_farmer(
