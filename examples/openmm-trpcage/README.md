@@ -64,24 +64,51 @@ example.
 ## Run it
 
 ```bash
-PY=/mnt/home/lsmith/miniforge3/envs/omm/bin/python
 cd examples/openmm-trpcage
 
-$PY farmer.py --check      # run shape and input readiness; writes nothing
-$PY farmer.py --dry-run    # every directory, config and sbatch.sh; submits nothing
-
-# for real:
-nohup $PY -u farmer.py > shakedown-omm.tend.out 2>&1 &
-tail -f shakedown-omm.tend.out
+./drive_omm.sh --check      # run shape and input readiness; writes nothing
+./drive_omm.sh --dry-run    # every directory, config and sbatch.sh; submits nothing
+./drive_omm.sh              # start the tender, detached, and return
+./drive_omm.sh --status     # up or down, its pid, the tail of its log
+./drive_omm.sh --stop       # brake it at its next tick
 ```
 
-`mdfarmer` must be importable by `$PY` — the submit script checks and refuses
-rather than failing on the node. Slurm exports the tender's environment, so
-launching from a shell where `python -c 'import mdfarmer'` works is enough.
+`drive_omm.sh` runs the driver under `mamba run -n omm python -u`
+(`--no-capture-output` is broken here, so `-u` is what keeps the log live) and
+appends to `shakedown-omm.tend.out`, whose path it prints on the way out. Set
+`CONDA_ENV` to use a different environment. `farmer.py` still runs perfectly
+well by hand; the script is what makes it survivable.
 
-To stop the tender gracefully, `touch stop` in the directory you launched it
-from; it exits at the next tick. Everything it writes lands in `data/` and
-`prepared/`, both gitignored.
+**The tender is not a Slurm job.** It runs detached — `setsid nohup` — on the
+login node or workstation you launch it from, and outlives the shell that
+started it. It sleeps between ticks and needs nothing from the cluster but
+`sbatch`, so an allocation of its own would idle for hours; worse, that
+allocation's walltime or its preemption would end the campaign with it. Launch
+it anywhere `sbatch` and the `omm` environment both work.
+
+**One tender per campaign.** The loop holds `flock` on
+`data/shakedown-omm/tender.lock` for as long as it lives, and a second
+`./drive_omm.sh` refuses with the running one's pid rather than starting a rival
+that would submit every clone a second time. The kernel drops the lock when the
+process dies, however it dies, so there is no stale pid file to reason about.
+
+**It re-enters.** `Farmer.launch` drops a clone for good on a single transient
+`sbatch` failure, and a fresh tender rebuilds every clone from disk and re-adopts
+the job ids still running, so re-entering is the recovery. The loop does that
+every 60 s (`GAP`) until the driver exits 0, which happens only when every clone
+has finished. Three exits inside a minute in a row is a broken setup rather than
+a scheduler hiccup, and the loop says so and gives up.
+
+Before it detaches, the script checks that `mamba`, `sbatch` and an importable
+`mdfarmer` are all there, and prints which `mdfarmer` — `import mdfarmer`
+resolves to whatever the environment installed, which in a git worktree is not
+necessarily the tree you are reading. On the node, the submit script makes the
+same check and refuses rather than failing mid-generation.
+
+`./drive_omm.sh --stop` writes the `stop` brake file the driver watches for; the
+tender exits at its next tick (20 s), the loop then exits too, and jobs already
+submitted keep running. Everything a run writes lands in `data/` and `prepared/`,
+both gitignored.
 
 ## What to expect
 
