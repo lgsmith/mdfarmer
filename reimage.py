@@ -528,6 +528,9 @@ class _MdtrajWriter:
                 f'{out_p.suffix} is not a format the mdtraj backend writes; '
                 'use .xtc or .dcd')
 
+    # The harvest writes through this class too, so a format either backend
+    # cannot write fails the same way whichever one the box shape picked.
+
     def write(self, traj, step=None):
         if self.suffix == '.xtc':
             # Without an explicit step mdtraj writes the frame index, which
