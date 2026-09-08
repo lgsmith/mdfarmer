@@ -47,14 +47,14 @@ def _gen_sort_key(path, sep):
     return (1, 0, path.name)
 
 
-def _align_tandem_dcds(gen_path: Path, prev_config: dict, target_nset: int):
+def _align_tandem_trajs(gen_path: Path, prev_config: dict, target_nset: int):
     """Trim the velocity and force trajectories to target_nset frames.
 
     True once every tandem trajectory the config names is aligned. False when
-    one cannot be: an untruncatable format, an unreadable header, a truncation
-    that missed its target, or a tandem behind positions, whose missing frames
-    cannot be fabricated without a matching checkpoint. The caller cascades on
-    False and redoes the gen, which is dead either way.
+    one cannot be: a format that cannot be trimmed, a file that cannot be read,
+    or a tandem behind positions, whose missing frames cannot be fabricated
+    without a matching checkpoint. The caller cascades on False and redoes the
+    generation, which is dead either way.
     """
     for name_key, suffix_key, default_name in (
             ('velocity_name', 'velocity_traj_suffix', 'velocities'),
@@ -66,34 +66,17 @@ def _align_tandem_dcds(gen_path: Path, prev_config: dict, target_nset: int):
                     ).with_suffix(tandem_suffix)
         if (not tandem_p.is_file()) or tandem_p.stat().st_size == 0:
             continue
-        if tandem_suffix != '.dcd':
-            print(f'_align_tandem_dcds: cannot frame-align {tandem_p} '
-                  f'(only .dcd truncation is supported); cascading.')
-            return False
+        # Trimmed from what the bytes hold, not from a header that can be
+        # ahead of them, so a torn last frame is removed rather than counted.
         try:
-            tandem_nset = util.dcd_header_info(tandem_p)['nset']
+            tandem_actual = util.truncate_traj_to_nframes(tandem_p, target_nset)
         except Exception as exc:
-            print(f'_align_tandem_dcds: bad tandem DCD header at {tandem_p}: '
-                  f'{exc}; cascading.')
-            return False
-        if tandem_nset == target_nset:
-            continue
-        if tandem_nset < target_nset:
-            print(f'_align_tandem_dcds: {tandem_p} has {tandem_nset} frames, '
-                  f'behind positions/state ({target_nset}); cannot realign '
-                  f'without a matching checkpoint, cascading.')
-            return False
-        print(f'_align_tandem_dcds: trimming {tandem_p} from {tandem_nset} '
-              f'to {target_nset} frames to match positions.')
-        try:
-            tandem_actual = util.truncate_dcd_to_nframes(tandem_p, target_nset)
-        except Exception as exc:
-            print(f'_align_tandem_dcds: could not truncate {tandem_p}: '
-                  f'{exc}; cascading.')
+            print(f'_align_tandem_trajs: could not trim {tandem_p}: {exc}; '
+                  f'cascading.')
             return False
         if tandem_actual != target_nset:
-            print(f'_align_tandem_dcds: tandem truncate returned '
-                  f'{tandem_actual} != target {target_nset}; cascading.')
+            print(f'_align_tandem_trajs: {tandem_p} reached {tandem_actual} '
+                  f'frames, not the {target_nset} positions has; cascading.')
             return False
     return True
 
@@ -153,23 +136,14 @@ def _try_recover_gen(gen_path: Path, *,
 
     # Only DCD has a header we can read and rewrite; an XTC has to be counted
     # instead, and one that ran past its checkpoint is redone rather than cut.
-    is_dcd = traj_suffix == '.dcd'
-    if is_dcd:
-        try:
-            info = util.dcd_header_info(traj_p)
-        except Exception as exc:
-            print(f'_try_recover_gen: bad DCD header at {traj_p}: {exc}; '
-                  f'skipping gen.')
-            return None
-        nset, nsavc = info['nset'], info['nsavc']
-    else:
-        try:
-            nset = util.get_traj_len(str(traj_p), top_fn)
-        except Exception as exc:
-            print(f'_try_recover_gen: cannot count frames in {traj_p}: '
-                  f'{type(exc).__name__}: {exc}; skipping gen.')
-            return None
-        nsavc = write_interval
+    try:
+        nset = util.get_traj_len(str(traj_p), top_fn)
+    except Exception as exc:
+        print(f'_try_recover_gen: cannot count frames in {traj_p}: '
+              f'{type(exc).__name__}: {exc}; skipping gen.')
+        return None
+    nsavc = write_interval
+
     if nset == 0:
         return gen_index, seed_fn, total_steps, False
 
@@ -188,21 +162,14 @@ def _try_recover_gen(gen_path: Path, *,
     target_nset = state_offset // nsavc
 
     if target_nset > nset:
-        # State ahead of the DCD: the integrator state is intact, so advance.
+        # State ahead of the trajectory: the integrator state is intact, advance.
         return gen_index + 1, seed_fn, total_steps, False
-    if target_nset < nset and not is_dcd:
-        # Untrimmable: going on leaves frames the next gen re-simulates, which
-        # reads as time running backwards. Redo the gen instead.
-        print(f'_try_recover_gen: {traj_p} has {nset} frames but state.xml is '
-              f'at frame {target_nset}, and {traj_suffix} cannot be truncated; '
-              f'cascading so this gen is redone rather than left discontiguous.')
-        return None
     if target_nset < nset:
-        # Kill between DCDReporter and CheckpointReporter writes.
+        # Kill between the trajectory reporter and the checkpoint writer.
         print(f'_try_recover_gen: trimming {traj_p} from {nset} to '
               f'{target_nset} frames to match state.xml stepCount.')
         try:
-            actual = util.truncate_dcd_to_nframes(traj_p, target_nset)
+            actual = util.truncate_traj_to_nframes(traj_p, target_nset)
         except Exception as exc:
             print(f'_try_recover_gen: could not truncate {traj_p}: {exc}; '
                   f'cascading.')
@@ -214,7 +181,7 @@ def _try_recover_gen(gen_path: Path, *,
         nset = actual
         # Reached only once positions were trimmed; a healthy in-flight gen
         # takes the target_nset == nset path, so its tandems are left alone.
-        if not _align_tandem_dcds(gen_path, prev_config, target_nset):
+        if not _align_tandem_trajs(gen_path, prev_config, target_nset):
             return None
 
     remaining = total_steps - nset * nsavc

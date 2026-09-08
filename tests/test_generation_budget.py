@@ -90,18 +90,18 @@ def gen_dirs(work, clone_index=0):
     return sorted(clone_dir.iterdir()) if clone_dir.is_dir() else []
 
 
-def probe_recover(gen_path, *, state_step, header_info, truncate,
+def probe_recover(gen_path, *, state_step, n_frames, truncate,
                   restart_name='state.cpt', traj_name='prod',
                   traj_suffix='.dcd', write_interval=100, total_steps=1000):
-    """Calls _try_recover_gen with util's DCD/state.xml readers replaced by
-    fakes, so the branch under test doesn't need a real OpenMM state.xml or
-    DCD file. Returns (result, exception raised while recovering)."""
+    """Calls _try_recover_gen with util's frame and state.xml readers replaced
+    by fakes, so the branch under test needs neither a real OpenMM state.xml
+    nor a readable trajectory. Returns (result, exception while recovering)."""
     saved = (util.is_state_xml_usable, util.state_xml_step_count,
-            util.dcd_header_info, util.truncate_dcd_to_nframes)
+            util.get_traj_len, util.truncate_traj_to_nframes)
     util.is_state_xml_usable = lambda p: True
     util.state_xml_step_count = lambda p: state_step
-    util.dcd_header_info = header_info
-    util.truncate_dcd_to_nframes = truncate
+    util.get_traj_len = lambda p, top: n_frames
+    util.truncate_traj_to_nframes = truncate
     try:
         result = _try_recover_gen(
             gen_path, append_mode=True, restart_name=restart_name,
@@ -113,7 +113,7 @@ def probe_recover(gen_path, *, state_step, header_info, truncate,
         return None, exc
     finally:
         (util.is_state_xml_usable, util.state_xml_step_count,
-         util.dcd_header_info, util.truncate_dcd_to_nframes) = saved
+         util.get_traj_len, util.truncate_traj_to_nframes) = saved
 
 
 def main(n_gens=N_GENS, pack_n_gens=PACK_N_GENS, steps_per_gen=STEPS_PER_GEN):
@@ -241,7 +241,7 @@ def main(n_gens=N_GENS, pack_n_gens=PACK_N_GENS, steps_per_gen=STEPS_PER_GEN):
 
     result, exc = probe_recover(
         position_dir, state_step=500,
-        header_info=lambda p: {'nset': 7, 'nsavc': 100}, truncate=raises)
+        n_frames=7, truncate=raises)
     suite.check('a corrupt position DCD cascades rather than raising',
                 exc is None and result is None, f'-> exc={exc!r} result={result!r}')
 
@@ -260,7 +260,7 @@ def main(n_gens=N_GENS, pack_n_gens=PACK_N_GENS, steps_per_gen=STEPS_PER_GEN):
 
     result, exc = probe_recover(
         tandem_dir, state_step=500,
-        header_info=lambda p: {'nset': 7, 'nsavc': 100}, truncate=truncate_mixed)
+        n_frames=7, truncate=truncate_mixed)
     suite.check('a corrupt tandem DCD cascades rather than raising',
                 exc is None and result is None, f'-> exc={exc!r} result={result!r}')
 
