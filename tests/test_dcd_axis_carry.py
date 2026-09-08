@@ -40,6 +40,50 @@ def frame_steps(timing, n_frames):
     return [step0 + k * steps_per_frame for k in range(n_frames)]
 
 
+def harvest_dcd(work, inputs, gen_index, backend, downsample_frq,
+                write_interval=WRITE_INTERVAL):
+    """Run one DCD generation and harvest it with the named backend."""
+    import json
+    farm = work / f'farm-{backend}'
+    traj_p = run_gen(farm, inputs, gen_index, '.dcd')
+    gen_dir = traj_p.parent
+    steps = util.dcd_header_info(traj_p)['nset'] * write_interval
+    config = dict(
+        traj_dir_top_level=str(farm), top_fn=str(inputs[2]),
+        seed_index=SEED_INDEX, clone_index=CLONE_INDEX, gen_index=gen_index,
+        dirname_pad=DIRNAME_PAD, sep=SEP, traj_name='positions',
+        traj_suffix='.dcd', write_interval=write_interval,
+        steps_per_gen=steps, title='axis')
+    util.write_json_atomic(gen_dir / util.CONFIG_NAME, config, indent=4)
+    (gen_dir / 'hconfig.json').write_text(json.dumps(dict(
+        downsample_frq=downsample_frq, harvester_structure=str(inputs[2]),
+        harvester_subset='all', harvester_unlink=False)))
+    record = hv.harvest_generation(gen_dir / util.CONFIG_NAME,
+                                   gen_dir / 'hconfig.json', backend=backend)
+    return traj_p, gen_dir, record
+
+
+def check_harvested_axis(suite, backend, source_timing, gen_dir, record,
+                         downsample_frq):
+    """Both harvested streams carry an axis, in their own spacing."""
+    dry_p = gen_dir / record['dry']
+    down_p = gen_dir / record['downsample']
+    dry_timing = util.dcd_frame_timing(dry_p)
+    suite.check(f'{backend}: the dry DCD carries an axis',
+                dry_timing is not None, f'-> {dry_timing}')
+    if dry_timing is None:
+        return
+    suite.check(f'{backend}: and it is the source spacing, not LOOS\'s 1',
+                dry_timing[1] == source_timing[1],
+                f'-> {dry_timing[1]} vs {source_timing[1]}')
+    down_timing = util.dcd_frame_timing(down_p)
+    suite.check(f'{backend}: the downsampled DCD carries its own spacing',
+                down_timing is not None
+                and down_timing[1] == source_timing[1] * downsample_frq,
+                f'-> {down_timing} vs {source_timing[1] * downsample_frq}')
+
+
+
 def main(downsample_frq=DOWNSAMPLE_FRQ, write_interval=WRITE_INTERVAL):
     suite = Suite('dcd_axis_carry')
     work = harness.workdir('dcd_axis_carry')
@@ -122,6 +166,18 @@ def main(downsample_frq=DOWNSAMPLE_FRQ, write_interval=WRITE_INTERVAL):
     except ValueError as exc:
         suite.check('stamping an uneven stream raises', True,
                     f'-> {str(exc)[:60]}')
+
+    suite.section('and the harvest itself stamps what it wrote')
+    # The wiring inside _harvest_loos and _harvest_mdtraj, not the helper: no
+    # other suite harvests a DCD, so without this the call sites are untested.
+    for backend in (hv.BACKEND_LOOS, hv.BACKEND_MDTRAJ):
+        # Generation 0 of its own farm: a later one would need the
+        # earlier configs the chain offset is counted from.
+        source_p, gen_dir, record = harvest_dcd(
+            work, inputs, 0, backend, downsample_frq)
+        source_timing = util.dcd_frame_timing(source_p)
+        check_harvested_axis(suite, backend, source_timing, gen_dir, record,
+                             downsample_frq)
 
     suite.section('nothing is stamped when there is nothing to carry')
     suite.check('no timing means no header written',

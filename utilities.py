@@ -270,6 +270,18 @@ def stamp_dcd_timing(traj_fn, step0, steps_per_frame, time0, time_per_frame,
         fh.write(struct.pack('<f', ps_per_step / akma_ps))
     return True
 
+# Formats whose frames each carry their own time, and so can be checked one by
+# one against a reconstruction. A DCD states one rule in its header instead, and
+# mdtraj's reader answers with the frame index rather than that rule -- so
+# comparing against it measures mdtraj's placeholder, not the trajectory.
+PER_FRAME_TIME_SUFFIXES = ('.xtc',)
+
+
+def stamps_time_per_frame(traj_fn, suffixes=PER_FRAME_TIME_SUFFIXES):
+    """Whether this format writes a time onto every frame."""
+    return Path(traj_fn).suffix.lower() in suffixes
+
+
 # What frame_timing answers for. A DCD is read here but not written through a
 # frame's arguments: no DCD writer in reach takes any, so a caller carries a
 # DCD's axis forward with stamp_dcd_timing once the file is closed.

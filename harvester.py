@@ -423,8 +423,13 @@ def _harvest_mdtraj(traj_fn, structure_fn, subset_spec, dry_out, down_out,
                 step0, steps_per_frame, time0, time_per_frame = timing
                 step = step0 + local * steps_per_frame
                 predicted = time0 + local * time_per_frame
-                if not np.allclose(predicted, chunk.time, rtol=1e-5,
-                                   atol=1e-5 * max(abs(time0), 1.0)):
+                # Only where the frames carry a time of their own. A DCD's axis
+                # is one header rule by construction, and mdtraj hands back the
+                # frame index in its place, so this would compare the source
+                # against a placeholder and call every DCD uneven.
+                if (util.stamps_time_per_frame(traj_fn)
+                        and not np.allclose(predicted, chunk.time, rtol=1e-5,
+                                            atol=1e-5 * max(abs(time0), 1.0))):
                     raise HarvestError(
                         f'{traj_fn}: frame times drift from the even spacing '
                         f'read off frames 0 and 1 (worst difference '
