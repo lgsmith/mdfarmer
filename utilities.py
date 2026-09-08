@@ -265,13 +265,10 @@ def stamp_dcd_timing(traj_fn, step0, steps_per_frame, time0, time_per_frame,
         fh.write(struct.pack('<f', ps_per_step / akma_ps))
     return True
 
-# What frame_timing answers for. dcd_frame_timing is deliberately not wired in
-# here: what a caller does with an answer is hand a step and a time to a writer,
-# and loos.DCDWriter.writeFrame takes a group and nothing else, so a DCD's
-# reconstructed timing would only make harvester and reimage raise TypeError on
-# the format they can already read. Ask dcd_frame_timing directly until those
-# two branch on what the output writer accepts rather than on this being None.
-_FRAME_TIMING = {'.xtc': _xtc_frame_timing}
+# What frame_timing answers for. A DCD is read here but not written through a
+# frame's arguments: no DCD writer in reach takes any, so a caller carries a
+# DCD's axis forward with stamp_dcd_timing once the file is closed.
+_FRAME_TIMING = {'.xtc': _xtc_frame_timing, '.dcd': dcd_frame_timing}
 
 
 def frame_timing(traj_fn, n_frames=None, backends=_FRAME_TIMING):
@@ -283,11 +280,15 @@ def frame_timing(traj_fn, n_frames=None, backends=_FRAME_TIMING):
     the step. Anything that rewrites a trajectory has to read these and pass
     them back in.
 
-    Only an .xtc answers. A DCD's timing is recoverable, but from its header
-    rather than its frames, and dcd_frame_timing is where to ask for it. An
-    .h5 has no answer to give at all: an mdtraj HDF5 file records a time per
-    frame and no step whatsoever, and half an axis would put a fabricated step
-    counter into whatever was written from it.
+    An .xtc answers from its frames, a DCD from its header -- and a DCD answers
+    None when nothing filled that header in, which is what a DCD written by
+    LOOS or mdtraj looks like. An .h5 has no answer to give at all: an mdtraj
+    HDF5 file records a time per frame and no step whatsoever, and half an axis
+    would put a fabricated step counter into whatever was written from it.
+
+    Where the answer goes depends on the format written, not the one read. An
+    .xtc stamps each frame as it is written; a DCD keeps one rule in its header,
+    so stamp_dcd_timing puts it there after the writer has closed.
     """
     backend = backends.get(Path(traj_fn).suffix.lower())
     if backend is None:
