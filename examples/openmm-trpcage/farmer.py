@@ -19,6 +19,7 @@ import argparse
 import gzip
 import re
 import shutil
+import sys
 from pathlib import Path
 
 import openmm as mm
@@ -31,7 +32,10 @@ HERE = Path(__file__).resolve().parent
 INPUTS = HERE / 'inputs'
 PREPARED = HERE / 'prepared'
 TRAJ_TOP = HERE / 'data' / PROJECT
-PYTHON_CMD = '/mnt/home/lsmith/miniforge3/envs/omm/bin/python'
+# The interpreter a compute node runs a generation with. The tender is already
+# in the right environment, so its own python is the honest default; --python
+# overrides it when the node needs a different one.
+PYTHON_CMD = sys.executable
 
 # ---- run shape --------------------------------------------------------------
 # The whole point of the shakedown is that a generation is seconds long but
@@ -278,10 +282,10 @@ def build_farmer(paths, n_clones=N_CLONES, n_gens=N_GENS,
                  write_interval=WRITE_INTERVAL,
                  downsample_frq=DOWNSAMPLE_FRQ, harvest=True,
                  report_cmd=None, assoc_cmd=None, dry_run=False,
-                 restarts_per_gen=RESTARTS_PER_GEN):
+                 restarts_per_gen=RESTARTS_PER_GEN, python=PYTHON_CMD):
     harvester = build_harvester(
         paths, steps_per_gen=steps_per_gen, write_interval=write_interval,
-        downsample_frq=downsample_frq) if harvest else None
+        downsample_frq=downsample_frq, python=python) if harvest else None
     return mdf.Farmer(
         n_seeds=N_SEEDS, n_clones=n_clones, n_gens=n_gens,
         config_template=config_template(
@@ -292,7 +296,7 @@ def build_farmer(paths, n_clones=N_CLONES, n_gens=N_GENS,
         top_fns=[paths['top_fn']],
         scheduler='sbatch',
         scheduler_fstring=SCHEDULER_FSTRING,
-        scheduler_kws=scheduler_kws(),
+        scheduler_kws=scheduler_kws(python=python),
         scheduler_report_cmd=(
             report_cmd or mdf.basic_scheduler_reports['slurm']),
         scheduler_assoc_rep_cmd=(
@@ -348,6 +352,9 @@ def main():
     ap.add_argument('--write-interval', type=int, default=WRITE_INTERVAL)
     ap.add_argument('--traj-top', default=str(TRAJ_TOP))
     ap.add_argument('--update-interval', type=int, default=UPDATE_INTERVAL)
+    ap.add_argument('--python', default=PYTHON_CMD,
+                    help='interpreter a compute node runs a generation with '
+                         f'(default: this tender\'s own, {PYTHON_CMD})')
     args = ap.parse_args()
 
     missing = report_readiness(steps_per_gen=args.steps,
@@ -367,7 +374,8 @@ def main():
                           traj_top=Path(args.traj_top),
                           steps_per_gen=args.steps,
                           write_interval=args.write_interval,
-                          harvest=not args.no_harvest, dry_run=args.dry_run)
+                          harvest=not args.no_harvest, dry_run=args.dry_run,
+                          python=args.python)
     finished = farmer.start_tending_fields(update_interval=args.update_interval)
     # The exit status a re-entering tender loop reads: 0 only when every clone
     # finished, so a braked or failed run is re-entered rather than called done.
