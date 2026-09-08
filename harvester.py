@@ -1211,9 +1211,10 @@ def harvest_recovered(rows, hconfig=None, unlink=RECOVERY_UNLINK,
 
 
 def _main(argv=None):
-    """`python -m mdfarmer.harvester <campaign>`: report, and only then act."""
+    """Report what a campaign never harvested, and only then act on it."""
     import argparse
     ap = argparse.ArgumentParser(
+        prog='python -m mdfarmer harvest',
         description='Report the generations a campaign never harvested, and '
                     'optionally harvest the ones that are provably safe.')
     ap.add_argument('top_level', help="the campaign's traj_dir_top_level")
