@@ -1,8 +1,42 @@
+"""Helpers shared by the orchestrator, the runners and the harvest.
+
+Job scripts. basic_scheduler_fstrings and its variants are ready-made submit
+scripts, keyed by scheduler. Anything you put in their place has to keep the
+placeholders: {job_name}, which campaign_jobs below matches on, {queue_name},
+{gpu_line}, and {exclude_nodes}, which expands to a directive line excluding the
+nodes BadNodeRegistry has flagged and to nothing when none are. Keep the NODE:
+and GPU: echoes as well, since that registry reads them out of the job's log.
+
+Job names. A job is named title, seed, clone and gen joined by the config's sep,
+so 'mycampaign-0-3-5'. The queue reports ask for the whole queue and
+campaign_jobs picks ours out in Python, splitting the trailing indices off and
+comparing the title that remains by string equality. Equality rather than a
+prefix, because a second campaign titled 'mycampaign-long' names its jobs
+'mycampaign-long-0-3-5', and a looser test would bind those ids to this
+campaign's clone (0, 3, 5).
+
+Bad nodes. A generation that aborts at 0 steps because the node is broken (a
+stale CUDA driver, a GLIBC mismatch, no visible GPU) aborts the same way on
+every retry, since the scheduler tends to hand the resubmission back to the same
+node, and the farmer spends each clone's restart budget doing it.
+BadNodeRegistry recognises those failures, remembers the host in a file that
+survives a restart, and excludes it from later submissions.
+
+Resuming. The last frame of a generation's trajectory has to sit at exactly the
+step its state.xml stopped at, or the next append lands at the wrong point in
+time and gen-to-gen concatenation drifts. A run killed between the trajectory
+report and the checkpoint report has one frame too many, so is_state_xml_usable
+and state_xml_step_count are here to find the step, and truncate_traj_to_nframes
+to trim to it. It trims a .dcd, an .xtc or an .h5 alike, in place and from what
+the file really holds rather than from the count it claims, since a kill leaves
+none of the three counting honestly.
+"""
+
 import inspect
+import json
 import os
 import struct
 from pathlib import Path
-import json
 import subprocess as sp
 import openmm as mm
 from openmm import app
@@ -19,189 +53,293 @@ openmm_topology_readers = {
 
 
 def read_openmm_top(top_fn):
-    try:
-        top_p = Path(top_fn)
-        top_ext = top_p.suffix
-        topology = openmm_topology_readers[top_ext](top_fn).topology
-    except KeyError:
-        print('You seem to have used a topology format', top_ext,
-              'for which we have not included a reader. Choices are:',
-              *openmm_topology_readers.keys())
-        raise
-    return topology
+    """The OpenMM Topology in a structure file, using the reader its suffix names.
 
+    Only the suffix lookup is guarded: a reader raises a KeyError of its own for
+    an atom type it was never given, and calling that an unsupported format
+    would send the user after the wrong problem.
+    """
+    top_p = Path(top_fn)
+    try:
+        reader = openmm_topology_readers[top_p.suffix]
+    except KeyError:
+        raise ValueError(
+            f'No topology reader for {top_p.suffix!r}. Choices are: '
+            f'{", ".join(openmm_topology_readers)}') from None
+    return reader(top_fn).topology
+
+
+# Frame counting. mdtraj.open() measures a trajectory without reading its
+# coordinates or needing a topology at all, so LOOS is only the fallback.
+try:
+    import mdtraj as _mdtraj
+except ImportError:
+    _mdtraj = None
 
 try:
     import loos
     from loos import pyloos
-
-    def get_traj_len(traj_fn, top_fn):
-        if Path(traj_fn).stat().st_size == 0:
-            length = 0
-        else:
-            m = loos.createSystem(top_fn)
-            try:
-                t = pyloos.Trajectory(traj_fn, m)
-                length = len(t)
-            except loos.FileReadError:
-                print('Assumming empty file; cannot read:', traj_fn)
-                length = 0
-        return length
-
-
 except ImportError:
-    print('LOOS not in import path; falling back to MDTraj.')
-    import mdtraj
+    loos = None
+    pyloos = None
 
-    # mdtraj.open(...) returns a format-specific file handle (DCD/XTC) whose
-    # __len__ reports frame count without loading coordinates. Avoids the
-    # mdtraj.load(...) round-trip that materialized the whole traj just to
-    # measure it -- which was prohibitive for mature datasets.
-    def get_traj_len(traj_fn, top_fn):
-        if Path(traj_fn).stat().st_size == 0:
-            return 0
+
+def _traj_len_mdtraj(traj_fn):
+    with _mdtraj.open(str(traj_fn)) as fh:
+        return len(fh)
+
+
+def _traj_len_loos(traj_fn, top_fn):
+    model = loos.createSystem(str(top_fn))
+    return len(pyloos.Trajectory(str(traj_fn), model))
+
+
+# Solute-only topology the harvester leaves beside a dry trajectory. Named here
+# rather than imported from harvester, which imports this module.
+DRY_TOPOLOGY_NAME = 'dry-top.pdb'
+
+
+def get_traj_len(traj_fn, top_fn, dry_topology_name=DRY_TOPOLOGY_NAME):
+    """Number of frames in a trajectory, or 0 if it is empty or unreadable.
+
+    top_fn is only consulted by the LOOS fallback; the mdtraj path does not
+    need it, which is what makes this work for GROMACS runs whose top_fn is a
+    .top.
+
+    The fallback tries the harvester's solute-only topology as well: after a
+    harvest the trajectory name is a symlink to a stripped copy, and LOOS built
+    from the wet top_fn would hit an atom-count mismatch, be swallowed by the
+    broad except below, and report 0 frames, which reads as "never ran".
+
+    With neither backend installed a trajectory that exists cannot be measured,
+    so this raises rather than answering 0. Refusing here rather than at import
+    keeps a scheduler-only install, which never counts a frame, working.
+    """
+    traj_p = Path(traj_fn)
+    if not traj_p.is_file() or traj_p.stat().st_size == 0:
+        return 0
+    if _mdtraj is None and loos is None:
+        # 0 for a trajectory that exists reads as a generation that never ran,
+        # and the orchestrator deletes it.
+        raise ImportError(
+            f'Counting the frames in {traj_fn} needs mdtraj or LOOS, and '
+            'neither is importable.')
+    if _mdtraj is not None:
         try:
-            with mdtraj.open(traj_fn) as fh:
-                return len(fh)
-        except (OSError, ValueError) as exc:
-            print(f'mdtraj.open could not read {traj_fn}: {exc}; '
-                  'treating as empty.')
-            return 0
+            return _traj_len_mdtraj(traj_p)
+        except Exception as exc:
+            print(f'mdtraj could not read {traj_fn}: '
+                  f'{type(exc).__name__}: {exc}; trying LOOS.')
+    if loos is not None:
+        candidates = [top_fn] if top_fn is not None else []
+        dry_top_p = traj_p.parent / dry_topology_name
+        if dry_top_p.is_file():
+            candidates.append(dry_top_p)
+        for candidate in candidates:
+            try:
+                return _traj_len_loos(traj_p, candidate)
+            except Exception as exc:
+                # Broad: an unsupported topology is a RuntimeError, an
+                # unreadable frame a LOOSError, and both have to be survivable.
+                print(f'LOOS could not read {traj_fn} with topology '
+                      f'{candidate}: {type(exc).__name__}: {exc}.')
+        print(f'No usable topology for {traj_fn}; treating as empty.')
+    return 0
 
 
-"""
-To run this one, hconfig needs to contain the following keys:
- - `'harvester_subset'`: a LOOS selection string that produces the desired system subsetting.
- - `'downsample_frq'`: An int---the number of frames to skip over before writing another solvated frame.
-"""
+def _xtc_frame_timing(traj_p, n_frames=None):
+    """An .xtc's frame timing, read off the step and time it stamps per frame.
+
+    Given n_frames, the spacing read off frames 0 and 1 is checked against the
+    last frame, since extrapolating from two frames is only right if the source
+    is evenly spaced.
+    """
+    with _mdtraj.open(str(traj_p)) as fh:
+        available = len(fh)
+        _, time, step, _ = fh.read(min(2, available))
+        if available < 2:
+            return int(step[0]), 0, float(time[0]), 0.0
+        step0, time0 = int(step[0]), float(time[0])
+        steps_per_frame = int(step[1]) - step0
+        time_per_frame = float(time[1]) - time0
+        if n_frames is None:
+            return step0, steps_per_frame, time0, time_per_frame
+        fh.seek(n_frames - 1)
+        _, last_time, last_step, _ = fh.read(1)
+    predicted_step = step0 + (n_frames - 1) * steps_per_frame
+    predicted_time = time0 + (n_frames - 1) * time_per_frame
+    if int(last_step[0]) != predicted_step or abs(
+            float(last_time[0]) - predicted_time) > 1e-5 * max(
+                abs(predicted_time), 1.0):
+        raise ValueError(
+            f'{traj_p} is not evenly spaced: frames 0 and 1 are '
+            f'{steps_per_frame} steps apart, which puts frame {n_frames - 1} at '
+            f'step {predicted_step}, but it is at {int(last_step[0])}. Refusing '
+            'to restamp frames from an assumption the trajectory contradicts.')
+    return step0, steps_per_frame, time0, time_per_frame
+
+
+# CHARMM keeps a DCD's timestep in AKMA time units, and OpenMM's writer divides
+# by this on the way in, so reading it back multiplies.
+DCD_AKMA_PICOSECONDS = 0.04888821
+
+
+def dcd_frame_timing(traj_fn, n_frames=None, akma_ps=DCD_AKMA_PICOSECONDS):
+    """A DCD's (step0, steps_per_frame, time0, time_per_frame), or None.
+
+    A DCD stamps nothing on a frame: istart, nsavc and delta describe the whole
+    file at once, putting frame k at step istart + k*nsavc and at time
+    (istart + k*nsavc) * delta. OpenMM's DCDReporter makes that map exact for a
+    generation, because it hands DCDFile the report interval as both firstStep
+    and interval, so frame 0 is the first report, one interval of steps in, and
+    an append reuses those same two numbers. The steps count from the file's
+    own beginning rather than from the campaign's -- which is the clock
+    XTCReporter stamps on its frames too, so the two formats answer in the same
+    units and the recovery path still has to add the earlier generations' steps
+    itself.
+
+    None when nothing filled the header in. mdtraj's DCD writer, which is what
+    writes a reimaged or harvested DCD, leaves istart 0, nsavc 1 and delta 1,
+    placing frame 0 at step 0 -- a frame no reporter ever writes, since a
+    reporter's first comes one interval in. Handing that back as a time axis
+    would be a fabrication, so the caller is told there is none.
+
+    n_frames is accepted and ignored: one linear rule covers every frame, so
+    there is no last frame that could disagree with the first two.
+    """
+    info = dcd_header_info(Path(traj_fn))
+    istart, nsavc, delta = info['istart'], info['nsavc'], info['delta']
+    if istart <= 0 or nsavc <= 0 or delta <= 0:
+        return None
+    ps_per_step = delta * akma_ps
+    return istart, nsavc, istart * ps_per_step, nsavc * ps_per_step
+
+
+# What frame_timing answers for. dcd_frame_timing is deliberately not wired in
+# here: what a caller does with an answer is hand a step and a time to a writer,
+# and loos.DCDWriter.writeFrame takes a group and nothing else, so a DCD's
+# reconstructed timing would only make harvester and reimage raise TypeError on
+# the format they can already read. Ask dcd_frame_timing directly until those
+# two branch on what the output writer accepts rather than on this being None.
+_FRAME_TIMING = {'.xtc': _xtc_frame_timing}
+
+
+def frame_timing(traj_fn, n_frames=None, backends=_FRAME_TIMING):
+    """(step0, steps_per_frame, time0, time_per_frame) a rewrite has to carry
+    forward, or None when there is nothing to carry.
+
+    Neither LOOS nor mdtraj keeps a source's step and time on its own: LOOS
+    numbers frames from zero at 1 ps apart, and mdtraj writes the frame index as
+    the step. Anything that rewrites a trajectory has to read these and pass
+    them back in.
+
+    Only an .xtc answers. A DCD's timing is recoverable, but from its header
+    rather than its frames, and dcd_frame_timing is where to ask for it. An
+    .h5 has no answer to give at all: an mdtraj HDF5 file records a time per
+    frame and no step whatsoever, and half an axis would put a fabricated step
+    counter into whatever was written from it.
+    """
+    backend = backends.get(Path(traj_fn).suffix.lower())
+    if backend is None:
+        return None
+    return backend(Path(traj_fn), n_frames)
 
 
 def strip_and_downsample(config_fn, harvester_config_fn):
-    import loos
-    from loos import pyloos as pl
-    config_fp = Path(config_fn)
-    config = json.loads(config_fp.read_text())
-    hconfig_fp = Path(harvester_config_fn)
-    hconfig = json.loads(hconfig_fp.read_text())
-    sep = config['sep']
-    model = loos.createSystem(config['top_fn'])
-    subset_selection = hconfig['harvester_subset']
-    subset = loos.selectAtoms(model, subset_selection)
+    """The one old entry point, kept for the harvest.sh scripts already on disk.
 
-    traj_name = config['traj_name']
-    traj_suffix = config['traj_suffix']
-    traj_fn = f'{traj_name}{traj_suffix}'
-    traj = pl.Trajectory(traj_fn, model)
-    downsample_frq = hconfig['downsample_frq']
-    dry_outfn = f'dry{sep}{traj_fn}'
-    dry_outp = Path(dry_outfn)
+    New scripts call harvester.harvest_generation, which this hands off to with
+    no backend pinned, so the box shape picks one.
 
-    down_outfn = f'downsample{sep}{traj_fn}'
-    down_outp = Path(down_outfn)
-    if traj_suffix == ".xtc":
-        dry_outtraj = loos.XTCWriter(dry_outfn)
-        downsampe_outtraj = loos.XTCWriter(down_outfn)
-    elif traj_suffix == '.dcd':
-        dry_outtraj = loos.DCDWriter(dry_outfn)
-        downsampe_outtraj = loos.DCDWriter(down_outfn)
-    else:
-        raise NotImplementedError(
-            f'{traj_suffix}: not implemented for basic strip and downsample')
-    print('Preparing to loop over trj in strip and downsample.')
-    while next(traj, False):
-        dry_outtraj.writeFrame(subset)
-        if traj.index() % downsample_frq == 0:
-            downsampe_outtraj.writeFrame(model)
-    # dump to PDB for topology
-    subset.pruneBonds()  # Need to do this to ensure connects are correct.
-    pdb = loos.PDB.fromAtomicGroup(subset)
-    Path('dry-top.pdb').write_text(str(pdb))
-
-    # if we've subset and also dried the trajectories, remove the original.
-    # Should raise a file not found error if the call to stat()
-    # is applied to a file that was never created
-    if dry_outp.stat().st_size > 0 and down_outp.stat().st_size > 0:
-        traj_p = Path(traj_fn)
-        traj_p.unlink()
-        # leave a symlink to dry traj so that frame counting efforts don't go awry
-        traj_p.symlink_to(dry_outp)
-    else:
-        print('either', dry_outp, 'or', down_outp,
-              'are size zero, refusing to unlink')
+    hconfig keys:
+     - harvester_subset: which atoms the solute trajectory keeps, in LOOS syntax
+       unless harvester_subset_syntax says 'mdtraj'.
+     - downsample_frq: keep every Nth frame in the solvated stream.
+     - harvester_structure: structure file to build the model from. REQUIRED for
+       GROMACS runs, whose top_fn is a force-field topology that neither LOOS nor
+       mdtraj can build a model from. Defaults to config['top_fn'].
+    """
+    from . import harvester
+    return harvester.harvest_generation(config_fn, harvester_config_fn)
 
 
-def strip_ds_mdtraj(config_fn, harvester_config_fn, sep='-', image_molecules=True):
-    import mdtraj as md
-    config_fp = Path(config_fn)
-    config = json.loads(config_fp.read_text())
-    hconfig_fp = Path(harvester_config_fn)
-    hconfig = json.loads(hconfig_fp.read_text())
-    model_name = str(config['top_fn'])
-    # subset = loos.selectAtoms(model, subset_selection)
-
-    traj_name = config['traj_name']
-    traj_suffix = config['traj_suffix']
-    traj_fn = f'{traj_name}{traj_suffix}'
-    traj = md.load(traj_fn, top=model_name)
-    if image_molecules:
-        traj.make_molecules_whole(inplace=True)
-        traj.image_molecules(inplace=True)
-    top = traj.top
-    subset_selection = hconfig['harvester_subset']
-    if subset_selection:
-        subset_iis = top.select(subset_selection)
-        dry_traj = traj.atom_slice(subset_iis)
-    else:
-        dry_traj = traj.remove_solvent()
-    
-    dry_outfn = f'dry{sep}{traj_fn}'
-    dry_outp = Path(dry_outfn)
-    dry_traj.save(dry_outfn)
-    dry_topp = dry_outp.with_suffix('.pdb')
-    # dump to PDB for topology
-    dry_traj[-1].save(str(dry_topp))
-    del dry_traj
-
-    # make and save downsampled traj
-    downsample_frq = hconfig['downsample_frq']
-    downsample_traj = traj[::downsample_frq]
-
-    down_outfn = f'downsample{sep}{traj_fn}'
-    down_outp = Path(down_outfn)
-    downsample_traj.save(down_outfn)
-
-    # if we've subset and also dried the trajectories, remove the original.
-    # Should raise a file not found error if the call to stat()
-    # is applied to a file that was never created
-    if dry_outp.stat().st_size > 0 and down_outp.stat().st_size > 0:
-        traj_p = Path(traj_fn)
-        traj_p.unlink()
-        # leave a symlink to dry traj so that frame counting efforts don't go awry
-        traj_p.symlink_to(dry_outp)
-    else:
-        print('either', dry_outp, 'or', down_outp,
-              'are size zero, refusing to unlink')
-        
-
-# These basic strings are useful in many cases on clusters using the scheduler named as the key.
-# NOTE the format target '{job_name}' has to appear for the default queue parser to find the job.
+# Ready-made job scripts, keyed by scheduler. The module docstring says what a
+# replacement has to keep.
 basic_scheduler_fstrings = {
     "lsf": inspect.cleandoc("""#!/bin/bash
                 #BSUB -J {job_name}
                 #BSUB -o lsf.out
                 {gpu_line}
                 #BSUB -q {queue_name}
+                {exclude_nodes}
+
+                echo "JOB_NAME: {job_name}"
+                echo "NODE: $LSB_HOSTS"
+                echo "GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | paste -sd, -)"
 
                 python {run_script_name}
                 """),
-    "slurm": inspect.cleandoc("""
-                #SBATCH -j {job_name}
+    # Every #SBATCH has to stay above the echoes: Slurm stops reading
+    # directives at the first real command.
+    "slurm": inspect.cleandoc("""#!/bin/bash
+                #SBATCH -J {job_name}
                 #SBATCH -e slurm.out
                 #SBATCH -o slurm.out
                 {gpu_line}
                 #SBATCH -p {queue_name}
-                
+                {exclude_nodes}
+
+                echo "JOB_NAME: {job_name}"
+                echo "SLURM_JOB_ID: $SLURM_JOB_ID"
+                echo "NODE: $SLURMD_NODENAME"
+                echo "GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | paste -sd, -)"
+
                 python {run_script_name}
+                """)
+}
+
+# Preempt-aware variants for Farmer(handle_preempt=True): the trap touches the
+# file SentinelReporter watches, python is backgrounded so bash can deliver the
+# signal at all, and the sleep outlives the grace period so Slurm says CANCELLED.
+basic_scheduler_fstrings_preempt = {
+    "lsf": inspect.cleandoc("""#!/bin/bash
+                #BSUB -J {job_name}
+                #BSUB -o lsf.out
+                {gpu_line}
+                #BSUB -q {queue_name}
+                {exclude_nodes}
+
+                echo "JOB_NAME: {job_name}"
+                echo "NODE: $LSB_HOSTS"
+                echo "GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | paste -sd, -)"
+
+                preempt_handler() {{ touch PREEMPT_SIGTERM; sleep 70; }}
+                trap preempt_handler SIGTERM
+
+                python {run_script_name} &
+                wait
+                """),
+    # --signal=B:TERM@120 warns the batch shell (B:) 120 seconds before the
+    # allocation ends or a preemption lands, which is the time to checkpoint in.
+    "slurm": inspect.cleandoc("""#!/bin/bash
+                #SBATCH -J {job_name}
+                #SBATCH -e slurm.out
+                #SBATCH -o slurm.out
+                {gpu_line}
+                #SBATCH -p {queue_name}
+                #SBATCH --signal=B:TERM@120
+                {exclude_nodes}
+
+                echo "JOB_NAME: {job_name}"
+                echo "SLURM_JOB_ID: $SLURM_JOB_ID"
+                echo "NODE: $SLURMD_NODENAME"
+                echo "GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | paste -sd, -)"
+
+                preempt_handler() {{ touch PREEMPT_SIGTERM; sleep 70; }}
+                trap preempt_handler SIGTERM
+
+                python {run_script_name} &
+                wait
                 """)
 }
 
@@ -210,38 +348,144 @@ basic_gpu_lines = {
     "slurm": "#SBATCH --gpus=1"
 }
 
-# Basic report to print _only_ a list of job ids associated to this runner.
-# Should have 'title' fstring target somewhere to purify spurious jobids.
-# update_jids calls:
-#   self.scheduler_report_fstring.format(title=self.config_template['title'])
+# One job, one GPU, several replicas sharing it through CUDA MPS. Goes with
+# gmx_pack.gmx_pack_sim_block_json, which does the core pinning.
+basic_scheduler_fstrings_mps = {
+    "slurm": inspect.cleandoc("""#!/bin/bash
+                #SBATCH -J {job_name}
+                #SBATCH -e slurm.out
+                #SBATCH -o slurm.out
+                {gpu_line}
+                #SBATCH -p {queue_name}
+                #SBATCH --cpus-per-task={cpus}
+                #SBATCH --signal=B:TERM@120
+                {exclude_nodes}
+
+                echo "JOB_NAME: {job_name}"
+                echo "SLURM_JOB_ID: $SLURM_JOB_ID"
+                echo "NODE: $SLURMD_NODENAME"
+                echo "GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | paste -sd, -)"
+
+                # Refuse to be a second job in this pack directory. Two
+                # would share one checkpoint and one set of part numbers, which
+                # no checkpoint can undo. Held on fd 9 until the job ends.
+                exec 9>pack.lock
+                if ! flock -n 9; then
+                    echo "PACK LOCK: another job already holds $(pwd)/pack.lock; exiting rather than putting a second mdrun on this checkpoint."
+                    exit 0
+                fi
+
+                # Per-job MPS daemon. Keyed on the job id so two packed jobs on
+                # one node never share or clobber each other's daemon.
+                export CUDA_MPS_PIPE_DIRECTORY="/tmp/mps-$USER-$SLURM_JOB_ID/pipe"
+                export CUDA_MPS_LOG_DIRECTORY="/tmp/mps-$USER-$SLURM_JOB_ID/log"
+                mkdir -p "$CUDA_MPS_PIPE_DIRECTORY" "$CUDA_MPS_LOG_DIRECTORY"
+                if nvidia-cuda-mps-control -d; then
+                    echo "MPS: daemon started ($CUDA_MPS_PIPE_DIRECTORY)"
+                else
+                    echo "MPS: WARNING daemon FAILED to start; replicas will time-slice the GPU at 10-20% worse throughput."
+                fi
+
+                stop_mps() {{
+                    echo quit | nvidia-cuda-mps-control 2>/dev/null || true
+                    rm -rf "/tmp/mps-$USER-$SLURM_JOB_ID"
+                }}
+                preempt_handler() {{ touch PREEMPT_SIGTERM; sleep 70; }}
+                trap preempt_handler SIGTERM
+                trap stop_mps EXIT
+
+                python {run_script_name} &
+                wait
+                """)
+}
+
+# One 'jobid jobname' line per job in this user's whole queue. Which of them
+# belong to a campaign is decided by campaign_jobs below, not by the shell.
 basic_scheduler_reports = {
-    "lsf": "bjobs -o JOBID -noheader -J '{title}-*'",
-    # -h -o '%i %j' prints JobID and untruncated JobName, two whitespace-separated columns.
-    # The default -O Name truncates to 8 chars, which silently breaks title matching.
-    # Curly braces must be escaped with curly braces when using awk via str.format.
-    "slurm": "squeue --me -h -o '%i %j' | awk '/{title}/ {{print $1}}'"
+    # -o 'JOBID JOB_NAME', not the default, which pads out several columns.
+    "lsf": "bjobs -o 'JOBID JOB_NAME' -noheader",
+    # '%i %j' prints the id and the untruncated name; -O Name would truncate to
+    # 8 characters and silently stop matching.
+    "slurm": "squeue --me -h -o '%i %j'"
 }
 
-# Basic report to print the name, and then the jobid, for each job with job title
-# created by orchestrator. Allows scripts to associate currently running jobs to
-# their seed, clone, and gen indexes. Output should be a string where each new line
-# is a job, with the Job ID in the first field and the Job Name in the second.
-# __init__ from Orchestrator calls:
-#   self.scheduler_assoc_fstring.format(title=self.config_template['title'])
-basic_scheduler_assoc_reports = {
-    "lsf": "bjobs -o 'JOBID JOB_NAME' -noheader -J '{title}-*'",
-    # awk (not grep) so a clean queue exits 0 instead of grep's exit-1-on-no-match,
-    # which would crash the boot-time sp.check_output in Farmer.__init__.
-    "slurm": "squeue --me -h -o '%i %j' | awk '/{title}/'"
-}
+# The name Farmer's association argument takes. Both reports read the same
+# lines now, and differ only in what the orchestrator takes out of them.
+basic_scheduler_assoc_reports = dict(basic_scheduler_reports)
+
+# A job name ends in this many integers: its seed, clone and gen index.
+JOB_NAME_INDEX_COUNT = 3
 
 
-# Per-scheduler post-mortem checks for whether a finished job was preempted.
-# Used by Clone.check_start_gen to avoid charging preemptions against the
-# per-gen restart_attempts budget. Returns False on any error (missing
-# binary, timeout, accounting gap, unknown state) so a true failure still
-# counts as a restart.
+def parse_scheduler_report(text):
+    """The (job_id, job_name) pairs in a queue report, one per line.
+
+    The id is the first whitespace-separated field and the name is the rest of
+    the line, so a name holding a space survives. A line carrying no name is
+    warned about, since a report without names can never match; a line whose id
+    is not an integer is dropped quietly, being an array task or a header, and
+    so never one of ours.
+    """
+    jobs = []
+    for line in text.splitlines():
+        fields = line.split(None, 1)
+        if not fields:
+            continue
+        if len(fields) < 2:
+            print(f'WARNING: scheduler report line {line!r} carries a job id '
+                  'and no job name, so no clone can be bound to it.')
+        elif fields[0].isascii() and fields[0].isdigit():
+            jobs.append((int(fields[0]), fields[1].strip()))
+    return jobs
+
+
+def split_job_name(name, sep='-', index_count=JOB_NAME_INDEX_COUNT):
+    """A job name split into (title, indices), or None.
+
+    None when the name does not end in index_count integers. The title leads
+    and may itself contain sep, so only the last index_count fields are read as
+    indices and everything before them is rejoined as the title.
+    """
+    fields = name.split(sep)
+    if len(fields) <= index_count:
+        return None
+    tail = fields[-index_count:]
+    if not all(f.isascii() and f.isdigit() for f in tail):
+        return None
+    return sep.join(fields[:-index_count]), tuple(int(f) for f in tail)
+
+
+def campaign_jobs(text, title, sep='-', index_count=JOB_NAME_INDEX_COUNT):
+    """This campaign's jobs in a queue report, as (job_id, indices) pairs.
+
+    Ordered as the report listed them. The title is compared by equality
+    against the title each name was split into, never as a pattern and never as
+    a bare prefix, so a campaign called 'sampling' does not claim the jobs of
+    one called 'sampling-long'. A name that reads as ours but carries the wrong
+    indices is warned about and left out: nothing can be bound to it, so a
+    second job may land on top of it.
+    """
+    ours = []
+    for jid, name in parse_scheduler_report(text):
+        split = split_job_name(name, sep=sep, index_count=index_count)
+        if split is None:
+            if name == title or name.startswith(title + sep):
+                print(f'WARNING: queued job {jid} is named {name!r}, which '
+                      f'does not end in {index_count} {sep!r}-separated '
+                      'indices. No clone will be bound to it, and one may '
+                      'launch a second job on top of it.')
+            continue
+        if split[0] == title:
+            ours.append((jid, split[1]))
+    return ours
+
+
 def slurm_was_preempted(jid):
+    """Whether Slurm's accounting says this finished job was preempted.
+
+    False whenever the question cannot be answered (no sacct, a timeout, a gap
+    in the accounting), so a real failure still costs the clone a restart.
+    """
     try:
         out = sp.check_output(
             ['sacct', '-j', str(jid), '-n', '-o', 'State', '-X'],
@@ -256,6 +500,8 @@ def slurm_was_preempted(jid):
 
 
 def lsf_was_preempted(jid):
+    """Whether LSF recorded TERM_PREEMPT for this finished job. False on any
+    error, as above."""
     try:
         out = sp.check_output(
             ['bjobs', '-d', '-o', 'exit_reason', '-noheader', str(jid)],
@@ -266,20 +512,341 @@ def lsf_was_preempted(jid):
     return 'TERM_PREEMPT' in out
 
 
+# Clone.check_start_gen uses these so a preemption is not charged against the
+# generation's restart_attempts budget.
 preemption_checkers = {
     'sbatch': slurm_was_preempted,
     'bsub': lsf_was_preempted,
 }
 
 
-# Resolve which OpenMM Platform to use and which platformProperties to apply.
-# If platform_name is set, demand that exact platform (raise if it can't load).
-# Otherwise pick the fastest available non-Reference platform; raise if only
-# Reference is available, since AMOEBA / large-system MD on Reference is
-# effectively a hang from the scheduler's perspective. Filter platform_properties
-# to those the chosen platform actually exposes so e.g. {'Precision': 'mixed'}
-# applies cleanly on CUDA/HIP/OpenCL but is silently dropped on CPU.
+# Log strings that mean the node is broken rather than the simulation.
+default_bad_node_patterns = (
+    'CUDA_ERROR_UNSUPPORTED_PTX_VERSION',
+    'CUDA_ERROR_NO_DEVICE',
+    'CUDA_ERROR_INVALID_DEVICE',
+    'CUDA_ERROR_NOT_INITIALIZED',
+    'CUDA driver version is insufficient',
+    'No CUDA-capable device is detected',
+    'Failed to initialize NVML',
+    # GLIBC ABI mismatch; only the quoted half of the message is stable.
+    "version `GLIBC_",
+)
+
+# Seconds a scheduler query may take before it counts as failed.
+SCHEDULER_QUERY_TIMEOUT = 120
+
+# Some schedulers say "nothing matched" with a non-zero exit rather than with
+# empty output. LSF's bjobs does; an empty Slurm queue exits 0.
+empty_query_messages = ('no unfinished job found', 'no matching job found',
+                        'is not found')
+
+
+def scheduler_query(command, timeout=SCHEDULER_QUERY_TIMEOUT,
+                    empty_messages=empty_query_messages):
+    """Ask the scheduler something. Returns (trusted, text).
+
+    trusted is False when the query itself failed, which is not at all the same
+    as the queue being empty: reading a squeue that died as "no jobs are
+    running" relaunches every live clone on top of itself. The reports above
+    are single commands, so their own exit status settles that, but pipefail
+    stays for the pipelines a site may substitute, where the last stage would
+    otherwise exit 0 over a dead first stage. A scheduler that reports an empty
+    queue by exiting non-zero is recognised by what it says.
+    """
+    try:
+        result = sp.run(f'set -o pipefail; {command}', shell=True,
+                        executable='/bin/bash', text=True,
+                        capture_output=True, timeout=timeout)
+    except (sp.TimeoutExpired, OSError) as exc:
+        print(f'WARNING: scheduler query {command!r} did not run: {exc}')
+        return False, ''
+    output = result.stdout.strip()
+    if result.returncode == 0:
+        return True, output
+    said = (result.stderr or '').lower()
+    if not output and any(m in said for m in empty_messages):
+        return True, ''
+    print(f'WARNING: scheduler query {command!r} exited {result.returncode}: '
+          f'{(result.stderr or "").strip()[:200]}')
+    return False, output
+
+
+default_scheduler_log_names = {
+    'sbatch': 'slurm.out',
+    'slurm': 'slurm.out',
+    'bsub': 'lsf.out',
+    'lsf': 'lsf.out',
+}
+
+# Submit command -> the family the fstring tables are keyed by.
+scheduler_families = {
+    'sbatch': 'slurm',
+    'slurm': 'slurm',
+    'bsub': 'lsf',
+    'lsf': 'lsf',
+}
+
+
+def _format_exclude_slurm(nodes):
+    if not nodes:
+        return ''
+    return f'#SBATCH --exclude={",".join(sorted(nodes))}'
+
+
+def _format_exclude_lsf(nodes):
+    if not nodes:
+        return ''
+    selectors = ' && '.join(f"hname!='{n}'" for n in sorted(nodes))
+    return f'#BSUB -R "select[{selectors}]"'
+
+
+default_exclude_node_formatters = {
+    'sbatch': _format_exclude_slurm,
+    'slurm': _format_exclude_slurm,
+    'bsub': _format_exclude_lsf,
+    'lsf': _format_exclude_lsf,
+}
+
+
+class BadNodeRegistry:
+    """Tracks nodes that produced node-local failures and excludes them
+    from subsequent submissions.
+
+    On boot: parses the persistence file (default bad_nodes.txt) and
+    rebuilds the in-memory exclude set so a farmer restart doesn't
+    re-learn the same bad nodes. Seeds scheduler_kws['exclude_nodes']
+    with the corresponding directive line.
+
+    Per detection: scan_and_record(gen_dir, clone_tag) reads the gen's
+    scheduler log (slurm.out / lsf.out), looks for a bad_node_patterns
+    hit, harvests the NODE: line (and GPU: if present), appends a breadcrumb
+    row, and refreshes scheduler_kws['exclude_nodes'].
+
+    Breadcrumb file is plain text, tab-separated. Comment-out (prefix
+    with #) or delete rows to clear entries; the farmer rereads the file
+    on boot.
+    """
+
+    BREADCRUMB_HEADER = (
+        '# mdfarmer bad-nodes blocklist\n'
+        '# This file is appended to whenever a clone aborts at 0 steps\n'
+        "# on a node whose log matches a known fatal-on-this-node pattern.\n"
+        '# The farmer excludes these nodes on subsequent submissions via\n'
+        "# the '{exclude_nodes}' placeholder in scheduler_fstring.\n"
+        '#\n'
+        '# To clear an entry: comment it out, or delete the row, then\n'
+        '# restart the farmer. Comment and blank lines are ignored.\n'
+        '# are ignored on reload.\n'
+        '#\n'
+        "# If many nodes from one partition fail with the same pattern,\n"
+        "# that's a hint about how to reconfigure: e.g. PTX-version errors\n"
+        '# usually mean the partition has older driver/CUDA-toolkit nodes,\n'
+        "# so narrowing your --constraint (Slurm) or queue is more durable\n"
+        "# than relying on this exclude list to grow.\n"
+        '#\n'
+        '# Columns (tab-separated):\n'
+        '#   timestamp\tnode\tgpu\tpattern\tlog_path\tclone_tag\n'
+    )
+
+    def __init__(self, persist_path, scheduler, scheduler_kws,
+                 patterns=None, log_name=None, exclude_formatter=None):
+        self.persist_path = Path(persist_path)
+        self.scheduler = scheduler
+        # Held by reference; mutating exclude_nodes here updates the dict
+        # the Farmer hands to every Clone for str.format() at launch.
+        self.scheduler_kws = scheduler_kws
+        self.patterns = tuple(patterns) if patterns is not None \
+            else default_bad_node_patterns
+        self.log_name = log_name or default_scheduler_log_names.get(
+            scheduler, 'slurm.out')
+        self.exclude_formatter = (
+            exclude_formatter
+            or default_exclude_node_formatters.get(scheduler)
+            or (lambda nodes: '')
+        )
+        self.bad_nodes = self._load_persisted()
+        self._refresh_kws()
+
+    def _load_persisted(self):
+        nodes = set()
+        if not self.persist_path.is_file():
+            return nodes
+        for raw in self.persist_path.read_text().splitlines():
+            line = raw.strip()
+            if not line or line.startswith('#'):
+                continue
+            parts = line.split('\t')
+            # Older and hand-edited rows are tolerated by taking the first
+            # field that looks like a hostname rather than column 2.
+            for cand in parts:
+                cand = cand.strip()
+                if not cand:
+                    continue
+                # ISO timestamps start with a 4-digit year + '-'.
+                if len(cand) >= 5 and cand[4] == '-' and cand[:4].isdigit():
+                    continue
+                nodes.add(cand)
+                break
+        return nodes
+
+    def _refresh_kws(self):
+        self.scheduler_kws['exclude_nodes'] = self.exclude_formatter(self.bad_nodes)
+
+    def _ensure_header(self):
+        if (not self.persist_path.is_file()
+                or self.persist_path.stat().st_size == 0):
+            self.persist_path.write_text(self.BREADCRUMB_HEADER)
+
+    def _append_row(self, node, gpu, pattern, log_path, clone_tag):
+        import datetime as _dt
+        ts = _dt.datetime.now(_dt.timezone.utc).isoformat(timespec='seconds')
+        row = f'{ts}\t{node}\t{gpu}\t{pattern}\t{log_path}\t{clone_tag}\n'
+        with self.persist_path.open('a') as f:
+            f.write(row)
+
+    @staticmethod
+    def _extract_value(text, key):
+        for line in text.splitlines():
+            if line.startswith(key):
+                rest = line[len(key):].strip()
+                return rest if rest else None
+        return None
+
+    def scan_and_record(self, gen_dir, clone_tag):
+        """Blocklist the node behind a generation's failure, and name it.
+
+        The generation's scheduler log is searched for a bad_node_patterns hit;
+        on one, the NODE: line it echoed is recorded and excluded from here on.
+        None when nothing matched, or when the script echoed no NODE: line.
+        """
+        log_p = Path(gen_dir) / self.log_name
+        if not log_p.is_file():
+            return None
+        try:
+            text = log_p.read_text(errors='replace')
+        except OSError as exc:
+            print(f'BadNodeRegistry: cannot read {log_p}: {exc}')
+            return None
+        matched = next((p for p in self.patterns if p in text), None)
+        if matched is None:
+            return None
+        node = self._extract_value(text, 'NODE:')
+        if node is None:
+            print(f'BadNodeRegistry: pattern {matched!r} matched in {log_p} '
+                  "but no 'NODE:' line found in scheduler log; cannot "
+                  'exclude. Add an echo of NODE: $SLURMD_NODENAME (or LSF '
+                  'equivalent) to your scheduler_fstring.')
+            return None
+        gpu = self._extract_value(text, 'GPU:') or 'unknown'
+        self._ensure_header()
+        self._append_row(node, gpu, matched, log_p.resolve(), clone_tag)
+        if node not in self.bad_nodes:
+            print(f'BadNodeRegistry: node {node!r} (gpu={gpu!r}) hit '
+                  f'fatal-on-node pattern {matched!r}; adding to exclude '
+                  f'list (logged to {self.persist_path.resolve()}).')
+            self.bad_nodes.add(node)
+            self._refresh_kws()
+        else:
+            print(f'BadNodeRegistry: node {node!r} (already excluded) hit '
+                  f'pattern {matched!r} again; logged in {self.persist_path}.')
+        return node
+
+
+# Indent for the JSON files a runner and the orchestrator share.
+JSON_INDENT = 2
+
+
+def write_json_atomic(path, obj, indent=JSON_INDENT):
+    """Write obj to path as JSON under a temp name, and return path.
+
+    The rename is atomic and the temp name sits in the target's own directory,
+    so a reader racing the write sees either the whole old file or the whole new
+    one. Every file a running job and the orchestrator share is written this
+    way: a generation's config and status, a pack manifest, the seed map.
+
+    indent is a parameter rather than fixed because config.json has always been
+    written at 4 and the rest at 2, and reshaping files already on disk would
+    make a stored config differ from itself on the next boot.
+    """
+    path = Path(path)
+    tmp_p = path.with_name(path.name + '.tmp')
+    tmp_p.write_text(json.dumps(obj, indent=indent))
+    tmp_p.replace(path)
+    return path
+
+
+# Where a campaign records what each seed index means.
+SEED_MAP_NAME = 'seed_map.json'
+
+
+def read_seed_map(seed_map_p: Path):
+    """The recorded {seed index: label}, or {} when nothing is recorded yet."""
+    seed_map_p = Path(seed_map_p)
+    if not seed_map_p.is_file():
+        return {}
+    return {int(index): label
+            for index, label in json.loads(seed_map_p.read_text()).items()}
+
+
+def write_seed_map(seed_map_p: Path, seed_map: dict):
+    """Write {seed index: label}, under a temp name so no boot reads a torn file."""
+    seed_map_p = Path(seed_map_p)
+    seed_map_p.parent.mkdir(parents=True, exist_ok=True)
+    return write_json_atomic(
+        seed_map_p,
+        {str(index): label for index, label in sorted(seed_map.items())})
+
+
+def changed_seed_labels(recorded: dict, seed_labels):
+    """Recorded indices whose label has changed, as {index: (was, now)}."""
+    return {index: (recorded[index], label)
+            for index, label in enumerate(seed_labels)
+            if index in recorded and recorded[index] != label}
+
+
+def check_seed_map(seed_map_p: Path, seed_labels):
+    """Bind each seed index to its label, refusing a boot that re-indexes one.
+
+    A seed index is an on-disk identity: it names the seed directory, appears
+    in job names, and is the key running jobs are re-associated by. Every label
+    already recorded must still mean the same thing; indices past the end of
+    the record are new seeds and are added to it. Returns the merged mapping.
+    """
+    seed_labels = list(seed_labels)
+    duplicated = sorted({label for label in seed_labels
+                         if seed_labels.count(label) > 1})
+    if duplicated:
+        raise ValueError(
+            f'seed_labels repeats {duplicated}. A label is a seed\'s identity, '
+            'so two seeds sharing one make a swap between them undetectable.')
+    recorded = read_seed_map(seed_map_p)
+    changed = changed_seed_labels(recorded, seed_labels)
+    if changed:
+        detail = '; '.join(f'seed {index} was {was!r} and is now {now!r}'
+                           for index, (was, now) in sorted(changed.items()))
+        raise ValueError(
+            f'seed_labels disagrees with {seed_map_p}: {detail}. That index '
+            'already names a directory of finished data and any job still '
+            'queued for it, so booting would run this seed into another '
+            "replica's trajectory. Put the seed lists back in their recorded "
+            'order, or, if the re-index is deliberate, move the existing '
+            f'data aside and delete {seed_map_p}.')
+    merged = {**recorded, **dict(enumerate(seed_labels))}
+    write_seed_map(seed_map_p, merged)
+    return merged
+
+
 def select_platform(platform_name=None, platform_properties=None):
+    """(platform, properties) for a simulation to run on.
+
+    A named platform is demanded and raises if it will not load. Otherwise the
+    fastest platform that is not Reference is taken, and having only Reference
+    raises too, since MD on it is a hang as far as the scheduler can tell.
+
+    Properties the chosen platform does not expose are dropped, so a request
+    like {'Precision': 'mixed'} can be left in a config that also runs on CPU.
+    """
     if platform_name is not None:
         platform = mm.Platform.getPlatformByName(platform_name)
     else:
@@ -315,17 +882,8 @@ def select_platform(platform_name=None, platform_properties=None):
     return platform, filtered_properties
 
 
-# Resume-correctness helpers: state.xml ↔ DCD alignment.
-#
-# On every resume we need the DCD's last frame's logical step to equal
-# the state.xml's stepCount exactly, otherwise the next append lands at
-# the wrong place in time and gen-to-gen concatenation drifts. The
-# helpers below validate the state file, read the DCD header's frame
-# accounting, and (if the kill happened between the DCD report and the
-# checkpoint report) truncate the DCD to match.
-
-
 def is_state_xml_usable(p: Path) -> bool:
+    """Whether this state.xml can be deserialized, so a gen can resume from it."""
     if not p.is_file() or p.stat().st_size == 0:
         return False
     try:
@@ -336,9 +894,32 @@ def is_state_xml_usable(p: Path) -> bool:
     return True
 
 
+def state_xml_origin(seed_fn):
+    """The step an initial seed already carries, or 0 if it carries none.
+
+    An equilibrated seed's state.xml records the step its equilibration reached,
+    and every later stepCount counts on from there. A campaign's own step zero
+    is therefore this offset, not zero, and recovery has to subtract it.
+    """
+    seed_p = Path(seed_fn)
+    if seed_p.suffix.lower() != '.xml' or not seed_p.is_file():
+        return 0
+    try:
+        return state_xml_step_count(seed_p)
+    except (ValueError, OSError):
+        return 0
+
+
 def state_xml_step_count(p: Path) -> int:
+    """The step a state.xml stopped at. ValueError if it cannot be read."""
     import xml.etree.ElementTree as ET
-    root = ET.parse(p).getroot()
+    try:
+        root = ET.parse(p).getroot()
+    except ET.ParseError as exc:
+        # ParseError is a SyntaxError, which the caller's ValueError guard
+        # would miss, dropping the clone instead of cascading to an older gen.
+        raise ValueError(f'state.xml at {p} is not parseable XML, so the step '
+                         f'it stopped at cannot be read: {exc}') from exc
     sc = root.attrib.get('stepCount')
     if sc is None:
         raise ValueError(f'state.xml at {p} has no stepCount attribute '
@@ -347,7 +928,7 @@ def state_xml_step_count(p: Path) -> int:
 
 
 def dcd_header_info(p: Path) -> dict:
-    """Parse a DCD header. Returns nset, istart, nsavc, with_unitcell,
+    """Parse a DCD header. Returns nset, istart, nsavc, delta, with_unitcell,
     n_atoms, and header_size (file offset where the first frame begins).
     """
     with open(p, 'rb') as f:
@@ -357,10 +938,12 @@ def dcd_header_info(p: Path) -> dict:
         magic = f.read(4)
         if magic != b'CORD':
             raise ValueError(f'DCD magic {magic!r} != b"CORD" at {p}')
-        ints = struct.unpack('<20i', f.read(80))
+        block = f.read(80)
+        ints = struct.unpack('<20i', block)
         nset, istart, nsavc = ints[0], ints[1], ints[2]
-        # ints[10] is at byte offset 48 from file start — the
-        # with-unit-cell flag (1 if frames carry the 6-double box record).
+        # Word 9 of the block, at byte 44, is the timestep, and a float.
+        delta = struct.unpack('<f', block[36:40])[0]
+        # ints[10], at byte 48, is 1 when frames carry the 6-double box record.
         with_unitcell = ints[10]
         be1 = struct.unpack('<i', f.read(4))[0]
         if be1 != 84:
@@ -380,52 +963,239 @@ def dcd_header_info(p: Path) -> dict:
         if be3 != 4:
             raise ValueError(f'DCD natoms block end marker {be3} != 4 at {p}')
         header_size = f.tell()
-    return {'nset': nset, 'istart': istart, 'nsavc': nsavc,
+    return {'nset': nset, 'istart': istart, 'nsavc': nsavc, 'delta': delta,
             'with_unitcell': bool(with_unitcell), 'n_atoms': n_atoms,
             'header_size': header_size}
 
 
 def dcd_frame_size(with_unitcell: bool, n_atoms: int) -> int:
-    # PBC block: 4 + 6*8 + 4 = 56 bytes
-    # Each coord record: 4 + 4*n_atoms + 4 = 8 + 4n
-    # 3 coord records: 3*(8+4n) = 24 + 12n
+    """Bytes one DCD frame occupies: a 56-byte box record if the file has them,
+    plus three Fortran coordinate records of 8 + 4*n_atoms each."""
     return (56 if with_unitcell else 0) + 24 + 12 * n_atoms
 
 
 def truncate_dcd_to_nframes(p: Path, target_nframes: int) -> int:
-    """Reduce a DCD's frame count to target_nframes by rewriting the
-    header nset field and truncating trailing bytes. No-op if already
-    at target. Refuses to grow. Idempotent on partial completion.
+    """Cut a DCD down to at most target_nframes, or however many whole
+    frames its bytes actually hold if that is fewer. Rewrites nset and
+    truncates trailing bytes so the header and the file length always
+    agree afterward. Never grows the file. Idempotent.
+
+    Returns the frame count actually achieved, which the caller must
+    compare against target_nframes: they can disagree when the header's
+    nset over- or under-states what is really on disk.
     """
     info = dcd_header_info(p)
-    cur_nset = info['nset']
-    if target_nframes > cur_nset:
-        raise ValueError(f'truncate_dcd_to_nframes refuses to grow '
-                         f'{p}: current nset={cur_nset}, target='
-                         f'{target_nframes}')
-    if target_nframes == cur_nset:
-        return cur_nset
     frame_size = dcd_frame_size(info['with_unitcell'], info['n_atoms'])
-    new_size = info['header_size'] + target_nframes * frame_size
-    # Rewrite nset first, then truncate. If interrupted between, the
-    # file's nset is below its byte length; the next call computes the
-    # same target and is a no-op (trailing bytes stay as harmless
-    # padding that mdtraj/LOOS ignore since they honor nset).
+    header_size = info['header_size']
+    # nset is not trusted: OpenMM bumps it before writing the frame it counts,
+    # so a kill mid-write leaves it ahead of the data. Bytes are what happened.
+    whole_frames = max(0, (p.stat().st_size - header_size) // frame_size)
+    achievable = min(target_nframes, whole_frames)
+    if achievable != target_nframes:
+        print(f'{p}: asked to trim to {target_nframes} frames but only '
+              f'{whole_frames} whole frames are actually on disk; '
+              f'trimming to {achievable} instead.')
     with open(p, 'r+b') as f:
         f.seek(8)
-        f.write(struct.pack('<i', target_nframes))
-    os.truncate(str(p), new_size)
-    return target_nframes
+        f.write(struct.pack('<i', achievable))
+    os.truncate(str(p), header_size + achievable * frame_size)
+    return achievable
+
+
+# An .xtc frame is a 56-byte header ending in the atom count xdr3dfcoord
+# repeats, then either raw coordinates for a system of nine atoms or fewer or a
+# 36-byte compression header and the packed bytes its last word sizes.
+XTC_MAGIC = 1995
+XTC_HEADER_SIZE = 56
+XTC_COMPRESSED_HEADER_SIZE = 92
+XTC_UNCOMPRESSED_ATOMS = 9
+XTC_BYTES_PER_COORD = 12
+XTC_PAD = 4
+
+
+def xtc_frame_offsets(p: Path, magic=XTC_MAGIC, header_size=XTC_HEADER_SIZE,
+                      compressed_header_size=XTC_COMPRESSED_HEADER_SIZE,
+                      uncompressed_atoms=XTC_UNCOMPRESSED_ATOMS,
+                      bytes_per_coord=XTC_BYTES_PER_COORD, pad=XTC_PAD) -> list:
+    """Where every whole frame of an .xtc starts, and where the last one ends.
+
+    The list is one longer than the frame count, so offsets[n] is the length a
+    file trimmed to n frames has to have, for any n from zero to that count.
+    An .xtc frame is a variable-length compressed block and cannot be located
+    by arithmetic the way a fixed-record DCD frame can, so the frames are
+    walked instead: each header gives the atom count and, above the handful
+    that go in uncompressed, the byte length of the packed coordinates.
+
+    Bytes are authoritative here as they are for a DCD. A frame the walk cannot
+    complete -- the torn tail a kill mid-write leaves -- ends the list rather
+    than joining it, so trimming to offsets[-1] is what removes it. A first
+    frame with no magic number is a different complaint, a file that is not an
+    .xtc at all, and raises.
+    """
+    size = p.stat().st_size
+    offsets = []
+    position = 0
+    with open(p, 'rb') as f:
+        while position + header_size <= size:
+            f.seek(position)
+            head = f.read(header_size)
+            frame_magic, n_atoms = struct.unpack('>2i', head[:8])
+            if frame_magic != magic or n_atoms <= 0:
+                if position == 0:
+                    raise ValueError(
+                        f'{p} does not begin with an XTC frame header: magic '
+                        f'{frame_magic} (want {magic}), {n_atoms} atoms.')
+                break
+            if n_atoms <= uncompressed_atoms:
+                end = position + header_size + bytes_per_coord * n_atoms
+            else:
+                tail = f.read(compressed_header_size - header_size)
+                if len(tail) < compressed_header_size - header_size:
+                    break
+                n_bytes = struct.unpack('>i', tail[-4:])[0]
+                if n_bytes < 0:
+                    break
+                end = (position + compressed_header_size
+                       + ((n_bytes + pad - 1) // pad) * pad)
+            if end > size:
+                break
+            offsets.append(position)
+            position = end
+        offsets.append(position)
+    return offsets
+
+
+def truncate_xtc_to_nframes(p: Path, target_nframes: int) -> int:
+    """Cut an .xtc down to at most target_nframes, or however many whole
+    frames its bytes actually hold if that is fewer. Never grows the file.
+    Idempotent.
+
+    Nothing is re-encoded: the frames that stay keep their own bytes, so their
+    coordinates, steps, times and compressed-x-precision are exactly what the
+    writer produced, and a run that asked for a precision finer than mdtraj's
+    fixed 1000 does not lose it here. A torn trailing frame goes even when
+    target_nframes was already met, because mdtraj raises on one rather than
+    stopping short of it.
+
+    Returns the frame count actually achieved, which the caller must compare
+    against target_nframes the way it does for a DCD.
+    """
+    p = Path(p)
+    offsets = xtc_frame_offsets(p)
+    whole_frames = len(offsets) - 1
+    achievable = max(0, min(target_nframes, whole_frames))
+    if achievable != target_nframes:
+        print(f'{p}: asked to trim to {target_nframes} frames but only '
+              f'{whole_frames} whole frames are actually on disk; '
+              f'trimming to {achievable} instead.')
+    os.truncate(str(p), offsets[achievable])
+    return achievable
+
+
+def truncate_h5_to_nframes(p: Path, target_nframes: int) -> int:
+    """Cut an mdtraj HDF5 trajectory down to at most target_nframes, or
+    however many whole frames it holds if that is fewer. Never grows it.
+    Idempotent.
+
+    Every per-frame quantity is a PyTables EArray extendable along the frame
+    axis, and /topology, the one node that is not per frame, is a plain Array,
+    so truncating each EArray is the whole job. The shortest of them is what
+    the file really holds: mdtraj appends to them one after another, so a kill
+    between two appends leaves coordinates a frame ahead of time.
+
+    HDF5 hands freed space back to the file's own free list rather than to the
+    filesystem, so what shrinks is the frame count and not the size on disk.
+
+    Returns the frame count actually achieved, as the other truncators do.
+    """
+    p = Path(p)
+    try:
+        import tables
+    except ImportError as exc:
+        raise ImportError(
+            f'Trimming {p} needs PyTables, which mdtraj installs.') from exc
+    with tables.open_file(str(p), 'a') as handle:
+        arrays = list(handle.walk_nodes('/', 'EArray'))
+        if not arrays:
+            raise ValueError(
+                f'{p} holds no extendable per-frame arrays, so it is not an '
+                'mdtraj HDF5 trajectory.')
+        whole_frames = min(int(a.shape[0]) for a in arrays)
+        achievable = max(0, min(target_nframes, whole_frames))
+        if achievable != target_nframes:
+            print(f'{p}: asked to trim to {target_nframes} frames but only '
+                  f'{whole_frames} whole frames are actually on disk; '
+                  f'trimming to {achievable} instead.')
+        # A shrink or a no-op for every array, since achievable is their
+        # shortest at most, and truncate() would grow one asked for more.
+        for array in arrays:
+            array.truncate(achievable)
+    return achievable
+
+
+# Trimming a trajectory back to a frame count, keyed by suffix. Each one works
+# in place and from what the file's bytes really hold, not from any count it
+# records, and each returns the frame count it reached.
+TRUNCATORS = {
+    '.dcd': truncate_dcd_to_nframes,
+    '.xtc': truncate_xtc_to_nframes,
+    '.h5': truncate_h5_to_nframes,
+}
+
+TRUNCATABLE_SUFFIXES = frozenset(TRUNCATORS)
+
+
+def truncate_traj_to_nframes(traj_fn, target_nframes, truncators=TRUNCATORS):
+    """Cut a trajectory to at most target_nframes, whatever format it is in.
+
+    Returns the frame count reached, which the caller has to compare against
+    what it asked for: fewer means the file held fewer whole frames than its
+    own bookkeeping claimed, and a generation resumed on that basis would be
+    discontiguous. ValueError for a format with no truncator, which a caller
+    recovering a generation treats the way it treats a truncation that missed
+    -- redo the generation rather than append to a trajectory it cannot trim.
+    """
+    traj_p = Path(traj_fn)
+    try:
+        truncate = truncators[traj_p.suffix.lower()]
+    except KeyError:
+        raise ValueError(
+            f'No truncator for {traj_p.suffix!r}; the formats that can be '
+            f'trimmed are {sorted(truncators)}.') from None
+    return truncate(traj_p, target_nframes)
+
+
+def check_whole_frames(total_steps, write_interval, source='config_template'):
+    """Refuse a step count that is not a whole number of write_intervals.
+
+    The leftover steps write no frame and no checkpoint, so the run passes its
+    last report and never registers as finished: calx_remaining_steps keeps
+    asking for the remainder and every relaunch spends it again.
+
+    source names where the numbers came from, since the Farmer checks a config
+    template and a Clone checks the generation it is about to launch. Either
+    value being absent or zero means there is nothing to check. Returns
+    total_steps, so a caller can validate in place.
+    """
+    if not total_steps or not write_interval or total_steps % write_interval == 0:
+        return total_steps
+    raise ValueError(
+        f'{source} steps={total_steps} is not a whole number of '
+        f'write_interval={write_interval} steps. The remaining '
+        f'{total_steps % write_interval} would write no frame and no '
+        'checkpoint, so the generation would never finish.')
 
 
 def calx_remaining_steps(traj_fn, top_fn, total_steps, write_interval):
+    """Steps a generation still owes, from the frames already on disk.
+
+    A negative answer means more frames than the generation should hold, usually
+    duplicates from appending against a stale state.xml or a config whose
+    write_interval or total_steps has changed since the run started. The caller
+    treats that as complete, so it is warned about rather than passed silently.
+    """
     traj_len = get_traj_len(traj_fn, top_fn)
     remaining = total_steps - traj_len * write_interval
-    # A negative result means the traj has more frames than the gen
-    # should contain — usually duplicated frames from an append against
-    # a stale state.xml, or a write_interval / total_steps mismatch
-    # between the on-disk config and the current run. Surface it so it
-    # doesn't masquerade as "gen complete."
     if remaining < 0:
         print(f'WARNING: calx_remaining_steps({traj_fn}) = {remaining}; '
               f'traj has {traj_len} frames at write_interval={write_interval} '
@@ -434,13 +1204,49 @@ def calx_remaining_steps(traj_fn, top_fn, total_steps, write_interval):
     return remaining
 
 
-# This won't be nicely jsonizable unless all default and provided vals are.
-def merge_args_defaults_dict(function, **kwargs):
+# Keys config.json carries for the run block rather than for a runner: the
+# sim-block wrappers pop traj_list back out before calling one.
+CONFIG_ONLY_KEYS = ('traj_list',)
+
+
+def merge_args_defaults_dict(function, config_only_keys=CONFIG_ONLY_KEYS,
+                             **kwargs):
+    """A config dict recording the full call: every parameter and its value.
+
+    Only as jsonizable as the values put in it.
+
+    Two things stay out of the result, since both would carry the sentinel
+    inspect._empty, a class, which json.dumps cannot write:
+
+    * **kwargs-style catch-alls (gmx_generation has **_unused),
+      which have no default because they collect leftovers;
+    * parameters with no default that the caller did not supply. Those are
+      required arguments, and are named in a TypeError instead.
+
+    A keyword that is neither a parameter of the function nor one of
+    config_only_keys is a typo: it is refused, not written into the config,
+    where gmx_generation's **_unused would swallow it at run time and leave
+    config.json describing a call that never happened.
+    """
     sig = inspect.signature(function)
-    # create a dictionary of the parameters and their defaults.
-    config = {p: sig.parameters[p].default for p in sig.parameters}
-    # overwrite the defaults wherever an option was specified
+    variadic = (inspect.Parameter.VAR_KEYWORD, inspect.Parameter.VAR_POSITIONAL)
+    config = {name: param.default
+              for name, param in sig.parameters.items()
+              if param.kind not in variadic}
+    unknown = sorted(set(kwargs) - set(sig.parameters) - set(config_only_keys))
+    if unknown:
+        raise TypeError(
+            f'{function.__name__} has no parameter {unknown}; check for a '
+            f'typo. Only arguments {function.__name__} takes, plus '
+            f'{list(config_only_keys)}, belong here, so config.json records '
+            f'the call that really happens.')
     config.update(kwargs)
+    missing = sorted(name for name, value in config.items()
+                     if value is inspect.Parameter.empty)
+    if missing:
+        raise TypeError(
+            f'{function.__name__} has no default for {missing}, and none was '
+            f'supplied. Pass them here so config.json records the whole call.')
     return config
 
 
@@ -457,6 +1263,43 @@ def dir_seeds_clones(top_lvl: Path, seed_index, clone_index, pad, sep='-',
     return p
 
 
+# What every generation directory calls its run record. That file plus the job
+# script is all a rerun of the generation needs.
+CONFIG_NAME = 'config.json'
+
+
+def earlier_gen_configs(top_lvl, seed_index, clone_index, gen_index, pad,
+                        sep='-', config_name=CONFIG_NAME):
+    """The config of every generation before this one, oldest first.
+
+    Each generation records what it actually ran, so the ones before it are
+    counted rather than assumed to match it. A seed may be given a different
+    generation length between boots, and a wallclock-matched run ends its
+    generations wherever the clock ran out.
+    """
+    for earlier in range(gen_index):
+        gen_dir = dir_seeds_clones_gens(Path(top_lvl), seed_index, clone_index,
+                                        earlier, pad, sep=sep, mkdir=False)
+        config_p = gen_dir / config_name
+        if not config_p.is_file():
+            raise FileNotFoundError(
+                f'{config_p} is missing, so there is no record of what '
+                f'generation {earlier} ran. Every later generation is placed by '
+                'counting the ones before it, and assuming they match this one '
+                'would misplace every step and frame from here on. Restore that '
+                "file, or write one recording that generation's steps_per_gen "
+                'and write_interval.')
+        yield json.loads(config_p.read_text())
+
+
+def steps_before(top_lvl, seed_index, clone_index, gen_index, pad, sep='-',
+                 config_name=CONFIG_NAME):
+    """The absolute step this generation starts from."""
+    return sum(c['steps_per_gen'] for c in earlier_gen_configs(
+        top_lvl, seed_index, clone_index, gen_index, pad, sep=sep,
+        config_name=config_name))
+
+
 def dir_seeds_clones_gens(top_lvl: Path, seed_index, clone_index, gen_index, pad,
                           sep='-', padchar='0', mkdir=True):
     p = top_lvl / fdir('seed', seed_index, pad, sep=sep, padchar=padchar) / \
@@ -467,13 +1310,7 @@ def dir_seeds_clones_gens(top_lvl: Path, seed_index, clone_index, gen_index, pad
     return p
 
 
-# All trajectory formats for which a reporter exists. Add grace in future.
-traj_suffixes = ['.dcd',
-                 '.xtc']
-
-
-default_steps = int(2.5e7)  # Given 0.004 ps timestep,
-# this is 100 ns of simulation.
+default_steps = int(2.5e7)  # 100 ns at a 0.004 ps timestep.
 default_state_data_kwargs = dict(
     totalSteps=default_steps,
     step=True,
@@ -494,11 +1331,9 @@ default_straight_sampling_config_template = dict(
     traj_name='traj',
     traj_suffix='.xtc',
     restart_name='state.xml',
-    # None -> auto-select fastest available non-Reference platform.
-    # Set explicitly (e.g. 'CUDA', 'HIP', 'OpenCL') if you want to force one.
+    # None takes the fastest platform that is not Reference; name one to force it.
     platform_name=None,
-    # Precision is filtered against the chosen platform's supported properties,
-    # so this works on CUDA/HIP/OpenCL and is silently dropped on CPU.
+    # Filtered against what the platform supports, so CPU just drops this.
     platform_properties={'Precision': 'mixed'},
     steps=default_steps,
     state_data_kwargs=default_state_data_kwargs,
@@ -509,7 +1344,7 @@ default_straight_sampling_config_template = dict(
     new_velocities=False
 )
 
-# You'll need to replace all of these, but I wanted it to be more clear what the slots were.
+# Replace all of these; they are here to make the slots obvious.
 default_straight_sampling_init_config = dict(
     title='samplingX',  # This you should def overwrite for your own jobs!
     seeds=[
@@ -525,11 +1360,22 @@ default_straight_sampling_init_config = dict(
 )
 
 
-#  make two trajs--one stripped of solvent, the _other_ downsampled by some integer factor but not dried.
+# Writes two trajectories, one dried and one downsampled but still solvated.
+# harvest_generation picks its own backend, and a re-run of one does nothing.
 default_harvest_shellscript = inspect.cleandoc("""#!/bin/bash
                 #BSUB -J harvest
                 #BSUB -o harvest.out
                 #BSUB -q {queue_name}
 
-                python -c 'from mdfarmer.utilities import strip_ds_mdtraj; strip_ds_mdtraj("config.json", "hconfig.json")'
+                python -c 'from mdfarmer import harvest_generation; harvest_generation("config.json", "hconfig.json")'
+                """)
+
+default_harvest_shellscript_slurm = inspect.cleandoc("""#!/bin/bash
+                #SBATCH -J harvest
+                #SBATCH -o harvest.out
+                #SBATCH -p {queue_name}
+                #SBATCH --time={harvest_time}
+                #SBATCH --cpus-per-task=1
+
+                python -c 'from mdfarmer import harvest_generation; harvest_generation("config.json", "hconfig.json")'
                 """)

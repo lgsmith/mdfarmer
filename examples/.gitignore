@@ -1,0 +1,7 @@
+# What a run of either example leaves behind: the inflated inputs, the dataset
+# tree, the tender's log and its brake file. Only inputs/, the drivers and the
+# drive scripts are committed.
+prepared/
+data/
+*.tend.out
+stop

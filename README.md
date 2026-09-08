@@ -57,7 +57,8 @@ harvester = mdf.Harvester(  # The default harvester makes a dry trajectory at fu
 farmer = mdf.Farmer(
     n_seeds=1,
     n_clones=100,
-    active_clone_threshold=50  # how many clones will we try to schedule simultaneously.
+    active_clone_threshold=50,  # how many clones will we try to schedule simultaneously. With pack_size set this counts packs, so pack_size times as many clones run at once.
+    launch_interval=0,  # seconds to wait between one submission and the next. Some schedulers do not mind two thousand jobs at once and some fall over on a handful; raise this if yours is the second kind.
     n_gens=9,
     config_template=cfg_template,
     seed_structure_fns=['start-state.xml'],
@@ -82,6 +83,8 @@ Here we are asking for 50 clones to be run simultaneously, across a dataset of 1
 
 Right now, the actual tender process (i.e. the one that the instance of Farmer is being run by) should sit on your head-node and remain running even if you log off. If it checks up on its jobs every 60-120 seconds and sleeps the rest of the time, it is extremely unlikely to bog down your head node much. Choosing an extremely short `update_interval` (say `5`, or `1`) could be bad for a number of reasons, one being that schedulers take time to update and so the tender process could accidentally submit the same clone twice, because it believes the first time didn't work, which will sow chaos in your data fields. How short too short is could be different for different systems, but after you finish debugging I very much doubt you're gaining much by having that interval be on the long side. I recommend something like 20-30 seconds for debugging, and between 1 and 5 minutes for normal usage.
 
+`update_interval` is the wait between ticks; `launch_interval` is the wait *within* a tick, between one clone's submission and the next. It defaults to 0, which hands the scheduler the whole tick at once. That is fine on most Slurm sites, but some schedulers -- LSF clusters especially -- misbehave when even a handful of jobs land nearly simultaneously, so if yours does, set `launch_interval` to a second or two. It is an empirical setting; there is no way to know the right value but to try one. `Farmer.launch(sleep=...)` was the old, per-call spelling of the same wait. It still works and still overrides `launch_interval`, but it warns, and it will go away.
+
 You launch the tender process by just calling the correct python on the script above. For debugging I recommend doing this in an interactive session, but normally these datasets take weeks or even months to collect so I often run them using the shell utility `nohup`, in a script such as the following. This allows me to call `tail` on `straight-sampling-farmer.out` to read what's going on.
 
 Launch the tender from the directory that holds your seed structures, system, integrator, and topology files. `Farmer.__init__` resolves any relative paths in the config to absolute paths once at boot, against the cwd it was started in. Absolute paths in your script work from anywhere; relative paths only work if you launch from the right directory.
@@ -93,6 +96,104 @@ nohup python straight-sampling-farmer.py > straight-sampling-farmer.out 2>&1 &
 ```
 
 This nohupped process can be annoying to stop. You can find it using `pgrep` and `pkill`, but if you want it to stop gracefully you can create a file in the directory you launched it from called `stop`. This file can be empty, it just needs to be present. At each update interval, if the script detects a file with that name, it'll exit and the process will return.
+
+## Running GROMACS
+
+Pass `runner=mdf.gmx_generation` and the Farmer picks the matching run script,
+disk-recovery function and progress hook; supplying a mismatched set by hand is
+refused rather than half-applied. Build the config template with
+`gmx_config_template`, which records every `gmx_generation` parameter:
+
+```python
+cfg_template = mdf.gmx_config_template(
+    traj_dir_top_level='trajectories',
+    title='mysystem',
+    structure_fn='start.gro',      # grompp -c for generation 0
+    mdp_fn='prod.mdp',
+    steps=12_500_000,
+    steps_per_gen=12_500_000,
+    write_interval=50_000,
+    traj_suffix='.xtc',
+    mdrun_args=['-nb', 'gpu', '-pme', 'gpu', '-update', 'gpu', '-pin', 'on'],
+)
+farmer = mdf.Farmer(..., runner=mdf.gmx_generation, config_template=cfg_template)
+```
+
+`gmx_config_template` fills placeholders for the five parameters a Clone
+supplies per generation (`seed_index`, `clone_index`, `gen_index`, `seed_fn`,
+`top_fn` — all overwritten before any job reads them) and omits the three
+`gmx_pack` injects at runtime. Passing either group through to `gmx_generation`
+raises, so building the template any other way means knowing both lists.
+
+Generations chain with `gmx convert-tpr -nsteps` plus `mdrun -cpi`, not
+`grompp -t`: the later generation inherits its predecessor's tpr, so the
+integrator parameters and the Nose-Hoover / Parrinello-Rahman coupling state
+carry across and the step and time counters stay globally continuous.
+
+Only generation 0 reads the base `.mdp`, and the runner controls a handful of
+its keys: `nsteps`, `init-step`, `nstxout-compressed`, `gen-vel`, `continuation`
+and the seeds. `nsteps` is the campaign-absolute step a generation must reach,
+so `init-step` is pinned to 0; a base `.mdp` that sets it gets a note on stdout
+and is overridden. Everything else is inherited verbatim.
+
+Every launch writes its own `prod.partNNNN.xtc`, merged with `concat_parts` when
+the generation finishes. Where two parts cover the same steps the **later**
+file's frames are the ones kept, so a part left behind by a relaunch that
+rewound to an earlier checkpoint is renamed out of the way first — otherwise the
+merge would splice the abandoned branch into the one that actually continued.
+
+Generation 0 is built with `grompp -c` from `seed_fn` when that is a structure
+file, falling back to `structure_fn`. That is what lets seeds differ in
+topology, and what lets an adaptive scheme reseed from a configuration it
+picked rather than from the structure the campaign started with.
+
+`n_gens` is a count, and generations are numbered from 0, so `n_gens=9` runs
+generations 0 through 8. A clone retires once it has finished the last of them.
+
+> Upgrading a campaign that ran before this was true: it may hold a generation
+> numbered `n_gens` or higher, which the older code submitted by mistake. The
+> tender now retires such a clone immediately and stops minding that job. It
+> does not cancel it — mdfarmer never runs `scancel` — so check for those
+> directories before you restart, and harvest or cancel them yourself.
+
+### Packing replicas onto one GPU
+
+Where Slurm exposes only a `gpu` gres — no `mps`, no `shard` — it cannot
+co-schedule two jobs onto one card, so the packing has to happen inside one
+job. `pack_size` members share one sbatch, one MPS daemon and one generation
+step:
+
+```python
+farmer = mdf.Farmer(
+    ...,
+    pack_size=2,
+    pack_cpus_per_task=16,
+    # Optional: a policy other than consecutive runs of the priority order.
+    pack_grouping=lambda clones: [...],
+    # Optional: per-member core widths, for members with different core knees.
+    pack_member_cores=[12, 4],
+    # Optional: one dict per seed, applied over the shared template.
+    seed_config_overrides=[dict(mdrun_args=[...]), dict(mdrun_args=[...])],
+)
+```
+
+Once packing is on, the tender schedules packs rather than clones. The
+Farmer's `active_set` holds whichever unit is being scheduled -- clones
+normally, packs once packing -- and `active_clone_threshold` bounds it, so it
+counts packs: with `pack_size=2` and a threshold of 50, 100 clones run at once.
+The boot log prints the figure it arrived at.
+
+Each replica gets a private, contiguous block of cores (`-ntomp`, `-pinoffset`,
+`-pinstride`), and `-ntmpi 1` on the thread-MPI builds that accept it — a
+real-MPI build takes its rank count from `mpirun` and makes that flag fatal, so
+it is probed for rather than assumed. Without the pinning, two replicas that
+both say a bare `-pin on` start at core 0 and fight over the same cores, which
+reads as node variance rather than a misconfiguration.
+
+Failure is per-member: one replica raising does not abort the others, and the
+tender fails exactly one clone. Preemption is the exception that must reach
+everyone, so the sentinel is watched once and SIGTERM is fanned out to all K
+mdruns — that handshake is what protects trajectory contiguity.
 
 ## Dataset structure
 
@@ -146,7 +247,174 @@ Another nice troubleshooting step can be simply trying to resubmit the job gener
 
 There are two modes of analysis with this type of dataset. If you have fewer clones, but long length per clone, you could do a classical 'replicate' analysis of an observable across contiguous trajectories. If you have multiple seeds, or many clones with short generations, or some combination thereof, you're better off making some kind of transition-counting model from the data, such as a Markov State Model.
 
-We're hoping to add some scripts for both modes of analysis--mostly these will be simple functions that just use the configurations you've given for the farmer and or the structure of the data-set tree to provide you with lists of trajectories that might be useful, such as a nested list of file-paths that follows the overall structure of the tree. If you're writing functions like this yourself, note that python's `glob` and `iterdir` functionalities provide sub-paths in no particular order. The reason the directory names are padded is so that the built-in `sorted` will 'just work' with a semantic sort on the file names, but you do have to bother to use sorted if you're writing your own iterator and you want the order to be 1. the same and 2. for the generations to be sequential each time you read the files. Note that the top level file titled `traj_list.txt` records the trajectory paths in the order they are produced, which could be good for some things like a function that surveys how much data has been collected thus far, but is probably not what you want for most analysis.
+We're hoping to add some scripts for both modes of analysis--mostly these will be simple functions that just use the configurations you've given for the farmer and or the structure of the data-set tree to provide you with lists of trajectories that might be useful, such as a nested list of file-paths that follows the overall structure of the tree. If you're writing functions like this yourself, note that python's `glob` and `iterdir` functionalities provide sub-paths in no particular order. The reason the directory names are padded is so that the built-in `sorted` will 'just work' with a semantic sort on the file names, but you do have to bother to use sorted if you're writing your own iterator and you want the order to be 1. the same and 2. for the generations to be sequential each time you read the files. Note that the top level file titled `traj_list.txt` records the trajectory paths in the order they are produced, which could be good for some things like a function that surveys how much data has been collected thus far, but is probably not what you want for most analysis. It lives at the top of `traj_dir_top_level`, and a `traj_list` you name yourself is taken relative to that same directory unless you give an absolute path, so the campaign directory can be picked up and restarted on another cluster without the tender writing its list somewhere else.
+
+### Reimaging (making molecules whole again)
+
+GROMACS writes whatever coordinates the integrator is holding, and it wraps
+atoms into the box as it goes. Molecules that straddle a boundary come out
+**split**, and there is no avoiding it — it is fundamental to how the engine
+stores coordinates. On a real trp-cage system deliberately positioned across a
+box face, the raw `.xtc` had 214 bonds longer than 2.5 Å, the worst of them
+4.7 nm — a whole box length. Anything you compute per molecule on that
+trajectory (R_g, RMSD, contacts, a picture) is wrong.
+
+`mdfarmer.reimage` fixes this, with two backends chosen by the unit cell:
+
+```python
+from mdfarmer import reimage
+
+# picks the backend from the box actually recorded in the trajectory
+reimage.reimage_trajectory('prod.xtc', structure_fn='start.gro',
+                           top_fn='topol.top')
+# -> prod-whole.xtc   (the raw prod.xtc is never touched)
+```
+
+* **`'loos'` — orthorhombic ("box") cells only.** LOOS's periodic box is three
+  numbers, and its readers keep only the diagonal of a triclinic box *without
+  raising* — hand it a rhombic dodecahedron and it reports a rectangular cell
+  and every minimum-image result downstream is quietly wrong. So this backend
+  refuses a non-orthorhombic cell rather than producing plausible garbage.
+* **`'mdtraj'` — any cell, and the only option for triclinic.** Carries the full
+  3x3 box, makes each molecule whole along its bonds and wraps it in beside an
+  anchor molecule — the largest by default, so the solute stays centred.
+
+Two things worth knowing:
+
+**Molecule membership never comes from the structure file.** A `.gro` carries no
+bonds, and a bondless LOOS model makes `splitByMolecule()` return *one group
+containing the whole system* — reimaging then degenerates into a single global
+translation that looks like it worked. Bonds alone are not enough either: a
+TIP4P-ice virtual site is bonded to nothing, so connected components over bonds
+strand every `MW` in its own "molecule" — which is also what mdtraj's
+`find_molecules()` does on a topology with no bonds at all, turning imaging into
+a per-atom wrap that no later pass can undo. Molecule blocks are therefore read
+from the GROMACS `.top` through `openmm.app.GromacsTopFile`, whose chains
+reproduce the `[ molecules ]` section exactly, and handed to whichever backend
+runs.
+
+**Reimaging is checked, not trusted.** There are many ways imaging-by-atom goes
+wrong quietly, so both backends verify their own output against a physical
+invariant — bond lengths, computed *without* the minimum-image convention,
+against LOOS's `long-bond-finder` cutoff of 2.5 Å — and raise if any bond is
+still overlong. You can run the same checks yourself:
+
+```python
+n_bad, violations = reimage.check_bond_lengths('prod-whole.xtc', top_fn='topol.top')
+margin = reimage.check_anchor_distances('prod-whole.xtc', ranges)
+```
+
+`check_anchor_distances` reports the one thing that limits the LOOS backend:
+`mergeImage()` minimum-images every atom against its molecule's *first* atom, so
+it is only correct while no atom is more than half a box edge from that anchor.
+Folded trp-cage in a 4.67 nm box already uses **89%** of that margin — an
+extended conformation will exceed it, at which point the LOOS backend is outside
+its safe regime and you want `backend='mdtraj'`, which walks the bond graph
+instead. The check reports the margin as a fraction so you can watch it.
+
+### Harvesting (reducing a finished generation, safely)
+
+When a generation completes, the `Harvester` submits a job that turns its raw
+trajectory into the two streams you actually keep — a **dry** stream (every
+frame, solute only) and a **downsampled** stream (every Nth frame, solvent
+kept) — and then replaces the original with a symlink to the dry one. That last
+step is irreversible, so the harvest is built to be interrupted:
+
+```python
+harvester = mdf.Harvester(
+    harvester_template=mdf.default_harvest_shellscript_slurm.format(
+        queue_name='ccb', harvest_time='02:00:00'),
+    scheduler='sbatch',
+    run_config=dict(
+        harvester_subset='resid <= 20',      # LOOS syntax by default
+        downsample_frq=10,
+        # REQUIRED for GROMACS: `top_fn` is a force-field topology, and neither
+        # LOOS nor mdtraj can build a model from a `.top`. Point this at the
+        # structure the run actually started from.
+        harvester_structure='reference/restarts/native_cluster000.gro',
+        steps_per_gen=STEPS_PER_GEN,
+    ),
+)
+```
+
+Set `harvester_subset_syntax='mdtraj'` if you would rather write the selection
+in mdtraj's language. Either way the selection is resolved to atom indices once
+and both backends slice by index, so which backend runs cannot change which
+atoms come out.
+
+**The backend is chosen by looking at the box.** A rectangular cell goes to
+LOOS, which streams frame by frame; anything triclinic goes to mdtraj's
+`iterload`. This cannot be a `try`/`except` around the LOOS call, because LOOS
+does not raise on a triclinic cell — it keeps the diagonal and carries on (see
+the reimaging section) — so the handler would never fire on the case it exists
+for. The off-diagonals are read off frame 0 and the choice is made before either
+engine is touched. Neither path holds the trajectory in memory: a 1 µs
+generation at 10 ps sampling is ~29 GB of coordinates.
+
+**Frames are counted, not sized.** A harvest killed mid-write leaves both
+outputs nonzero and truncated, so size cannot decide whether one finished. The
+source is counted first, the output counts are *computed* from the frame plan,
+and the written files are re-counted off disk. Any mismatch raises and leaves
+the original alone.
+
+**It is idempotent.** A `.harvested` sentinel carrying the counts is written
+last; a re-run short-circuits on it. A generation whose original is already a
+symlink but which has no sentinel is a harvest that died in that window — its
+outputs are checked against the plan and the sentinel is written, rather than
+the write loop running again with its own output as input. Under a requeueing
+scheduler this is not optional.
+
+**Two spacing rules, checked when a `Farmer` is built** — not when the harvest
+runs, hours into a campaign:
+
+```
+steps_per_gen % write_interval == 0
+(steps_per_gen / write_interval) % downsample_frq == 0
+```
+
+The first puts each generation's last frame exactly on the checkpoint the next
+one restarts from; miss it and every seam silently drops the trajectory between
+the two. The second keeps the downsampled stream evenly spaced across the
+concatenation.
+
+**The seam frame is dropped exactly once.** GROMACS writes a frame at the step
+it restarts from, so generation N's last frame and generation N+1's first are
+the same time point. Concatenating without handling that puts a duplicate at
+every seam — which never fails loudly, it just biases lag times and kinetics.
+Frame 0 of every generation after the first is dropped, and the downsample phase
+is driven by a *global* frame index so it does not reset at each boundary. The
+OpenMM reporters do not write that frame; the convention is detected from the
+frame count rather than assumed.
+
+**The time axis is carried through.** LOOS's `XTCWriter` numbers frames from
+its own counters (`dt_ = 1.0`, `step_ = 0`, `steps_per_frame_ = 1`) and mdtraj
+fills `step` with the frame index, so both backends read the source's step and
+time and write them explicitly, verified against the source's last frame.
+
+> Trajectories harvested before this was in place carry a fabricated time axis —
+> 1 ps per frame, stamped with the frame index. Recompute from the generation's
+> `write_interval` and `dt`; the coordinates are fine.
+
+Two things to check on a campaign after the fact:
+
+```python
+# Generations that ran but have no sentinel. On a campaign that is still
+# running, skip_newest=True leaves out the one each clone is mid-way through.
+mdf.unharvested_gen_dirs('trajectories', skip_newest=True)
+# Frame count, spacing and duplicates across a clone's harvested generations.
+mdf.verify_dry_chain(sorted_gen_dirs)
+```
+
+The harvest does **not** reimage — it preserves the per-frame box (LOOS subsets
+share the parent's `SharedPeriodicBox`, so the dry stream carries a live cell,
+not a frozen one), which is what lets you run `mdfarmer.reimage` on the dry
+stream afterwards.
+
+## Tests
+
+`tests/` holds plain scripts — no framework. `python tests/run_all.py` runs
+them all and reports pass, fail or skip per suite; see `tests/README.md` for
+what each one needs.
 
 ## AI assistance
 
