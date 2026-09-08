@@ -215,6 +215,56 @@ def dcd_frame_timing(traj_fn, n_frames=None, akma_ps=DCD_AKMA_PICOSECONDS):
     return istart, nsavc, istart * ps_per_step, nsavc * ps_per_step
 
 
+
+# Where a DCD keeps its timing: istart and nsavc are int32s in the 80-byte
+# control block, delta a float32 nine words further in.
+DCD_ISTART_OFFSET = 12
+DCD_NSAVC_OFFSET = 16
+DCD_DELTA_OFFSET = 44
+
+# How far a stamped time axis may drift from the source's before it is a
+# different axis rather than a rounded one.
+DCD_TIME_TOLERANCE = 1e-5
+
+
+def stamp_dcd_timing(traj_fn, step0, steps_per_frame, time0, time_per_frame,
+                     istart_offset=DCD_ISTART_OFFSET,
+                     nsavc_offset=DCD_NSAVC_OFFSET,
+                     delta_offset=DCD_DELTA_OFFSET,
+                     akma_ps=DCD_AKMA_PICOSECONDS,
+                     tolerance=DCD_TIME_TOLERANCE):
+    """Put a step and time axis into a finished DCD's header. True if stamped.
+
+    Neither writer used here fills one in. LOOS hardcodes istart and nsavc to 1
+    in DCDWriter::writeHeader, and mdtraj's DCD writer takes no timing at all,
+    so a rewritten DCD claims frame k sits at step k+1 whatever the source said.
+    The axis has to be written back afterwards, which is safe because a DCD
+    keeps it in the header rather than on the frames.
+
+    A DCD can only say `frame k is at step istart + k*nsavc, at time
+    (istart + k*nsavc)*delta`: one line through the origin, with no independent
+    time offset. An axis that does not fit that form raises rather than being
+    rounded into one, since a stamped header that disagrees with the frames is
+    worse than an unstamped one.
+    """
+    if steps_per_frame <= 0:
+        return False           # one frame, or a stalled clock: no axis to state
+    ps_per_step = time_per_frame / steps_per_frame
+    if abs(step0 * ps_per_step - time0) > tolerance * max(abs(time0), 1.0):
+        raise ValueError(
+            f'{traj_fn} cannot carry this axis: frame 0 is at step {step0} and '
+            f'{time0} ps, but {steps_per_frame} steps per {time_per_frame} ps '
+            f'puts step {step0} at {step0 * ps_per_step} ps. A DCD states time '
+            'as step*delta and has nowhere to put the difference.')
+    with open(traj_fn, 'r+b') as fh:
+        fh.seek(istart_offset)
+        fh.write(struct.pack('<i', int(step0)))
+        fh.seek(nsavc_offset)
+        fh.write(struct.pack('<i', int(steps_per_frame)))
+        fh.seek(delta_offset)
+        fh.write(struct.pack('<f', ps_per_step / akma_ps))
+    return True
+
 # What frame_timing answers for. dcd_frame_timing is deliberately not wired in
 # here: what a caller does with an answer is hand a step and a time to a writer,
 # and loos.DCDWriter.writeFrame takes a group and nothing else, so a DCD's
