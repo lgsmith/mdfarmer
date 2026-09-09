@@ -71,7 +71,7 @@ the code, and no performance work belongs in this example.
 One conda environment for mdfarmer, and GROMACS from somewhere else entirely:
 
 ```bash
-mamba create -n mdfarmer -c conda-forge python=3.12 openmm loos mdtraj
+mamba create -n mdfarmer -c conda-forge python=3.12 loos mdtraj
 mamba activate mdfarmer
 pip install -e /path/to/mdfarmer      # editable: this checkout is what runs
 ```
@@ -79,11 +79,12 @@ pip install -e /path/to/mdfarmer      # editable: this checkout is what runs
 No `gromacs` in that list: `gmx` reaches the compute node through `ENV_SETUP`,
 which the job script sources there, and the tender never runs MD itself.
 
-`openmm` is in it even though this arm never uses OpenMM to simulate.
-`utilities.py` imports it at module scope — for serialised-state reading and
-platform inspection — so `import mdfarmer` needs it whichever engine you run.
-Making that import lazy would let a GROMACS-only site skip it; until then it is
-a real dependency and saying otherwise would strand someone at `--check`.
+No `openmm` either. This arm never uses OpenMM to simulate, and it no longer
+needs it to import: the handful of helpers that read a serialised state or
+inspect a platform ask for OpenMM when they are called, so `import mdfarmer`
+and a whole GROMACS campaign run without one installed. Call an OpenMM-only
+entry point on this environment and it raises an ImportError naming the package
+rather than failing somewhere further in.
 
 `loos` and `mdtraj` are both needed, because the harvest picks between them per
 trajectory: LOOS for a rectangular box, mdtraj for a triclinic one it cannot
