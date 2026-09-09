@@ -32,7 +32,32 @@ TRAJ_TOP = HERE / 'data' / PROJECT
 # in the right environment, so its own python is the honest default; --python
 # overrides it when the node needs a different one.
 PYTHON_CMD = sys.executable
-GMX_BIN = 'gmx_mpi'              # what ENV_SETUP's module puts on PATH
+# Every CUDA GROMACS in this module tree is an MPI build, and such a binary
+# calls MPI_Init even for grompp -- unconditionally, from main(), before any
+# subcommand is dispatched. Inside a Slurm step that init finds SLURM_STEP_ID,
+# looks for a PMIx server a plain batch step does not run, and aborts before
+# any MD. Measured here: SLURM_STEP_ID alone is the trigger, and removing it
+# alone is the cure.
+#
+# So the binary runs with those variables taken out of its environment. `env`
+# execs rather than forks, so the process mdfarmer waits on IS gmx_mpi and the
+# preemption SIGTERM reaches GROMACS itself -- which mpirun -n 1, the other way
+# to satisfy this MPI, would put a launcher in front of. The PMIX_/PMI_ entries
+# are insurance for a step launched by another PMI plugin.
+#
+# A site with a thread-MPI gmx wants the bare string instead:
+#
+#     GMX_BIN = 'gmx'
+#
+# which is the default, and is why nothing in mdfarmer knows what any of this
+# is: gmx_bin is a command vector, and what goes in it is the site's business.
+GMX_SCRUB = ['env',
+             '-u', 'SLURM_STEP_ID', '-u', 'SLURM_STEPID',
+             '-u', 'PMIX_NAMESPACE', '-u', 'PMIX_RANK',
+             '-u', 'PMIX_SERVER_URI41', '-u', 'PMIX_SERVER_URI3',
+             '-u', 'PMI_FD', '-u', 'PMI_RANK', '-u', 'PMI_SIZE']
+GMX_BINARY = 'gmx_mpi'           # the binary itself, for the job's guard
+GMX_BIN = [*GMX_SCRUB, GMX_BINARY]
 
 # Loaded inside the job, since a compute node inherits no module environment
 # worth relying on. gmx_pack probes for -ntmpi rather than assuming it, so an
@@ -84,7 +109,16 @@ WALLTIME = '00:20:00'
 MAXH = 0.25                      # 15 min, comfortably inside the 20 min block
 PARTITION = 'gpu'
 QOS = ''
-GRES = 'gpu:rtx_pro_6000_blackwell:1'
+# NOT the Blackwell card the OpenMM arm uses. This GROMACS module is built
+# --generate-code code=sm_70;sm_80;sm_90 with no code=compute_XX among them,
+# so it embeds no PTX and cannot JIT for an architecture it was not built for.
+# A cubin runs only within its own major arch, and RTX PRO 6000 Blackwell is
+# sm_120, so mdrun would fail there with "no kernel image is available" -- and
+# only once it reached the GPU, after grompp had already succeeded. The A100 is
+# sm_80 and covered; h100_pcie (sm_90) is the other option on this partition.
+# OpenMM is unaffected and keeps the Blackwell card: it compiles its kernels at
+# runtime rather than shipping cubins.
+GRES = 'gpu:a100-sxm4-80gb:1'
 EXTRA_SBATCH = ''
 HARVEST_PARTITION = 'ccb'        # harvesting is CPU-only
 HARVEST_TIME = '00:30:00'
@@ -135,7 +169,9 @@ echo "DATE: $(date -Is)"
 printf '%s\\t%s\\t%s\\n' "$(date -Is)" "$SLURM_JOB_ID" "$SLURMD_NODENAME" >> node_history.tsv
 
 {env_setup}
-command -v {gmx_bin} >/dev/null || {{ echo "MISSING {gmx_bin} after env setup"; exit 1; }}
+for cmd in {gmx_check}; do
+  command -v "$cmd" >/dev/null || {{ echo "MISSING $cmd after env setup"; exit 1; }}
+done
 
 # Per-job MPS daemon, keyed on the job id so two packed jobs on one node never
 # share or clobber each other's. Without it the replicas time-slice the card.
@@ -270,12 +306,17 @@ def build_harvester(paths, steps_per_gen=STEPS_PER_GEN,
 
 def scheduler_kws(partition=PARTITION, qos=QOS, gres=GRES, mem=MEM,
                   walltime=WALLTIME, cpus=PACK_CPUS, extra_sbatch=EXTRA_SBATCH,
-                  python=PYTHON_CMD, gmx_bin=GMX_BIN, env_setup=ENV_SETUP):
+                  python=PYTHON_CMD, gmx_bin=GMX_BIN, env_setup=ENV_SETUP,
+                  gmx_binary=GMX_BINARY):
+    # The guard checks the binary by name, so a command vector cannot reach the
+    # shell as a python list -- which would fail every job at the guard.
+    checks = [gmx_binary]
     return dict(
         partition=partition, gres=gres, cpus=cpus, mem=mem, walltime=walltime,
         qos_line=(f'#SBATCH -q {qos}\n' if qos else ''),
         extra_sbatch=(extra_sbatch + '\n' if extra_sbatch else ''),
         exclude_nodes='', python=python, gmx_bin=gmx_bin,
+        gmx_check=' '.join(checks),
         env_setup=env_setup, run_script_name='run.py')
 
 
@@ -336,9 +377,12 @@ def report_readiness(steps_per_gen=STEPS_PER_GEN,
           f'{reps_per_pack} x {n_gens} gens, {active_packs} packs at once')
     print(f'  {steps_per_gen:,} steps/gen ({steps_per_gen * dt_ps:g} ps), '
           f'{frames} new frames at {write_interval * dt_ps:g} ps '
-          f'({frames + 1} on disk after gen 0, seam included), '
+          f'({frames + 1} on disk every gen, the seam included), '
           f'wet every {downsample_frq} -> {write_interval * dt_ps * downsample_frq:g} ps')
-    print(f'  {n_gens * frames} dry frames per clone over '
+    # One more than the generations contribute between them: GROMACS writes a
+    # frame at the step it restarts from, so generation 0's own first frame --
+    # the seed state, at step 0 -- is a frame no later generation repeats.
+    print(f'  {n_gens * frames + 1} dry frames per clone over '
           f'{n_gens * steps_per_gen * dt_ps:g} ps')
     print(f'  {pack_cpus} cores/pack, {pack_cpus // reps_per_pack} per '
           f'replica, -update {UPDATE_MODE}')

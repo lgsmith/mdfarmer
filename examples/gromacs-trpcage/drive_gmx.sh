@@ -38,6 +38,9 @@ RUN_PY=(python -u)               # what activate_env leaves on PATH
 # ones for every job it submits.
 GMX_MODULES='modules/2.4-20250724 openmpi/cuda-4.1.8 gromacs/mpi-2024.4'
 GMX_BIN='gmx_mpi'
+# Whether farmer.py runs that binary with a scrubbed environment. Kept in step
+# with its GMX_SCRUB by hand; the check below is what catches them disagreeing.
+GMX_SCRUBBED=1
 
 GAP="${GAP:-60}"                     # seconds before re-entering a failed tender
 MIN_RUN_S=60                         # a shorter run is a broken setup, not a hiccup
@@ -104,6 +107,22 @@ gmx_reachable() {
 }
 
 
+# Whether $GMX_BIN survives being run with a scheduler's environment around it.
+# An MPI-built gmx calls MPI_Init even for grompp, and an OpenMPI without
+# Slurm PMI support aborts on sight of these -- so a campaign whose binary
+# needs a launcher and has none dies at the first grompp, on every job, having
+# already submitted them all. The variables below are the ones that reproduce
+# it here; a login node has none of them, which is why this has to fake them.
+gmx_survives_scheduler_env() {
+    ( set +u +e
+      source /etc/profile.d/modules.sh
+      module load $GMX_MODULES
+      env SLURM_JOBID=1 SLURM_JOB_ID=1 SLURM_STEP_ID=0 SLURM_STEPID=0 \
+          SLURM_NODELIST="$(hostname)" SLURM_JOB_NUM_NODES=1 SLURM_NTASKS=1 \
+          "$GMX_BIN" -version ) >/dev/null 2>&1
+}
+
+
 preflight() {
     if ! command -v sbatch >/dev/null; then
         echo "no sbatch on PATH; run this where jobs can be submitted" >&2
@@ -112,6 +131,18 @@ preflight() {
     if ! gmx_reachable; then
         echo "no $GMX_BIN after 'module load $GMX_MODULES';" >&2
         echo "every generation would fail on the node. Fix ENV_SETUP in farmer.py." >&2
+        exit 1
+    fi
+    if gmx_survives_scheduler_env; then
+        if [ "$GMX_SCRUBBED" = 1 ]; then
+            echo "note: $GMX_BIN runs fine under a scheduler environment, so the" >&2
+            echo "  scrub in farmer.py's GMX_SCRUB may no longer be needed." >&2
+        fi
+    elif [ "$GMX_SCRUBBED" != 1 ]; then
+        echo "$GMX_BIN aborts when a scheduler's environment is present, and" >&2
+        echo "farmer.py runs it with that environment intact: every generation" >&2
+        echo "would die at grompp before any MD. Set GMX_SCRUB in farmer.py to" >&2
+        echo "drop SLURM_STEP_ID, or use a thread-MPI gmx." >&2
         exit 1
     fi
     activate_env
