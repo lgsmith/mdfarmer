@@ -1,12 +1,35 @@
 import subprocess as sp
+import sys
 import traceback
 from . import utilities as util
 from pathlib import Path
 from . import seeder
-from . import simulate as sims
 from . import gmx_simulate as gmx
 from . import gmx_pack
 import time
+
+# The OpenMM runner's module, held as a name so asking whether a runner came
+# from it does not import it. OpenMM is optional; GROMACS is a subprocess.
+OMM_MODULE_NAME = f'{__package__}.simulate'
+
+
+def omm_generation_runner(module_name=OMM_MODULE_NAME):
+    """simulate.omm_generation, importing the OpenMM runner only when asked."""
+    __import__(module_name)
+    return sys.modules[module_name].omm_generation
+
+
+def is_omm_generation(runner, module_name=OMM_MODULE_NAME):
+    """Whether runner is the OpenMM runner, without importing it to find out.
+
+    Nothing can be holding simulate.omm_generation unless simulate has already
+    been imported, so an unimported module answers no and a GROMACS-only
+    campaign never reaches OpenMM through this test.
+    """
+    simulate = sys.modules.get(module_name)
+    if simulate is None:
+        return False
+    return runner is simulate.omm_generation
 
 # Stands in for a seed index that runs off the end of one of the input lists.
 MISSING_ENTRY = '<no entry>'
@@ -305,7 +328,11 @@ class Farmer:
 
         A hand-supplied set that disagrees with runner is refused rather than
         half applied: the engine that runs is the one named in the run script.
+        runner None means the OpenMM runner, imported at that point rather than
+        at module scope so a GROMACS campaign never needs OpenMM installed.
         """
+        if runner is None:
+            runner = omm_generation_runner()
         self.runner = runner
         self.run_script = run_script
         self.recover_fn = recover_fn
@@ -322,7 +349,7 @@ class Farmer:
             if custom:
                 print(f'NOTE: runner=gmx_generation with custom {custom}; '
                       'make sure they implement the GROMACS contract.')
-        elif self.runner is sims.omm_generation:
+        elif is_omm_generation(self.runner):
             gmx_pieces = (gmx.default_gmx_run_script, gmx.gmx_try_recover_gen,
                           gmx.gmx_gen_progress)
             for name in ('run_script', 'recover_fn', 'progress_fn'):
@@ -425,7 +452,8 @@ class Farmer:
                      '{gen_index}'),
                  overwrite=False,
                  harvester=None,
-                 runner=sims.omm_generation,
+                 # The engine. None -> the OpenMM runner, imported on demand.
+                 runner=None,
                  # run.py body for each gen dir. None -> runner's own default.
                  run_script=None,
                  # Disk-recovery classifier. None -> runner's own default.

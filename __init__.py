@@ -6,8 +6,18 @@ from .harvester import (Harvester, HarvestError, harvest_generation,
                         classify_gen_dir, classify_campaign, format_report,
                         harvest_recovered, completion_witness)
 from .farmer import *
+from . import utilities
 from .utilities import *
-from .simulate import *
+# The OpenMM runner is imported only where OpenMM is: a GROMACS campaign drives
+# gmx as a subprocess, so a GROMACS-only site must not need OpenMM to import
+# this package. Absent, the two OpenMM entry points are still exported, as
+# stubs that say what to install when they are called.
+if utilities.openmm_available():
+    from .simulate import *
+else:
+    omm_generation = utilities.missing_openmm('omm_generation')
+    omm_basic_sim_block_json = utilities.missing_openmm(
+        'omm_basic_sim_block_json')
 from .seeder import *
 # GROMACS runner imported by name (not *) so its module-local Preempted does
 # not shadow simulate.Preempted in the package namespace.
@@ -53,3 +63,15 @@ __all__ = ['fdir', 'dir_seeds_clones', 'dir_seeds_clones_gens', 'omm_generation'
            'write_pack_manifest', 'default_gmx_pack_run_script',
            'ClonePack', 'basic_scheduler_fstrings_mps',
            'missing_seed_inputs', 'ready_seed_count', 'check_seed_map']
+
+
+def __getattr__(name):
+    """Names that exist only with OpenMM installed, refused by name.
+
+    mdfarmer.simulate is the OpenMM runner module and is not imported without
+    OpenMM, so asking for it raises an ImportError naming the missing package
+    rather than a bare AttributeError about the package.
+    """
+    if name == 'simulate':
+        utilities.require_openmm('mdfarmer.simulate')
+    raise AttributeError(f'module {__name__!r} has no attribute {name!r}')
