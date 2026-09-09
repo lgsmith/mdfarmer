@@ -167,7 +167,9 @@ process dies, however it dies, so there is no stale pid file to reason about.
 `sbatch` failure, and a fresh tender rebuilds every pack from disk and re-adopts
 the job ids still running, so re-entering is the recovery. The loop does that
 every 60 s (`GAP`) until the driver exits 0, which happens only when every clone
-has finished. Three exits inside a minute in a row is a broken setup rather than
+has finished. It re-enters on exit 1 and not on exit 2: the driver reports
+"asked to stop" and "died" as different statuses, so the loop reads the status
+and forms no opinion about the brake file itself. Three exits inside a minute in a row is a broken setup rather than
 a scheduler hiccup, and the loop says so and gives up.
 
 Before it detaches, the script checks that `sbatch` and an importable
