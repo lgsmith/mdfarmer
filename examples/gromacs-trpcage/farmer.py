@@ -32,6 +32,11 @@ TRAJ_TOP = HERE / 'data' / PROJECT
 # in the right environment, so its own python is the honest default; --python
 # overrides it when the node needs a different one.
 PYTHON_CMD = sys.executable
+
+# Whose presence stops the tender, and the status it exits with when it does.
+# Distinct from 1 so the launching shell can tell "asked to stop" from "died".
+BRAKE_FILE = mdf.farmer.BRAKE_FILE
+BRAKED_EXIT = 2
 # Every CUDA GROMACS in this module tree is an MPI build, and such a binary
 # calls MPI_Init even for grompp -- unconditionally, from main(), before any
 # subcommand is dispatched. Inside a Slurm step that init finds SLURM_STEP_ID,
@@ -409,6 +414,10 @@ def main():
     ap.add_argument('--write-interval', type=int, default=WRITE_INTERVAL)
     ap.add_argument('--traj-top', default=str(TRAJ_TOP))
     ap.add_argument('--update-interval', type=int, default=UPDATE_INTERVAL)
+    ap.add_argument('--brake-file', default=BRAKE_FILE,
+                    help='stop at the next tick once this file exists '
+                         f'(default: {BRAKE_FILE}, relative to the working '
+                         'directory the tender was started in)')
     ap.add_argument('--python', default=PYTHON_CMD,
                     help='interpreter a compute node runs a generation with '
                          f'(default: this tender\'s own, {PYTHON_CMD})')
@@ -433,10 +442,14 @@ def main():
                           write_interval=args.write_interval,
                           harvest=not args.no_harvest, dry_run=args.dry_run,
                           python=args.python)
-    finished = farmer.start_tending_fields(update_interval=args.update_interval)
-    # The exit status a re-entering tender loop reads: 0 only when every clone
-    # finished, so a braked or failed run is re-entered rather than called done.
-    raise SystemExit(0 if finished else 1)
+    finished = farmer.start_tending_fields(update_interval=args.update_interval,
+                                           brake_file=args.brake_file)
+    # Three outcomes, three statuses, so the shell that launched this needs no
+    # opinion about brake files: 0 every clone finished, BRAKED_EXIT someone
+    # asked it to stop, 1 something went wrong and re-entering is the recovery.
+    if finished:
+        raise SystemExit(0)
+    raise SystemExit(BRAKED_EXIT if Path(args.brake_file).is_file() else 1)
 
 
 if __name__ == '__main__':

@@ -26,6 +26,7 @@ CAMPAIGN="$HERE/data/$PROJECT"       # farmer.py's TRAJ_TOP
 LOG="$HERE/$PROJECT.tend.out"
 LOCK="$CAMPAIGN/tender.lock"         # one tender per campaign, held while it runs
 STOP="$HERE/stop"                    # Farmer brakes on ./stop in its cwd
+BRAKED_EXIT=2                        # farmer.py's status for "asked to stop"
 
 # The environment holding mdfarmer and its engine. Named, not hard-coded: this
 # example is meant to be run by someone whose env is not called what mine is.
@@ -210,7 +211,7 @@ tender_loop() {
     activate_env
     printf 'pid %s on %s since %s\n' "$$" "$(hostname)" "$(date -Is)" >"$LOCK"
     local fast_exits=0 started status
-    while [ ! -e "$STOP" ]; do
+    while true; do
         echo "=== tender starting $(date -Is): ${RUN_PY[*]} farmer.py $* ==="
         started=$SECONDS
         status=0
@@ -220,7 +221,10 @@ tender_loop() {
             echo "=== every clone finished; not re-entering ==="
             break
         fi
-        if [ -e "$STOP" ]; then
+        # The tender distinguishes "asked to stop" from "died", so this loop
+        # reads its status and forms no opinion about the brake file itself.
+        if [ "$status" -eq "$BRAKED_EXIT" ]; then
+            echo "=== tender was braked; not re-entering ==="
             break
         fi
         if [ $((SECONDS - started)) -lt "$MIN_RUN_S" ]; then
@@ -236,9 +240,6 @@ tender_loop() {
         echo "=== re-entering in ${GAP}s ==="
         sleep "$GAP"
     done
-    if [ -e "$STOP" ]; then
-        echo "=== brake file $STOP is present; loop done $(date -Is) ==="
-    fi
     echo "=== jobs already submitted keep running; squeue -u \$USER to see them ==="
 }
 

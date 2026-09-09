@@ -818,8 +818,14 @@ class Farmer:
                 'No clones could be set up; nothing to tend. Check the '
                 'per-clone setup errors printed above (missing structure, '
                 'topology, .mdp, or an unreadable checkpoint).')
-        still_running = self.launch(update_jids=False)
         brake_file_p = Path(brake_file)
+        # Before the first launch, not only between ticks: a brake already in
+        # place means stop, not submit one full round and then stop.
+        if brake_file_p.is_file():
+            print(f'Brake file present at start: {brake_file_p.resolve()} '
+                  'Submitting nothing.', flush=True)
+            return False
+        still_running = self.launch(update_jids=False)
         print('still_running:', *still_running, flush=True)
         # If dry run, short circuit the tending loop.
         if self.dry_run:
