@@ -232,10 +232,24 @@ def main():
                     and '*.tend.out' in gitignore)
         suite.check(f'{script_name} detaches, so the tender outlives the shell',
                     'setsid nohup bash "$SELF" --loop' in text)
-        # The loop stops re-entering on exit 0 and on nothing else.
-        suite.check(f'{arm}: the driver reports completion in its exit status',
-                    'raise SystemExit(0 if finished else 1)'
-                    in (EXAMPLES / arm / 'farmer.py').read_text())
+        # Three outcomes, three statuses: 0 finished, BRAKED_EXIT asked to
+        # stop, 1 died. The loop re-enters on 1 alone.
+        farmer_text = (EXAMPLES / arm / 'farmer.py').read_text()
+        suite.check(f'{arm}: the driver exits 0 only when every clone finished',
+                    'raise SystemExit(0)' in farmer_text)
+        suite.check(f'{arm}: and separates being braked from having died',
+                    'SystemExit(BRAKED_EXIT if' in farmer_text)
+        py_braked = re.search(r'^BRAKED_EXIT = (\d+)', farmer_text, re.M)
+        sh_braked = re.search(r'^BRAKED_EXIT=(\d+)', text, re.M)
+        # A disagreement here would re-enter a braked campaign forever.
+        suite.check(f'{script_name} stops on the same status the driver exits',
+                    py_braked and sh_braked
+                    and py_braked.group(1) == sh_braked.group(1),
+                    f'-> py={py_braked and py_braked.group(1)} '
+                    f'sh={sh_braked and sh_braked.group(1)}')
+        suite.check(f'{script_name} re-enters on a death and not on a brake',
+                    '"$status" -eq "$BRAKED_EXIT"' in text
+                    and 'not re-entering' in text)
     gmx_modules = re.search(
         r"GMX_MODULES='([^']*)'",
         (EXAMPLES / 'gromacs-trpcage' / 'drive_gmx.sh').read_text()).group(1)
