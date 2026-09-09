@@ -156,6 +156,45 @@ generations 0 through 8. A clone retires once it has finished the last of them.
 > does not cancel it — mdfarmer never runs `scancel` — so check for those
 > directories before you restart, and harvest or cancel them yourself.
 
+### Naming the gmx binary
+
+`gmx_bin` is the command that runs GROMACS, and it takes either form:
+
+```python
+gmx_bin='gmx'                                  # the default: one word, never split
+gmx_bin='/opt/my gromacs/bin/gmx'              # still one word -- a space is not a separator
+gmx_bin=['env', '-u', 'SLURM_STEP_ID', 'gmx_mpi']   # a whole command vector
+```
+
+Whatever it holds leads the argv of every gmx the runner issues — `grompp`,
+`mdrun`, `convert-tpr`, `dump` — and of the `-version` probe `gmx_pack` uses to
+decide whether `-ntmpi` is legal. It round-trips through each generation's
+`config.json` as a JSON array, which is how a packed job recovers it from its
+first member's config.
+
+Most sites want the bare string. The vector is for a site whose GROMACS cannot
+be run by naming it: the usual case is an MPI-only build, which calls
+`MPI_Init` from `main()` even for `grompp`, and aborts under a scheduler unless
+its environment matches the way it thinks it was launched. `examples/gromacs-trpcage/farmer.py`
+carries a worked instance — every CUDA GROMACS in that module tree is an MPI
+build, and `SLURM_STEP_ID` in a plain batch step is enough to kill `grompp`:
+
+```python
+GMX_SCRUB = ['env', '-u', 'SLURM_STEP_ID', '-u', 'SLURM_STEPID', ...]
+GMX_BINARY = 'gmx_mpi'
+GMX_BIN = [*GMX_SCRUB, GMX_BINARY]
+```
+
+Prefer a vector that **execs** the binary (`env`) over one that launches it
+(`mpirun -n 1`): then the process mdfarmer waits on is GROMACS itself, so the
+preemption SIGTERM reaches it rather than a launcher, and nothing imposes an
+affinity that would fight `mdrun -pin on -pinoffset`. If a job script of yours
+greps for the binary, pass its bare name separately — a list interpolated into
+a shell is not a command.
+
+Nothing in mdfarmer knows what a launcher is for. Whether one is needed, and
+which, is the site's business and belongs beside its module load.
+
 ### Packing replicas onto one GPU
 
 Where Slurm exposes only a `gpu` gres — no `mps`, no `shard` — it cannot
