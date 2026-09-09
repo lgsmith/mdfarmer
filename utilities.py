@@ -30,6 +30,11 @@ and state_xml_step_count are here to find the step, and truncate_traj_to_nframes
 to trim to it. It trims a .dcd, an .xtc or an .h5 alike, in place and from what
 the file really holds rather than from the count it claims, since a kill leaves
 none of the three counting honestly.
+
+OpenMM. It is optional here. A GROMACS campaign reaches its engine as a
+subprocess and imports nothing from it, so nothing in this module may import
+OpenMM at module scope; the handful of helpers that genuinely need it ask
+require_openmm for it and fail by name when it is absent.
 """
 
 import inspect
@@ -38,34 +43,99 @@ import os
 import struct
 from pathlib import Path
 import subprocess as sp
-import openmm as mm
-from openmm import app
 
 
-openmm_topology_readers = {
-    '.top': app.GromacsTopFile,
-    '.prmtop': app.AmberPrmtopFile,
-    '.psf': app.CharmmPsfFile,
-    '.pdb': app.PDBFile,
-    '.cif': app.PDBxFile,
-    '.pdbx': app.PDBxFile,
-}
+# How to get an OpenMM, said once so every OpenMM-only failure says the same.
+OPENMM_INSTALL_HINT = ('install it into this environment, e.g. '
+                       '`mamba install -c conda-forge openmm`')
 
 
-def read_openmm_top(top_fn):
+def require_openmm(what, hint=OPENMM_INSTALL_HINT):
+    """(openmm, openmm.app), or an ImportError naming what could not run.
+
+    OpenMM is an optional dependency. GROMACS is driven as a subprocess and is
+    never imported, so a site that runs only GROMACS campaigns must be able to
+    import the package without an OpenMM at all. Every OpenMM-only entry point
+    asks for the modules here, so a missing install is reported as itself
+    rather than as an AttributeError somewhere further in.
+    """
+    try:
+        import openmm as mm
+        from openmm import app
+    except ImportError as exc:
+        raise ImportError(f'{what} needs OpenMM, which is not importable in '
+                          f'this environment; {hint}.') from exc
+    return mm, app
+
+
+def openmm_available(hint=OPENMM_INSTALL_HINT):
+    """Whether OpenMM can be imported, answered without raising."""
+    try:
+        require_openmm('openmm_available', hint=hint)
+    except ImportError:
+        return False
+    return True
+
+
+def missing_openmm(name, hint=OPENMM_INSTALL_HINT):
+    """A stand-in for an OpenMM-only entry point, raising when it is called.
+
+    The package exports the name either way, so `from mdfarmer import *` and
+    __all__ mean the same thing on both kinds of site, and calling the stub
+    says what to install instead of failing as a missing attribute.
+    """
+    def stub(*args, **kwargs):
+        require_openmm(name, hint=hint)
+    stub.__name__ = name
+    stub.__doc__ = f'{name} is unavailable here: OpenMM is not installed.'
+    return stub
+
+
+def _topology_readers(what='read_openmm_top'):
+    """suffix -> the openmm.app class that reads it, built on first use.
+
+    The table cannot sit at module scope, since naming the classes imports
+    OpenMM. It is cached in the module afterwards so a caller that registers a
+    reader registers it in the table every other caller reads.
+    """
+    readers = globals().get('openmm_topology_readers')
+    if readers is None:
+        _, app = require_openmm(what)
+        readers = {
+            '.top': app.GromacsTopFile,
+            '.prmtop': app.AmberPrmtopFile,
+            '.psf': app.CharmmPsfFile,
+            '.pdb': app.PDBFile,
+            '.cif': app.PDBxFile,
+            '.pdbx': app.PDBxFile,
+        }
+        globals()['openmm_topology_readers'] = readers
+    return readers
+
+
+def __getattr__(name):
+    """Module attributes that exist only once OpenMM has been imported."""
+    if name == 'openmm_topology_readers':
+        return _topology_readers(what=name)
+    raise AttributeError(f'module {__name__!r} has no attribute {name!r}')
+
+
+def read_openmm_top(top_fn, readers=None):
     """The OpenMM Topology in a structure file, using the reader its suffix names.
 
     Only the suffix lookup is guarded: a reader raises a KeyError of its own for
     an atom type it was never given, and calling that an unsupported format
     would send the user after the wrong problem.
     """
+    if readers is None:
+        readers = _topology_readers()
     top_p = Path(top_fn)
     try:
-        reader = openmm_topology_readers[top_p.suffix]
+        reader = readers[top_p.suffix]
     except KeyError:
         raise ValueError(
             f'No topology reader for {top_p.suffix!r}. Choices are: '
-            f'{", ".join(openmm_topology_readers)}') from None
+            f'{", ".join(readers)}') from None
     return reader(top_fn).topology
 
 
@@ -915,6 +985,7 @@ def select_platform(platform_name=None, platform_properties=None):
     Properties the chosen platform does not expose are dropped, so a request
     like {'Precision': 'mixed'} can be left in a config that also runs on CPU.
     """
+    mm, _ = require_openmm('select_platform')
     if platform_name is not None:
         platform = mm.Platform.getPlatformByName(platform_name)
     else:
@@ -953,6 +1024,13 @@ def select_platform(platform_name=None, platform_properties=None):
 def is_state_xml_usable(p: Path) -> bool:
     """Whether this state.xml can be deserialized, so a gen can resume from it."""
     if not p.is_file() or p.stat().st_size == 0:
+        return False
+    try:
+        mm, _ = require_openmm('is_state_xml_usable')
+    except ImportError as exc:
+        # Nothing here could resume from it either way, but say which of the
+        # two reasons it is, rather than implying the file is broken.
+        print(f'is_state_xml_usable: {exc} Treating {p} as unusable.')
         return False
     try:
         mm.XmlSerializer.deserialize(p.read_text())
