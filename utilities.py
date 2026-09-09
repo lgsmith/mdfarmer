@@ -198,11 +198,16 @@ def dcd_frame_timing(traj_fn, n_frames=None, akma_ps=DCD_AKMA_PICOSECONDS):
     units and the recovery path still has to add the earlier generations' steps
     itself.
 
-    None when nothing filled the header in. mdtraj's DCD writer, which is what
-    writes a reimaged or harvested DCD, leaves istart 0, nsavc 1 and delta 1,
-    placing frame 0 at step 0 -- a frame no reporter ever writes, since a
-    reporter's first comes one interval in. Handing that back as a time axis
-    would be a fabrication, so the caller is told there is none.
+    None when a field is zero or negative, which is what mdtraj's DCD writer
+    leaves: istart 0, placing frame 0 at a step no reporter writes, since a
+    reporter's first comes one interval in. Handing that back would be a
+    fabrication, so the caller is told there is none.
+
+    LOOS is not caught by that and cannot be. DCDWriter::writeHeader hardcodes
+    istart and nsavc to 1 and defaults delta to 0.001, all positive and all
+    fiction -- frame k at step k+1, 4.9e-5 ps apart. Nothing in the header says
+    which of the two wrote it, so a rewritten DCD has its real axis stamped back
+    by stamp_dcd_timing rather than being detected here after the fact.
 
     n_frames is accepted and ignored: one linear rule covers every frame, so
     there is no last frame that could disagree with the first two.
@@ -215,13 +220,72 @@ def dcd_frame_timing(traj_fn, n_frames=None, akma_ps=DCD_AKMA_PICOSECONDS):
     return istart, nsavc, istart * ps_per_step, nsavc * ps_per_step
 
 
-# What frame_timing answers for. dcd_frame_timing is deliberately not wired in
-# here: what a caller does with an answer is hand a step and a time to a writer,
-# and loos.DCDWriter.writeFrame takes a group and nothing else, so a DCD's
-# reconstructed timing would only make harvester and reimage raise TypeError on
-# the format they can already read. Ask dcd_frame_timing directly until those
-# two branch on what the output writer accepts rather than on this being None.
-_FRAME_TIMING = {'.xtc': _xtc_frame_timing}
+
+# Where a DCD keeps its timing: istart and nsavc are int32s in the 80-byte
+# control block, delta a float32 nine words further in.
+DCD_ISTART_OFFSET = 12
+DCD_NSAVC_OFFSET = 16
+DCD_DELTA_OFFSET = 44
+
+# How far a stamped time axis may drift from the source's before it is a
+# different axis rather than a rounded one.
+DCD_TIME_TOLERANCE = 1e-5
+
+
+def stamp_dcd_timing(traj_fn, step0, steps_per_frame, time0, time_per_frame,
+                     istart_offset=DCD_ISTART_OFFSET,
+                     nsavc_offset=DCD_NSAVC_OFFSET,
+                     delta_offset=DCD_DELTA_OFFSET,
+                     akma_ps=DCD_AKMA_PICOSECONDS,
+                     tolerance=DCD_TIME_TOLERANCE):
+    """Put a step and time axis into a finished DCD's header. True if stamped.
+
+    Neither writer used here fills one in. LOOS hardcodes istart and nsavc to 1
+    in DCDWriter::writeHeader, and mdtraj's DCD writer takes no timing at all,
+    so a rewritten DCD claims frame k sits at step k+1 whatever the source said.
+    The axis has to be written back afterwards, which is safe because a DCD
+    keeps it in the header rather than on the frames.
+
+    A DCD can only say `frame k is at step istart + k*nsavc, at time
+    (istart + k*nsavc)*delta`: one line through the origin, with no independent
+    time offset. An axis that does not fit that form raises rather than being
+    rounded into one, since a stamped header that disagrees with the frames is
+    worse than an unstamped one.
+    """
+    if steps_per_frame <= 0:
+        return False           # one frame, or a stalled clock: no axis to state
+    ps_per_step = time_per_frame / steps_per_frame
+    if abs(step0 * ps_per_step - time0) > tolerance * max(abs(time0), 1.0):
+        raise ValueError(
+            f'{traj_fn} cannot carry this axis: frame 0 is at step {step0} and '
+            f'{time0} ps, but {steps_per_frame} steps per {time_per_frame} ps '
+            f'puts step {step0} at {step0 * ps_per_step} ps. A DCD states time '
+            'as step*delta and has nowhere to put the difference.')
+    with open(traj_fn, 'r+b') as fh:
+        fh.seek(istart_offset)
+        fh.write(struct.pack('<i', int(step0)))
+        fh.seek(nsavc_offset)
+        fh.write(struct.pack('<i', int(steps_per_frame)))
+        fh.seek(delta_offset)
+        fh.write(struct.pack('<f', ps_per_step / akma_ps))
+    return True
+
+# Formats whose frames each carry their own time, and so can be checked one by
+# one against a reconstruction. A DCD states one rule in its header instead, and
+# mdtraj's reader answers with the frame index rather than that rule -- so
+# comparing against it measures mdtraj's placeholder, not the trajectory.
+PER_FRAME_TIME_SUFFIXES = ('.xtc',)
+
+
+def stamps_time_per_frame(traj_fn, suffixes=PER_FRAME_TIME_SUFFIXES):
+    """Whether this format writes a time onto every frame."""
+    return Path(traj_fn).suffix.lower() in suffixes
+
+
+# What frame_timing answers for. A DCD is read here but not written through a
+# frame's arguments: no DCD writer in reach takes any, so a caller carries a
+# DCD's axis forward with stamp_dcd_timing once the file is closed.
+_FRAME_TIMING = {'.xtc': _xtc_frame_timing, '.dcd': dcd_frame_timing}
 
 
 def frame_timing(traj_fn, n_frames=None, backends=_FRAME_TIMING):
@@ -233,11 +297,15 @@ def frame_timing(traj_fn, n_frames=None, backends=_FRAME_TIMING):
     the step. Anything that rewrites a trajectory has to read these and pass
     them back in.
 
-    Only an .xtc answers. A DCD's timing is recoverable, but from its header
-    rather than its frames, and dcd_frame_timing is where to ask for it. An
-    .h5 has no answer to give at all: an mdtraj HDF5 file records a time per
-    frame and no step whatsoever, and half an axis would put a fabricated step
-    counter into whatever was written from it.
+    An .xtc answers from its frames, a DCD from its header -- and a DCD answers
+    None when nothing filled that header in, which is what a DCD written by
+    LOOS or mdtraj looks like. An .h5 has no answer to give at all: an mdtraj
+    HDF5 file records a time per frame and no step whatsoever, and half an axis
+    would put a fabricated step counter into whatever was written from it.
+
+    Where the answer goes depends on the format written, not the one read. An
+    .xtc stamps each frame as it is written; a DCD keeps one rule in its header,
+    so stamp_dcd_timing puts it there after the writer has closed.
     """
     backend = backends.get(Path(traj_fn).suffix.lower())
     if backend is None:

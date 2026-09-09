@@ -351,6 +351,7 @@ def _harvest_loos(traj_fn, structure_fn, subset_spec, dry_out, down_out,
 
     dry_writer = reimage._loos_writer(Path(dry_out))
     down_writer = reimage._loos_writer(Path(down_out))
+    dry_axis, down_axis = reimage.WrittenAxis(), reimage.WrittenAxis()
     traj = pyloos.Trajectory(str(traj_fn), model)
     n_orig = n_dry = n_down = 0
     for local, _ in enumerate(traj):
@@ -360,7 +361,7 @@ def _harvest_loos(traj_fn, structure_fn, subset_spec, dry_out, down_out,
         if not (dry or down):
             continue
         if timing is None:
-            # No per-frame timing to carry (DCD); let the writer count.
+            # Nothing to carry: the source stamped no axis on its frames.
             if dry:
                 dry_writer.writeFrame(subset)
             if down:
@@ -373,9 +374,16 @@ def _harvest_loos(traj_fn, structure_fn, subset_spec, dry_out, down_out,
                 dry_writer.writeFrame(subset, step, time)
             if down:
                 down_writer.writeFrame(model, step, time)
+        if dry:
+            dry_axis.took(local)
+        if down:
+            down_axis.took(local)
         n_dry += dry
         n_down += down
     del dry_writer, down_writer
+    # The two streams keep different frames, so each states its own spacing.
+    reimage.stamp_written_axis(Path(dry_out), timing, dry_axis)
+    reimage.stamp_written_axis(Path(down_out), timing, down_axis)
 
     # Solute-only topology for anything that reads the dry stream later.
     subset.pruneBonds()
@@ -396,8 +404,9 @@ def _harvest_mdtraj(traj_fn, structure_fn, subset_spec, dry_out, down_out,
 
     model = md.load(str(structure_fn))
     indices = None if subset_spec is None else subset_spec['indices']
-    dry_writer = _MdtrajWriter(Path(dry_out))
-    down_writer = _MdtrajWriter(Path(down_out))
+    dry_writer = reimage._MdtrajWriter(Path(dry_out))
+    down_writer = reimage._MdtrajWriter(Path(down_out))
+    dry_axis, down_axis = reimage.WrittenAxis(), reimage.WrittenAxis()
     n_orig = n_dry = n_down = 0
     try:
         for chunk in md.iterload(str(traj_fn), top=model.top,
@@ -414,8 +423,13 @@ def _harvest_mdtraj(traj_fn, structure_fn, subset_spec, dry_out, down_out,
                 step0, steps_per_frame, time0, time_per_frame = timing
                 step = step0 + local * steps_per_frame
                 predicted = time0 + local * time_per_frame
-                if not np.allclose(predicted, chunk.time, rtol=1e-5,
-                                   atol=1e-5 * max(abs(time0), 1.0)):
+                # Only where the frames carry a time of their own. A DCD's axis
+                # is one header rule by construction, and mdtraj hands back the
+                # frame index in its place, so this would compare the source
+                # against a placeholder and call every DCD uneven.
+                if (util.stamps_time_per_frame(traj_fn)
+                        and not np.allclose(predicted, chunk.time, rtol=1e-5,
+                                            atol=1e-5 * max(abs(time0), 1.0))):
                     raise HarvestError(
                         f'{traj_fn}: frame times drift from the even spacing '
                         f'read off frames 0 and 1 (worst difference '
@@ -426,52 +440,28 @@ def _harvest_mdtraj(traj_fn, structure_fn, subset_spec, dry_out, down_out,
                 dry_writer.write(sub if indices is None
                                  else sub.atom_slice(indices),
                                  step=None if step is None else step[keep_dry])
+                for index in local[keep_dry]:
+                    dry_axis.took(int(index))
                 n_dry += int(keep_dry.sum())
             if keep_down.any():
                 down_writer.write(
                     chunk[keep_down],
                     step=None if step is None else step[keep_down])
+                for index in local[keep_down]:
+                    down_axis.took(int(index))
                 n_down += int(keep_down.sum())
             n_orig += chunk.n_frames
     finally:
         dry_writer.close()
         down_writer.close()
+    # mdtraj's DCD writer takes no timing either, so a DCD output gets its axis
+    # the same way the LOOS backend's does: written into the header at the end.
+    reimage.stamp_written_axis(Path(dry_out), timing, dry_axis)
+    reimage.stamp_written_axis(Path(down_out), timing, down_axis)
 
     dry_model = model if indices is None else model.atom_slice(indices)
     dry_model.save_pdb(str(Path(dry_out).parent / dry_topology_name))
     return n_orig, n_dry, n_down
-
-
-class _MdtrajWriter:
-    """Writer that appends, which Trajectory.save() cannot do."""
-
-    def __init__(self, out_p):
-        import mdtraj as md
-        self.suffix = out_p.suffix.lower()
-        if self.suffix == '.xtc':
-            self.fh = md.formats.XTCTrajectoryFile(str(out_p), 'w')
-        elif self.suffix == '.dcd':
-            self.fh = md.formats.DCDTrajectoryFile(str(out_p), 'w')
-        else:
-            raise ValueError(
-                f'{out_p.suffix} is not a format the mdtraj harvest backend '
-                'writes; use .xtc or .dcd')
-
-    def write(self, traj, step=None):
-        if self.suffix == '.xtc':
-            # Without an explicit step mdtraj writes the frame index, which
-            # silently replaces the MD step counter with a small integer.
-            self.fh.write(traj.xyz, time=traj.time, step=step,
-                          box=traj.unitcell_vectors)
-        else:
-            self.fh.write(traj.xyz * reimage.ANGSTROM_PER_NM,
-                          cell_lengths=(None if traj.unitcell_lengths is None
-                                        else traj.unitcell_lengths
-                                        * reimage.ANGSTROM_PER_NM),
-                          cell_angles=traj.unitcell_angles)
-
-    def close(self):
-        self.fh.close()
 
 
 HARVEST_BACKENDS = {BACKEND_LOOS: _harvest_loos, BACKEND_MDTRAJ: _harvest_mdtraj}
