@@ -33,7 +33,7 @@ BRAKED_EXIT=2                        # farmer.py's status for "asked to stop"
 # example is meant to be run by someone whose env is not called what mine is.
 # Resolution order: --env, then $CONDA_ENV, then a .conda-env file at the top of
 # the checkout. With one of those in place, launching is just ./$(basename "$0").
-CONDA_ENV_FILE="$HERE/../../.conda-env"
+CONDA_ENV_FILE="$(cd "$HERE/../.." && pwd)/.conda-env"
 CONDA_ENV="${CONDA_ENV:-}"
 RUN_PY=(python -u)               # what activate_env leaves on PATH
 
@@ -46,15 +46,53 @@ cd "$HERE"
 
 
 usage() {
+    resolve_env
     cat <<EOF
-usage: $(basename "$SELF") [--env NAME] [--check|--dry-run|start|--status|--stop] [farmer.py args]
+usage: $(basename "$SELF") [--env NAME] [MODE] [farmer.py args]
 
-  --env NAME  conda env holding mdfarmer; else \$CONDA_ENV, else .conda-env
+Start, watch and stop the $PROJECT tender. With no MODE it starts the tender
+detached and returns, so launching a campaign is just:
+
+    ./$(basename "$SELF")
+
+MODES
   --check     run shape and input readiness; writes nothing, starts nothing
   --dry-run   every directory, config and job script; submits nothing
-  start       start the tender detached (the default with no argument)
+  start       start the tender detached (the default with no MODE)
   --status    whether a tender is up, its pid, and the tail of its log
   --stop      write the brake file; the tender stops at its next tick
+  -h, --help  this
+
+ENVIRONMENT
+  --env NAME  the conda environment holding mdfarmer and its engine.
+              Taken from the first of these that is set:
+                1. --env NAME
+                2. \$CONDA_ENV
+                3. $CONDA_ENV_FILE
+              With none of them the script refuses rather than guessing.
+              Right now this resolves to: ${CONDA_ENV:-<unset; see above>}
+
+  GAP=$GAP        seconds before re-entering a tender that died
+  The environment is activated, not wrapped, so the driver is a direct child:
+  its exit status is the one this loop reads and its log is not buffered.
+
+EXIT STATUS OF THE DRIVER
+  0  every clone finished; the loop stops
+  $BRAKED_EXIT  the brake file appeared; the loop stops
+  1  something went wrong; the loop re-enters, because a fresh tender rebuilds
+     every clone from disk and re-adopts the job ids still running
+
+EXAMPLES
+  ./$(basename "$SELF") --check              # is this campaign runnable here
+  ./$(basename "$SELF") --dry-run            # what would be submitted
+  ./$(basename "$SELF")                      # start it
+  ./$(basename "$SELF") --env other-env      # ... from a different environment
+  ./$(basename "$SELF") start --n-gens 1     # extra args go to farmer.py
+  ./$(basename "$SELF") --status             # is it up
+  ./$(basename "$SELF") --stop               # ask it to stop
+
+Jobs already submitted keep running after a stop; squeue -u \$USER shows them.
+Everything a run writes lands in data/ and prepared/, both gitignored.
 EOF
 }
 
@@ -62,10 +100,17 @@ EOF
 # Put CONDA_ENV's bin on PATH, so `python` below is a direct child of the loop:
 # its exit status is the one the loop reads and its stdout is not buffered by a
 # wrapper. set +u because conda's own shell functions do not survive it.
-activate_env() {
+# The name only; whether it exists is activate_env's problem. Called by the
+# help text too, so what --help reports is what a launch would actually use.
+resolve_env() {
     if [ -z "$CONDA_ENV" ] && [ -r "$CONDA_ENV_FILE" ]; then
         CONDA_ENV="$(tr -d '[:space:]' < "$CONDA_ENV_FILE")"
     fi
+}
+
+
+activate_env() {
+    resolve_env
     if [ -z "$CONDA_ENV" ]; then
         echo "no environment named. Pass one:" >&2
         echo "  $SELF --env NAME [--check|--dry-run|start|...]" >&2
