@@ -51,6 +51,7 @@ PYTHON_CMD = sys.executable
 #
 # which is the default, and is why nothing in mdfarmer knows what any of this
 # is: gmx_bin is a command vector, and what goes in it is the site's business.
+# The README's "Naming the gmx binary" covers both forms.
 GMX_SCRUB = ['env',
              '-u', 'SLURM_STEP_ID', '-u', 'SLURM_STEPID',
              '-u', 'PMIX_NAMESPACE', '-u', 'PMIX_RANK',

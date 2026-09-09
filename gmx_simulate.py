@@ -228,14 +228,17 @@ def gmx_argv(gmx_bin, *args):
     """The argv for one gmx call, from a gmx_bin that may carry a launcher.
 
     gmx_bin is either a bare command -- 'gmx', or a path to one -- or the whole
-    vector that has to run it, like ['mpirun', '-n', '1', 'gmx_mpi']. Sites
-    whose only GROMACS is an MPI build need the second form: such a binary calls
-    MPI_Init even for grompp, and under a scheduler that aborts unless it was
-    launched the way its MPI expects.
+    vector that has to run it, like ['env', '-u', 'SLURM_STEP_ID', 'gmx_mpi'].
+    Sites whose only GROMACS is an MPI build need the second form: such a binary
+    calls MPI_Init even for grompp, and under a scheduler that aborts unless its
+    environment matches the way its MPI thinks it was launched. Prefer a vector
+    that execs the binary over one that launches it, so the process mdfarmer
+    waits on is GROMACS itself and the preemption SIGTERM reaches it.
 
     A string is one word and is never split, so a path containing a space still
-    works. Nothing here knows what a launcher is for -- whether one is needed,
-    and which, is the site's business and belongs beside its module load.
+    works; a vector survives config.json as a JSON array. Nothing here knows
+    what a launcher is for -- whether one is needed, and which, is the site's
+    business and belongs beside its module load.
     """
     prefix = [gmx_bin] if isinstance(gmx_bin, str) else list(gmx_bin)
     return [*prefix, *args]
