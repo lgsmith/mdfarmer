@@ -19,6 +19,9 @@ LAUNCH_INTERVAL = 0
 # campaign does not name the file itself.
 TRAJ_LIST_NAME = 'traj_list.txt'
 
+# Whose presence in the tender's working directory stops the submission loop.
+BRAKE_FILE = 'stop'
+
 
 def missing_seed_inputs(seed_structure_fns, system_fns, top_fns,
                         missing_entry=MISSING_ENTRY):
@@ -765,14 +768,19 @@ class Farmer:
             self.priority_ordered_clones[queue_index] = survivors
         return still_running
 
-    def start_tending_fields(self, update_interval=120, sleep=None):
+    def start_tending_fields(self, update_interval=120, sleep=None,
+                             brake_file=BRAKE_FILE):
         """Mind the whole campaign: launch every clone and keep it going.
 
         Whether you are starting or restarting, this is probably what you
-        want. Returns True once every clone has finished, and False if a
-        'stop' brake file halted the loop or any clone was given up on.
-        Raises if no clone could be built at all. sleep is the deprecated
-        spelling of Farmer(launch_interval=...) and overrides it for this run.
+        want. Returns True once every clone has finished, and False if the
+        brake file halted the loop or any clone was given up on. Raises if no
+        clone could be built at all. sleep is the deprecated spelling of
+        Farmer(launch_interval=...) and overrides it for this run.
+
+        brake_file is relative to the working directory the tender was started
+        in, so two campaigns tended from one directory share a brake unless
+        they are given different ones.
         """
         self.launch_interval = self.resolve_launch_interval(sleep)
         if not self.priority_ordered_clones or not any(
@@ -783,7 +791,7 @@ class Farmer:
                 'per-clone setup errors printed above (missing structure, '
                 'topology, .mdp, or an unreadable checkpoint).')
         still_running = self.launch(update_jids=False)
-        brake_file_p = Path('stop')
+        brake_file_p = Path(brake_file)
         print('still_running:', *still_running, flush=True)
         # If dry run, short circuit the tending loop.
         if self.dry_run:
