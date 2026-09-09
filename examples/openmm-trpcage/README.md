@@ -61,22 +61,73 @@ asymmetry is why the GROMACS arm asks for 24 cores a pack and this one asks for
 a framework for testing the code, and no performance work belongs in either
 example.
 
+## Setting it up
+
+One conda environment, holding mdfarmer and everything it imports:
+
+```bash
+mamba create -n mdfarmer -c conda-forge python=3.12 openmm loos mdtraj
+mamba activate mdfarmer
+pip install -e /path/to/mdfarmer      # editable: this checkout is what runs
+```
+
+`openmm` runs the MD; `loos` and `mdtraj` are both needed because the harvest
+picks between them per trajectory — LOOS for a rectangular box, mdtraj for a
+triclinic one it cannot represent.
+
+Install **editable**. It puts a pointer to your checkout in the environment
+rather than a copy, so the code you edit is the code the compute node runs.
+A regular install or a `PYTHONPATH` entry work too, but then `import mdfarmer`
+can quietly resolve to a different tree than the one you are reading — which is
+why `--check` prints the file it landed on. Read that line.
+
+Then name the environment when you launch:
+
+```bash
+./drive_omm.sh --env mdfarmer --check
+```
+
+Nothing has to be installed on the compute node. `sbatch` exports the tender's
+environment by default, and independently of that the job script pins the
+absolute interpreter — `sys.executable` as the tender saw it — and refuses with
+`MISSING INTERPRETER` rather than running the wrong python.
+
+### What is site-specific
+
+Set for Flatiron's `rusty`. These are the first things to change elsewhere, all
+constants at the top of `farmer.py`:
+
+| constant | here | what to check |
+|---|---|---|
+| `PARTITION` | `gpu` | a partition your account can submit to |
+| `GRES` | `gpu:rtx_pro_6000_blackwell:1` | `sinfo -o '%P %G'` for the names your cluster uses |
+| `QOS` | unset | some sites require one |
+| `EXTRA_SBATCH` | empty | account/reservation lines, if your site wants them |
+| `HARVEST_PARTITION` | `ccb` | any CPU-only partition |
+| `WALLTIME` | `00:20:00` | fine for seconds of MD; raise for a real campaign |
+
+`STEPS_PER_GEN` is calibrated so a generation is a few seconds on an RTX A6000.
+On a slower card it is still short. The two spacing rules it satisfies are
+arithmetic, not tuning — see the comment above them before changing it.
+
 ## Run it
 
 ```bash
 cd examples/openmm-trpcage
 
-./drive_omm.sh --check      # run shape and input readiness; writes nothing
-./drive_omm.sh --dry-run    # every directory, config and sbatch.sh; submits nothing
-./drive_omm.sh              # start the tender, detached, and return
-./drive_omm.sh --status     # up or down, its pid, the tail of its log
-./drive_omm.sh --stop       # brake it at its next tick
+./drive_omm.sh --env mdfarmer --check      # run shape and input readiness; writes nothing
+./drive_omm.sh --env mdfarmer --dry-run    # every directory, config and sbatch.sh; submits nothing
+./drive_omm.sh --env mdfarmer              # start the tender, detached, and return
+./drive_omm.sh --env mdfarmer --status     # up or down, its pid, the tail of its log
+./drive_omm.sh --env mdfarmer --stop       # brake it at its next tick
 ```
 
-`drive_omm.sh` runs the driver under `mamba run -n omm python -u`
-(`--no-capture-output` is broken here, so `-u` is what keeps the log live) and
-appends to `shakedown-omm.tend.out`, whose path it prints on the way out. Set
-`CONDA_ENV` to use a different environment. `farmer.py` still runs perfectly
+`drive_omm.sh` activates the environment you name and runs the driver as a
+direct child, appending to `shakedown-omm.tend.out`, whose path it prints on the
+way out. Direct rather than under `mamba run` on purpose: the loop reads the
+driver's exit status to decide whether to re-enter, and you read its log live,
+and a wrapper process sits in the way of both. `--env` names the environment;
+`CONDA_ENV` in the environment does the same. `farmer.py` still runs perfectly
 well by hand; the script is what makes it survivable.
 
 **The tender is not a Slurm job.** It runs detached — `setsid nohup` — on the
@@ -84,7 +135,7 @@ login node or workstation you launch it from, and outlives the shell that
 started it. It sleeps between ticks and needs nothing from the cluster but
 `sbatch`, so an allocation of its own would idle for hours; worse, that
 allocation's walltime or its preemption would end the campaign with it. Launch
-it anywhere `sbatch` and the `omm` environment both work.
+it anywhere `sbatch` and your environment both work.
 
 **One tender per campaign.** The loop holds `flock` on
 `data/shakedown-omm/tender.lock` for as long as it lives, and a second
@@ -99,8 +150,8 @@ every 60 s (`GAP`) until the driver exits 0, which happens only when every clone
 has finished. Three exits inside a minute in a row is a broken setup rather than
 a scheduler hiccup, and the loop says so and gives up.
 
-Before it detaches, the script checks that `mamba`, `sbatch` and an importable
-`mdfarmer` are all there, and prints which `mdfarmer` — `import mdfarmer`
+Before it detaches, the script checks that `sbatch` and an importable
+`mdfarmer` are both there, and prints which `mdfarmer` — `import mdfarmer`
 resolves to whatever the environment installed, which in a git worktree is not
 necessarily the tree you are reading. On the node, the submit script makes the
 same check and refuses rather than failing mid-generation.
