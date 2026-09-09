@@ -13,8 +13,12 @@ counting from the start of the run rather than restarting at zero, which is what
 lets the generations be put back together in order.
 
 Each launch writes its own prod.partNNNN.xtc, because mdrun -cpi will not append
-into a directory that does not already hold the files its checkpoint names.
-concat_parts merges them when the generation finishes, reading with mdtraj so
+into a directory that does not already hold the files its checkpoint names --
+which at a generation boundary it never does, the checkpoint having come from
+the generation before. concat_parts merges them when the generation finishes and
+deletes them, so a part never outlives the generation that produced it: what a
+finished generation holds is one trajectory, and the unit of decision is whether
+to keep it or run it again. It reads with mdtraj so
 every frame keeps its own step, time and box, and writing with mdtraj unless the
 run's compressed-x-precision is finer than the 1000 that writer is fixed at, in
 which case LOOS writes instead. Where two parts cover the same steps the later
@@ -547,6 +551,11 @@ def concat_parts(gen_dir, out_fn, deffnm=DEFFNM, traj_suffix='.xtc',
     out of structure_fn and cannot represent a triclinic box.
 
     verify reads the merge back and compares it against the parts it came from.
+
+    Nothing is deleted here: this merges, and the generation that called it
+    decides what its parts were for. Calling it again once its caller has
+    cleaned up returns the trajectory already written, rather than reporting
+    the absence as damage.
     """
     if traj_suffix.lower() not in mergeable_suffixes:
         raise ValueError(
@@ -557,10 +566,13 @@ def concat_parts(gen_dir, out_fn, deffnm=DEFFNM, traj_suffix='.xtc',
     parts = part_files(gen_dir, deffnm=deffnm, traj_suffix=traj_suffix)
     # A launch killed before its first write leaves a part with nothing in it.
     parts = [p for p in parts if p.stat().st_size]
+    out_p = Path(out_fn)
     if not parts:
+        # Already merged and cleaned up: re-running has nothing left to do.
+        if out_p.is_file():
+            return out_p
         raise FileNotFoundError(
             f'no {deffnm}.partNNNN{traj_suffix} files in {gen_dir} to merge')
-    out_p = Path(out_fn)
     # Temp name, suffix kept so the writer reads the format from it.
     tmp_p = out_p.with_name(f'{out_p.stem}.concat-tmp{out_p.suffix}')
     precision = xtc_precision(parts[0])
@@ -569,7 +581,8 @@ def concat_parts(gen_dir, out_fn, deffnm=DEFFNM, traj_suffix='.xtc',
         warn_fine_precision(precision, mdtraj_precision=mdtraj_precision)
     try:
         if len(parts) == 1:
-            # Copy, not rename, so re-running is idempotent and the part survives.
+            # Copy first: a rename that lost the part would leave nothing to
+            # retry from if the replace below failed.
             shutil.copy(parts[0], tmp_p)
         else:
             if fine:
@@ -584,6 +597,20 @@ def concat_parts(gen_dir, out_fn, deffnm=DEFFNM, traj_suffix='.xtc',
         raise
     tmp_p.replace(out_p)
     return out_p
+
+
+def remove_parts(gen_dir, deffnm=DEFFNM, traj_suffix='.xtc'):
+    """Delete the trajectory parts a finished generation no longer needs.
+
+    A part is how mdrun had to write this generation, not a piece of it that
+    outlives it: once the merge is on disk, keeping them stores the whole
+    trajectory twice. Only the caller knows the merge succeeded, which is why
+    concat_parts does not do this itself.
+    """
+    removed = part_files(gen_dir, deffnm=deffnm, traj_suffix=traj_suffix)
+    for part in removed:
+        part.unlink()
+    return removed
 
 
 def write_gen_status(gen_dir, *, target_step, reached_step, complete,
@@ -896,6 +923,8 @@ def gmx_generation(traj_dir_top_level: str,
 
     concat_parts(gen_dir, traj, deffnm=deffnm, traj_suffix=traj_suffix,
                  structure_fn=structure_fn)
+    # The merge is written and verified, so the parts have done their job.
+    remove_parts(gen_dir, deffnm=deffnm, traj_suffix=traj_suffix)
     write_gen_status(gen_dir, target_step=target_step, reached_step=reached,
                      complete=True, gen_status_name=gen_status_name,
                      traj_fn=traj)

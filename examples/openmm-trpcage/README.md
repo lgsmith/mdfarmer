@@ -81,11 +81,15 @@ A regular install or a `PYTHONPATH` entry work too, but then `import mdfarmer`
 can quietly resolve to a different tree than the one you are reading — which is
 why `--check` prints the file it landed on. Read that line.
 
-Then name the environment when you launch:
+Then name the environment once, at the top of the checkout, so launching is
+just the script:
 
 ```bash
-./drive_omm.sh --env mdfarmer --check
+echo mdfarmer > /path/to/mdfarmer/.conda-env
 ```
+
+`--env NAME` and `CONDA_ENV=NAME` override it, in that order. With none of the
+three, the script refuses and says so rather than guessing.
 
 Nothing has to be installed on the compute node. `sbatch` exports the tender's
 environment by default, and independently of that the job script pins the
@@ -115,14 +119,14 @@ arithmetic, not tuning — see the comment above them before changing it.
 ```bash
 cd examples/openmm-trpcage
 
-./drive_omm.sh --env mdfarmer --check      # run shape and input readiness; writes nothing
-./drive_omm.sh --env mdfarmer --dry-run    # every directory, config and sbatch.sh; submits nothing
-./drive_omm.sh --env mdfarmer              # start the tender, detached, and return
-./drive_omm.sh --env mdfarmer --status     # up or down, its pid, the tail of its log
-./drive_omm.sh --env mdfarmer --stop       # brake it at its next tick
+./farm-omm.sh --check      # run shape and input readiness; writes nothing
+./farm-omm.sh --dry-run    # every directory, config and sbatch.sh; submits nothing
+./farm-omm.sh              # start the tender, detached, and return
+./farm-omm.sh --status     # up or down, its pid, the tail of its log
+./farm-omm.sh --stop       # brake it at its next tick
 ```
 
-`drive_omm.sh` activates the environment you name and runs the driver as a
+`farm-omm.sh` activates the environment you name and runs the driver as a
 direct child, appending to `shakedown-omm.tend.out`, whose path it prints on the
 way out. Direct rather than under `mamba run` on purpose: the loop reads the
 driver's exit status to decide whether to re-enter, and you read its log live,
@@ -139,7 +143,7 @@ it anywhere `sbatch` and your environment both work.
 
 **One tender per campaign.** The loop holds `flock` on
 `data/shakedown-omm/tender.lock` for as long as it lives, and a second
-`./drive_omm.sh` refuses with the running one's pid rather than starting a rival
+`./farm-omm.sh` refuses with the running one's pid rather than starting a rival
 that would submit every clone a second time. The kernel drops the lock when the
 process dies, however it dies, so there is no stale pid file to reason about.
 
@@ -158,7 +162,7 @@ resolves to whatever the environment installed, which in a git worktree is not
 necessarily the tree you are reading. On the node, the submit script makes the
 same check and refuses rather than failing mid-generation.
 
-`./drive_omm.sh --stop` writes the `stop` brake file the driver watches for; the
+`./farm-omm.sh --stop` writes the `stop` brake file the driver watches for; the
 tender exits at its next tick (20 s), the loop then exits too, and jobs already
 submitted keep running. Everything a run writes lands in `data/` and `prepared/`,
 both gitignored.

@@ -24,7 +24,11 @@ from harness import Suite
 import mdfarmer
 from mdfarmer import gmx_simulate as gs
 
-STEPS_PER_GEN = 2400            # generation 0's full step budget
+# Generation 0's full step budget. Bigger than the abandoned branch reaches
+# (400 + 1000 + 1000), so that branch never finishes -- a finished generation
+# merges its parts and deletes them, and then there is no stale part left to
+# outrank anything. Lingering parts are exactly the unfinished case.
+STEPS_PER_GEN = 3400
 WRITE_INTERVAL = 100            # -> 0.2 ps frame spacing at dt=0.002
 DT_PS = 0.002                   # must match harness.water_mdp's dt
 REWIND_STEP = 400               # step of the checkpoint the rewind restores
@@ -104,8 +108,9 @@ def main(gmx_bin=harness.GMX_BIN):
                == REWIND_STEP + BRANCH_STEP)
 
     traj = run_gen(common, BRANCH_A_ARGS + ('-nsteps', str(BRANCH_STEP)))
-    suite.check('the abandoned branch runs on to a third part and finishes',
-               traj is not None)
+    suite.check('the abandoned branch writes a third part, still incomplete',
+               traj is None and gs.checkpoint_step(own_cpt, gmx_bin=gmx_bin)
+               == REWIND_STEP + 2 * BRANCH_STEP)
 
     parts_before_rewind = gs.part_files(gen_dir)
     suite.check('three parts have accumulated before the rewind',
@@ -122,12 +127,16 @@ def main(gmx_bin=harness.GMX_BIN):
     suite.check('the relaunch resumes from the rewound checkpoint and finishes',
                traj is not None)
 
+    # The generation finished, so its own parts were merged and deleted: what a
+    # finished generation holds is one trajectory, not the launches it took.
     parts_after_rewind = gs.part_files(gen_dir)
-    suite.check('only the rewound branch\'s parts remain on the merge glob',
-               len(parts_after_rewind) == 2,
+    suite.check('a finished generation keeps no parts on the merge glob',
+               not parts_after_rewind,
                f'-> {[p.name for p in parts_after_rewind]}')
+    suite.check('and holds exactly one trajectory', Path(traj).is_file())
     abandoned_on_disk = sorted(gen_dir.glob(
         f'{gs.ABANDONED_PART_PREFIX}*{common["traj_suffix"]}'))
+    # Moved aside before the relaunch, so never on the glob the merge deleted.
     suite.check('the abandoned parts are kept on disk, just moved aside',
                len(abandoned_on_disk) == 2,
                f'-> {[p.name for p in abandoned_on_disk]}')

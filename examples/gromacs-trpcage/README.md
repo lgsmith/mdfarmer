@@ -96,11 +96,15 @@ regular install or a `PYTHONPATH` entry work too, but then `import mdfarmer` can
 quietly resolve to a different tree than the one you are reading — which is why
 `--check` prints the file it landed on. Read that line.
 
-Then name the environment when you launch:
+Then name the environment once, at the top of the checkout, so launching is
+just the script:
 
 ```bash
-./drive_gmx.sh --env mdfarmer --check
+echo mdfarmer > /path/to/mdfarmer/.conda-env
 ```
+
+`--env NAME` and `CONDA_ENV=NAME` override it, in that order. With none of the
+three, the script refuses and says so rather than guessing.
 
 Nothing has to be installed on the compute node. `sbatch` exports the tender's
 environment by default, and independently of that the job script pins the
@@ -133,14 +137,14 @@ script starts per job. Whether it pays *at all* is system-specific — see
 ```bash
 cd examples/gromacs-trpcage
 
-./drive_gmx.sh --env mdfarmer --check      # run shape and input readiness; writes nothing
-./drive_gmx.sh --env mdfarmer --dry-run    # every directory, config, pack.json and sbatch.sh; submits nothing
-./drive_gmx.sh --env mdfarmer              # start the tender, detached, and return
-./drive_gmx.sh --env mdfarmer --status     # up or down, its pid, the tail of its log
-./drive_gmx.sh --env mdfarmer --stop       # brake it at its next tick
+./farm-gmx.sh --check      # run shape and input readiness; writes nothing
+./farm-gmx.sh --dry-run    # every directory, config, pack.json and sbatch.sh; submits nothing
+./farm-gmx.sh              # start the tender, detached, and return
+./farm-gmx.sh --status     # up or down, its pid, the tail of its log
+./farm-gmx.sh --stop       # brake it at its next tick
 ```
 
-`drive_gmx.sh` activates the environment you name and runs the driver as a
+`farm-gmx.sh` activates the environment you name and runs the driver as a
 direct child, appending to `shakedown-gmx.tend.out`, whose path it prints on the
 way out. Direct rather than under `mamba run` on purpose: the loop reads the
 driver's exit status to decide whether to re-enter, and you read its log live,
@@ -157,7 +161,7 @@ it anywhere `sbatch` and your environment both work.
 
 **One tender per campaign.** The loop holds `flock` on
 `data/shakedown-gmx/tender.lock` for as long as it lives, and a second
-`./drive_gmx.sh` refuses with the running one's pid rather than starting a rival
+`./farm-gmx.sh` refuses with the running one's pid rather than starting a rival
 that would submit every pack a second time. (`pack.lock` inside the job is the
 same idea one level down: it is what stops two mdruns entering one pack
 directory. Neither substitutes for the other.) The kernel drops the lock when the
@@ -183,7 +187,7 @@ its environment would put module libraries ahead of the conda ones in every job
 it submits. On the node it is `ENV_SETUP` at the top of `farmer.py` that loads
 them, and the job script refuses to run if `gmx_mpi` or `mdfarmer` is missing.
 
-`./drive_gmx.sh --stop` writes the `stop` brake file the driver watches for; the
+`./farm-gmx.sh --stop` writes the `stop` brake file the driver watches for; the
 tender exits at its next tick (20 s), the loop then exits too, and pack jobs
 already submitted keep running. Everything a run writes lands in `data/` and
 `prepared/`, both gitignored.

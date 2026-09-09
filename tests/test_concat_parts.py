@@ -220,7 +220,25 @@ def main(gmx_bin=harness.GMX_BIN, overlap_frames=OVERLAP_FRAMES,
                 f'-> {[p.name for p in parts]} starting at {starts}')
     merged = gs.concat_parts(gen, gen / 'prod.xtc')
     contiguous_frames(suite, 'real parts', read_xtc(merged), STEPS)
-    suite.check('the parts are left on disk', all(p.is_file() for p in parts))
+    suite.check('the merge leaves the parts alone; cleaning up is the '
+                'generation\'s job', all(part.is_file() for part in parts))
+
+    suite.section('the generation is what a part does not outlive')
+    spent = work / 'spent'
+    build_real_parts(spent, gmx_bin=gmx_bin)
+    spent_parts = gs.part_files(spent)
+    spent_out = gs.concat_parts(spent, spent / 'prod.xtc')
+    removed = gs.remove_parts(spent)
+    suite.check('remove_parts deletes every part it reports',
+                sorted(removed) == sorted(spent_parts)
+                and not any(part.is_file() for part in spent_parts),
+                f'-> {[part.name for part in removed]}')
+    suite.check('and leaves the trajectory they were merged into',
+                spent_out.is_file())
+    # A re-run after cleanup has nothing to merge; that is done, not damage.
+    again = gs.concat_parts(spent, spent / 'prod.xtc')
+    suite.check('merging again returns the trajectory already there',
+                again == spent_out and spent_out.is_file())
 
     suite.section('a multi-frame overlap: the later part wins')
     # part0002 is restamped onto part0001's last frames while carrying the
