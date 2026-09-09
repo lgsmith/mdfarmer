@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Start, stop and check on the shakedown-gmx tender.
+# Start, stop and check on the shakedown-omm tender.
 #
 # The tender is the long-lived python process that submits this campaign's
 # Slurm jobs and re-submits them as generations finish. It runs detached on the
@@ -8,20 +8,21 @@
 # sit idle holding it, and that allocation's walltime (or its preemption) would
 # end the campaign with it. All it needs from the cluster is sbatch.
 #
-#   ./drive_gmx.sh --env NAME --check         # run shape and readiness; writes nothing
-#   ./drive_gmx.sh --env NAME --dry-run       # dirs, configs, job scripts; submits nothing
-#   ./drive_gmx.sh --env NAME                 # start the tender, detached, and return
-#   ./drive_gmx.sh --env NAME --status        # up or down, its pid, the tail of its log
-#   ./drive_gmx.sh --env NAME --stop          # brake it at its next tick
+#   ./farm-omm.sh --check         # run shape and readiness; writes nothing
+#   ./farm-omm.sh --dry-run       # dirs, configs, job scripts; submits nothing
+#   ./farm-omm.sh                 # start the tender, detached, and return
+#   ./farm-omm.sh --status        # up or down, its pid, the tail of its log
+#   ./farm-omm.sh --stop          # brake it at its next tick
 #
-# --env names the conda environment holding mdfarmer; CONDA_ENV does the same.
+# The conda environment holding mdfarmer comes from --env, else $CONDA_ENV,
+# else a .conda-env file at the top of the checkout.
 # Arguments after an explicit `start`, `--check` or `--dry-run` are passed on to
-# farmer.py: `./drive_gmx.sh --env myenv start --n-gens 1`.
+# farmer.py: `./farm-omm.sh start --n-gens 1`.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SELF="$HERE/$(basename "${BASH_SOURCE[0]}")"
-PROJECT='shakedown-gmx'
+PROJECT='shakedown-omm'
 CAMPAIGN="$HERE/data/$PROJECT"       # farmer.py's TRAJ_TOP
 LOG="$HERE/$PROJECT.tend.out"
 LOCK="$CAMPAIGN/tender.lock"         # one tender per campaign, held while it runs
@@ -30,18 +31,11 @@ BRAKED_EXIT=2                        # farmer.py's status for "asked to stop"
 
 # The environment holding mdfarmer and its engine. Named, not hard-coded: this
 # example is meant to be run by someone whose env is not called what mine is.
+# Resolution order: --env, then $CONDA_ENV, then a .conda-env file at the top of
+# the checkout. With one of those in place, launching is just ./$(basename "$0").
+CONDA_ENV_FILE="$HERE/../../.conda-env"
 CONDA_ENV="${CONDA_ENV:-}"
 RUN_PY=(python -u)               # what activate_env leaves on PATH
-
-# farmer.py's ENV_SETUP, which the job script sources on the node. Checked here
-# in a subshell only: the tender itself never calls gmx, and leaving the module
-# tree in its environment would put module libraries in front of the conda
-# ones for every job it submits.
-GMX_MODULES='modules/2.4-20250724 openmpi/cuda-4.1.8 gromacs/mpi-2024.4'
-GMX_BIN='gmx_mpi'
-# Whether farmer.py runs that binary with a scrubbed environment. Kept in step
-# with its GMX_SCRUB by hand; the check below is what catches them disagreeing.
-GMX_SCRUBBED=1
 
 GAP="${GAP:-60}"                     # seconds before re-entering a failed tender
 MIN_RUN_S=60                         # a shorter run is a broken setup, not a hiccup
@@ -53,9 +47,9 @@ cd "$HERE"
 
 usage() {
     cat <<EOF
-usage: $(basename "$SELF") --env NAME [--check|--dry-run|start|--status|--stop] [farmer.py args]
+usage: $(basename "$SELF") [--env NAME] [--check|--dry-run|start|--status|--stop] [farmer.py args]
 
-  --env NAME  the conda environment holding mdfarmer (or set CONDA_ENV)
+  --env NAME  conda env holding mdfarmer; else \$CONDA_ENV, else .conda-env
   --check     run shape and input readiness; writes nothing, starts nothing
   --dry-run   every directory, config and job script; submits nothing
   start       start the tender detached (the default with no argument)
@@ -69,10 +63,15 @@ EOF
 # its exit status is the one the loop reads and its stdout is not buffered by a
 # wrapper. set +u because conda's own shell functions do not survive it.
 activate_env() {
+    if [ -z "$CONDA_ENV" ] && [ -r "$CONDA_ENV_FILE" ]; then
+        CONDA_ENV="$(tr -d '[:space:]' < "$CONDA_ENV_FILE")"
+    fi
     if [ -z "$CONDA_ENV" ]; then
         echo "no environment named. Pass one:" >&2
         echo "  $SELF --env NAME [--check|--dry-run|start|...]" >&2
-        echo "or set CONDA_ENV=NAME. It must hold mdfarmer and its engine." >&2
+        echo "or set CONDA_ENV=NAME, or write the name into" >&2
+        echo "  $CONDA_ENV_FILE" >&2
+        echo "It must hold mdfarmer and its engine." >&2
         exit 2
     fi
     local base
@@ -98,52 +97,9 @@ last_tender() {
 }
 
 
-# set +u +e inside, because the module init script is not written to survive
-# either.
-gmx_reachable() {
-    ( set +u +e
-      source /etc/profile.d/modules.sh
-      module load $GMX_MODULES
-      command -v "$GMX_BIN" ) >/dev/null 2>&1
-}
-
-
-# Whether $GMX_BIN survives being run with a scheduler's environment around it.
-# An MPI-built gmx calls MPI_Init even for grompp, and an OpenMPI without
-# Slurm PMI support aborts on sight of these -- so a campaign whose binary
-# needs a launcher and has none dies at the first grompp, on every job, having
-# already submitted them all. The variables below are the ones that reproduce
-# it here; a login node has none of them, which is why this has to fake them.
-gmx_survives_scheduler_env() {
-    ( set +u +e
-      source /etc/profile.d/modules.sh
-      module load $GMX_MODULES
-      env SLURM_JOBID=1 SLURM_JOB_ID=1 SLURM_STEP_ID=0 SLURM_STEPID=0 \
-          SLURM_NODELIST="$(hostname)" SLURM_JOB_NUM_NODES=1 SLURM_NTASKS=1 \
-          "$GMX_BIN" -version ) >/dev/null 2>&1
-}
-
-
 preflight() {
     if ! command -v sbatch >/dev/null; then
         echo "no sbatch on PATH; run this where jobs can be submitted" >&2
-        exit 1
-    fi
-    if ! gmx_reachable; then
-        echo "no $GMX_BIN after 'module load $GMX_MODULES';" >&2
-        echo "every generation would fail on the node. Fix ENV_SETUP in farmer.py." >&2
-        exit 1
-    fi
-    if gmx_survives_scheduler_env; then
-        if [ "$GMX_SCRUBBED" = 1 ]; then
-            echo "note: $GMX_BIN runs fine under a scheduler environment, so the" >&2
-            echo "  scrub in farmer.py's GMX_SCRUB may no longer be needed." >&2
-        fi
-    elif [ "$GMX_SCRUBBED" != 1 ]; then
-        echo "$GMX_BIN aborts when a scheduler's environment is present, and" >&2
-        echo "farmer.py runs it with that environment intact: every generation" >&2
-        echo "would die at grompp before any MD. Set GMX_SCRUB in farmer.py to" >&2
-        echo "drop SLURM_STEP_ID, or use a thread-MPI gmx." >&2
         exit 1
     fi
     activate_env
@@ -198,8 +154,8 @@ start_tender() {
 
 
 # The re-entering loop, run detached by start_tender. Farmer.launch drops a
-# pack for good on one transient sbatch failure, and a fresh tender rebuilds
-# every pack from disk and re-adopts the running job ids, so re-entering is
+# clone for good on one transient sbatch failure, and a fresh tender rebuilds
+# every clone from disk and re-adopts the running job ids, so re-entering is
 # the recovery.
 tender_loop() {
     mkdir -p "$(dirname "$LOCK")"

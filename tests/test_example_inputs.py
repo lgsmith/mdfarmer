@@ -5,7 +5,7 @@ self-contained without carrying 7 MB of XML. Nothing else in the tree reads
 them, so a corrupt blob or a driver whose step arithmetic drifted out of
 commensurability would only show up when someone tried to launch a campaign.
 
-The same goes for each example's drive_*.sh, which cannot be run here without
+The same goes for each example's farm-*.sh, which cannot be run here without
 starting a real tender: what is checked is that it parses and that every path it
 hardcodes -- campaign directory, brake file, log, lock, GROMACS modules -- still
 agrees with the driver it launches.
@@ -203,8 +203,8 @@ def main():
 
     suite.section('each example ships a drive script that agrees with its driver')
     gitignore = (EXAMPLES / '.gitignore').read_text()
-    for driver, arm, script_name in ((omm, 'openmm-trpcage', 'drive_omm.sh'),
-                                     (gmx, 'gromacs-trpcage', 'drive_gmx.sh')):
+    for driver, arm, script_name in ((omm, 'openmm-trpcage', 'farm-omm.sh'),
+                                     (gmx, 'gromacs-trpcage', 'farm-gmx.sh')):
         script = EXAMPLES / arm / script_name
         suite.check(f'{script_name} is committed and executable',
                     script.is_file() and os.access(script, os.X_OK))
@@ -252,8 +252,8 @@ def main():
                     and 'not re-entering' in text)
     gmx_modules = re.search(
         r"GMX_MODULES='([^']*)'",
-        (EXAMPLES / 'gromacs-trpcage' / 'drive_gmx.sh').read_text()).group(1)
-    suite.check('drive_gmx.sh preflights the modules the job script loads',
+        (EXAMPLES / 'gromacs-trpcage' / 'farm-gmx.sh').read_text()).group(1)
+    suite.check('farm-gmx.sh preflights the modules the job script loads',
                 f'module load {gmx_modules}' in gmx.ENV_SETUP,
                 f'-> {gmx_modules}')
     return suite.report()

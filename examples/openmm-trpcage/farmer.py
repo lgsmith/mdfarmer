@@ -7,13 +7,13 @@ generations are deliberately far too short for that. What it proves is that
 the tender, the scheduler scripts, the interpreter on the compute node and the
 harvest all work before a real campaign is committed to them.
 
-drive_omm.sh is how it is launched: it holds the campaign's tender lock, logs
+farm-omm.sh is how it is launched: it holds the campaign's tender lock, logs
 somewhere findable, and detaches. The driver runs on its own just as well.
 
-    ./drive_omm.sh --check      # readiness table, no writes
-    ./drive_omm.sh --dry-run    # dirs, configs, scripts; submit nothing
-    ./drive_omm.sh              # start the tender, detached
-    ./drive_omm.sh --stop       # graceful stop, at the next tick
+    ./farm-omm.sh --check      # readiness table, no writes
+    ./farm-omm.sh --dry-run    # dirs, configs, scripts; submit nothing
+    ./farm-omm.sh              # start the tender, detached
+    ./farm-omm.sh --stop       # graceful stop, at the next tick
 """
 import argparse
 import gzip
